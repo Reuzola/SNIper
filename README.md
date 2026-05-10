@@ -1,90 +1,123 @@
-<div align="center">
+# dpi_bypass
 
-# SNIper
+A lightweight, zero-dependency DPI bypass proxy written in pure Python, shipped
+as a portable Windows `.exe`.
 
-**Lightweight DPI bypass proxy for Windows — ARM64 & x86**
-
-[![Python](https://img.shields.io/badge/Python-3.9%2B-3776ab?style=flat-square&logo=python&logoColor=white)](https://www.python.org/downloads/)
-[![Platform](https://img.shields.io/badge/Platform-Windows-0078d4?style=flat-square&logo=windows&logoColor=white)](https://github.com/Reuzola/SNIper)
-[![ARM64](https://img.shields.io/badge/ARM64-native-success?style=flat-square)]()
-[![License](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](LICENSE)
-[![Zero Dependencies](https://img.shields.io/badge/Dependencies-zero-brightgreen?style=flat-square)]()
-
-</div>
-
----
-
-## What is SNIper?
-
-SNIper is a local HTTP proxy that defeats ISP-level **SNI-based Deep Packet Inspection** (DPI) — the most common method used to block HTTPS traffic — by fragmenting the TLS ClientHello packet before the firewall can inspect it.
-
-It comes in two flavors: a **GUI application** for everyday use, and a **CLI version** for headless or scripted setups. Both run in **pure Python** with zero third-party dependencies, making them natively compatible with **ARM64 Windows** — an architecture most pre-built tools don't support.
-
----
+It runs entirely at the **application layer**: no admin privileges, no kernel
+drivers, no TAP adapters, no service installs. Just double-click the `.exe`
+from any folder (USB stick, Downloads, Desktop) and it works for the current
+user only.
 
 ## Origin
 
-This project started from a personal need. I have an ARM64 Windows machine and couldn't find a working DPI bypass tool for that architecture. Most existing solutions ship compiled binaries — none of them ran natively on ARM64.
+This project started from a personal need. I have an ARM64 Windows machine and
+couldn't find a working, pre-built DPI bypass tool for that architecture. Most
+existing solutions ship compiled binaries, none of them ran natively on ARM64,
+and most of them required admin rights or driver installs.
 
-I described the problem to **[Claude](https://claude.ai)** (Anthropic's AI assistant) and had it write the solution from scratch in pure Python. After several iterations — feeding errors back and refining — this is the result. I'm publishing it in case anyone else runs into the same gap.
+So I described the problem to **[Claude](https://claude.ai)** (Anthropic's AI
+assistant) and asked it to write one from scratch in pure Python, which has no
+architecture dependency and runs entirely in user-space. After a few iterations
+of feeding errors back and refining, this is the result. The final code is
+entirely Claude's work; my role was defining the requirements and testing.
 
----
+I'm publishing it in case anyone else runs into the same gap.
 
 ## How it works
 
-ISPs block HTTPS traffic by reading the `Server Name Indication` (SNI) field in the TLS ClientHello packet. SNIper defeats this with two mechanisms:
+ISP-level blocking in many countries uses **SNI-based Deep Packet Inspection**:
+the firewall reads the `Server Name Indication` field inside the TLS
+ClientHello packet to identify the destination, then drops the connection.
 
-### 1 — TLS ClientHello Fragmentation
+This tool defeats that in two ways:
 
-The ClientHello packet is split into 2-byte TCP segments with Nagle's algorithm disabled (`TCP_NODELAY`). Each fragment travels in its own TCP segment, so the DPI engine never sees the complete SNI field and lets the connection through.
+**1. TLS ClientHello fragmentation**
+The ClientHello is split into 2-byte TCP segments with Nagle's algorithm
+disabled (`TCP_NODELAY`). Each fragment travels in its own TCP segment, so the
+DPI engine never sees the full SNI field in one piece and lets the connection
+through.
 
-```
-Normal:   [ ——————— ClientHello (SNI visible) ——————— ]  →  ✗ BLOCKED
-SNIper:   [ CH ] [ el ] [ lo ] [ He ] [ ll ] [ o→ ]   →  ✓ PASSES
-```
+**2. DNS-over-HTTPS**
+DNS queries are sent over HTTPS directly to IP addresses (`1.1.1.1`, `8.8.8.8`,
+etc.), bypassing the ISP's DNS servers entirely. This prevents DNS poisoning,
+which is a common secondary blocking method. A TTL-aware in-memory cache avoids
+redundant lookups.
 
-### 2 — DNS-over-HTTPS (DoH)
-
-DNS queries bypass the ISP's resolvers entirely by going over HTTPS directly to IP addresses (`1.1.1.1`, `8.8.8.8`, etc.). This prevents DNS poisoning — a common secondary blocking method. Results are cached in-memory with TTL awareness to avoid redundant lookups.
-
----
-
-## Requirements
-
-- Windows (ARM64 or x86)
-- Python 3.9 or newer — [python.org/downloads](https://www.python.org/downloads/)
-- No third-party packages
-
----
-
-## Installation
-
-```bash
-git clone https://github.com/Reuzola/SNIper.git
-cd SNIper
-```
-
-No pip install, no virtualenv, no setup step.
-
----
+Everything runs in a single user-space process. The Windows system proxy is
+toggled via the per-user `HKEY_CURRENT_USER` registry key, which **does not
+require elevation**.
 
 ## Usage
 
-### GUI (recommended)
+### Just run the EXE
 
-**Double-click `dpi_bypass_gui.bat`**
+**Double-click `DPI_Bypass_Proxy_<arch>.exe`**. No install, no admin prompt,
+no dependencies.
 
-A window opens with all settings visible. Press **START** to activate the proxy — the Windows system proxy is enabled automatically. Press **STOP** (or close the window) to shut down and restore your previous proxy settings.
+A window opens with all settings visible. Press **START** to activate the proxy
+and the Windows system proxy is enabled automatically. Press **STOP** (or close
+the window) to shut down and restore your previous proxy settings.
 
-### CLI
+The EXE is fully portable: copy it anywhere (USB drive, OneDrive, etc.) and it
+will run from there. It writes nothing to the registry except the per-user
+proxy settings, which it restores on exit.
 
-**Double-click `dpi_bypass.bat`**
+## Files
 
-The proxy starts immediately on port `8881` with default settings. Close the window or press `Ctrl+C` to stop.
+| File | Purpose |
+|------|---------|
+| `DPI_Bypass_Proxy_arm64.exe` | Portable GUI executable (ARM64 Windows) |
+| `DPI_Bypass_Proxy_x64.exe` | Portable GUI executable (x64 Windows), built via `build_exe.bat` |
+| `dpi_bypass_gui.py` | GUI source (all proxy logic embedded) |
+| `dpi_bypass.py` | CLI source (no GUI) |
+| `build_exe.bat` | Rebuild the EXE for the current architecture |
+| `README.md` | This file |
 
-Or run directly with options:
+> **Note on architectures:** PyInstaller does not cross-compile, so each EXE
+> must be built on a machine of its own architecture. The repository ships
+> with the ARM64 build; to produce the x64 build, run `build_exe.bat` on an
+> x64 Windows machine.
 
-```bash
+## Why no admin prompt?
+
+Most DPI-bypass tools you'll find online either:
+
+- install a driver (WinDivert, WFP, etc.), which requires admin and persists across
+  reboots even after "uninstall"; or
+- run a system service, which requires admin and adds an attack surface.
+
+This tool does **neither**. It is a plain HTTP/CONNECT proxy that:
+
+- listens on `127.0.0.1` (no firewall rule needed);
+- forwards traffic with a userland fragmentation trick on the very first TCP
+  send (no kernel involvement);
+- toggles the per-user proxy via `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`
+  (admin rights are not needed to write to your own user hive).
+
+If you launch it from a non-elevated shell, which is the default, Windows
+never shows a UAC prompt and the program runs at the standard user integrity
+level.
+
+## GUI overview
+
+The GUI provides:
+
+- **Settings panel**: configure all options before starting. Hover over the
+  `?` button next to any setting for a description of what it does and how to
+  adjust it if something isn't working.
+- **Start / Stop button**: toggle the proxy on and off without closing the
+  application. Settings are locked while the proxy is running.
+- **Live log panel**: shows all connections and warnings in real time,
+  colour-coded by severity. A Clear button keeps it tidy.
+- **Status indicator**: shows whether the proxy is currently running.
+
+## Running the CLI version (optional)
+
+The repository also ships the original CLI script (`dpi_bypass.py`) for users
+who want to embed the proxy in their own scripts or run it without a GUI.
+This is **not** packaged into the EXE; to use it you need a Python install:
+
+```
 python dpi_bypass.py [options]
 
   --port N        Listen port (default: 8881)
@@ -93,76 +126,64 @@ python dpi_bypass.py [options]
   --verbose       Enable debug logging
 ```
 
-If the default settings don't unblock a site, try `--fragment 1` for more aggressive fragmentation.
-
----
-
-## GUI overview
-
-| Element | Description |
-|---------|-------------|
-| **Settings panel** | Configure port, fragment size, DoH, and verbosity before starting. Each setting has a `?` tooltip explaining what it does and when to change it. Settings are locked while the proxy is running. |
-| **Start / Stop** | Toggle the proxy on and off without closing the application. |
-| **Status indicator** | Shows `RUNNING` or `STOPPED` at a glance. |
-| **Live log** | Real-time connection log, colour-coded by severity (info / warning / error / debug). Includes a Clear button. |
-
----
+If the default settings don't work, try `--fragment 1` for more aggressive
+fragmentation.
 
 ## Settings reference
 
 | Setting | Default | What it does | When to change |
 |---------|---------|-------------|----------------|
-| Port | `8881` | Local port the proxy listens on | Change if another app is using 8881 |
-| Fragment size | `2` | Bytes per TCP segment during TLS handshake | Try `1` if connections are refused; try `4–8` if performance suffers on non-blocked sites |
+| Port | 8881 | Local port the proxy listens on | Change if another app is using 8881 |
+| Fragment size | 2 | Bytes per TCP segment during TLS handshake | Try 1 if connections are refused; try 4-8 if performance suffers on non-blocked sites |
 | Disable DoH | off | Falls back to system DNS | Enable only if DoH itself is timing out and system DNS resolves fine |
 | Verbose | off | Shows debug-level log entries | Enable when troubleshooting |
 
----
-
-## Files
-
-| File | Purpose |
-|------|---------|
-| `dpi_bypass_gui.py` | GUI application — proxy logic embedded, recommended for most users |
-| `dpi_bypass_gui.bat` | Double-click launcher for the GUI |
-| `dpi_bypass.py` | CLI proxy — no GUI, suitable for scripting or headless use |
-| `dpi_bypass.bat` | Double-click launcher for the CLI |
-
----
-
 ## Proxy shutdown guarantee
+
+The Windows proxy is restored under all normal exit conditions:
 
 | Exit method | Proxy restored? |
 |-------------|----------------|
-| Close window (X button) | ✅ Yes |
-| Stop button (GUI) | ✅ Yes |
-| Ctrl+C (CLI) | ✅ Yes |
-| Normal script exit | ✅ Yes |
-| Power loss / force kill | ❌ No — restore manually via Settings → Network → Proxy |
-
----
+| Close window (X button) | Yes |
+| Stop button (GUI) | Yes |
+| Ctrl+C (CLI) | Yes |
+| Normal script exit | Yes |
+| Power loss / force kill | No, disable manually in Settings → Network → Proxy |
 
 ## Notes
 
-- **errno 11001 warnings** are harmless. They appear on the first request to a new domain when DoH hasn't cached it yet and system DNS can't resolve it (because it's blocked). The next request succeeds via DoH and is cached.
-- SNIper does **not** encrypt your traffic — it tunnels your existing HTTPS connections. End-to-end TLS encryption remains fully intact.
-- No admin privileges, kernel drivers, or TAP adapters required.
-- Works at the application layer only. VPN-style global routing is out of scope by design.
+- **errno 11001** warnings in the log are harmless. They occur on the very
+  first request to a new domain when DoH hasn't cached it yet and the system
+  DNS can't resolve it (because it's blocked). The next request succeeds via
+  DoH and the result is cached.
+- Traffic is not encrypted by this tool, it only tunnels your existing HTTPS
+  connections. Your TLS encryption remains intact end-to-end.
+- The EXE is large (~10 MB) because PyInstaller bundles the Python runtime
+  inside it. There are no external dependencies and nothing is extracted to
+  disk on launch beyond the standard PyInstaller temp directory, which is
+  cleaned up automatically.
 
----
+## Building from source
+
+If you want to build the EXE yourself (e.g. to inspect the bundle, or to
+produce a build for a different architecture):
+
+```
+build_exe.bat
+```
+
+This installs PyInstaller into the active Python and produces
+`dist\DPI_Bypass_Proxy_<arch>.exe`. The architecture is taken from the Python
+interpreter, so to produce the x64 build, run the script with an x64 Python on
+an x64 host.
 
 ## Disclaimer
 
-This tool is published for **educational and personal use**. It is intended to help users access content that is legally available to them but technically obstructed by ISP-level filtering.
+This tool is published for **educational and personal use**. It is intended to
+help users access content that is legally available to them but technically
+obstructed by ISP-level filtering.
 
 - Use it in accordance with the laws of your country.
-- The author takes no responsibility for misuse.
-- SNIper does not provide anonymity — it only bypasses SNI-based filtering.
-
----
-
-<div align="center">
-
-Made with the help of [Claude](https://claude.ai) · MIT License · [Reuzola](https://github.com/Reuzola)
-
-</div>
+- The author takes no responsibility for any misuse.
+- This tool does not encrypt traffic or provide anonymity; it only bypasses
+  SNI-based filtering.
