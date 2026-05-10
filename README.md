@@ -1,4 +1,4 @@
-# dpi_bypass
+# SNIper
 
 A lightweight, zero-dependency DPI bypass proxy written in pure Python, shipped
 as a portable Windows `.exe`.
