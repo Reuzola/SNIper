@@ -6,7 +6,10 @@ How it works:
   1. Runs as a local HTTP proxy (CONNECT tunnel)
   2. Splits the TLS ClientHello into small TCP segments
      -> DPI never sees the full SNI field, so it lets the connection through
-  3. Uses DNS-over-HTTPS (IP-based) to bypass DNS poisoning
+  3. Resolves names via DNS-over-HTTPS; if DoH endpoints are unreachable,
+     falls back to plain UDP DNS aimed at public resolvers (1.1.1.1,
+     8.8.8.8, 9.9.9.9); only as a last resort uses the (possibly poisoned)
+     system DNS
   4. Pure Python, zero dependencies — pure user-space, no admin rights,
      no kernel drivers, no TAP adapters
 
@@ -34,6 +37,8 @@ import time
 import re
 import atexit
 import ctypes
+import struct
+import random
 from collections import OrderedDict
 
 try:
@@ -77,6 +82,7 @@ FRAGMENT_SIZE   = 2       # bytes — smaller is better for DPI evasion
 BUFFER          = 32768
 CONNECT_TIMEOUT = 10      # seconds
 DOH_TIMEOUT     = 4       # seconds
+UDP_DNS_TIMEOUT = 2.0     # seconds — short, we retry across servers
 DNS_CACHE_MAX   = 1024    # entries — bound the cache to avoid unbounded growth
 
 # IP-based DoH servers — no domain resolution needed, immune to DNS poisoning
@@ -85,6 +91,19 @@ DOH_SERVERS = [
     "https://1.0.0.1/dns-query",   # Cloudflare secondary
     "https://8.8.8.8/dns-query",   # Google
     "https://9.9.9.9/dns-query",   # Quad9
+]
+
+# Plain UDP DNS resolvers — used when DoH endpoints are blocked at the
+# network level (common with ISP-level DPI that interferes with TLS to
+# well-known DoH IPs). Many ISPs only poison responses from their *own*
+# resolver and pass UDP/53 traffic to other IPs through untouched.
+PLAIN_DNS_SERVERS = [
+    "1.1.1.1",        # Cloudflare
+    "8.8.8.8",        # Google
+    "9.9.9.9",        # Quad9
+    "1.0.0.1",        # Cloudflare secondary
+    "8.8.4.4",        # Google secondary
+    "208.67.222.222", # OpenDNS
 ]
 
 # Hop-by-hop headers that proxies must strip before forwarding (RFC 7230 §6.1)
@@ -128,19 +147,118 @@ def _cache_put(hostname: str, ip: str, ttl: float):
             _dns_cache.popitem(last=False)
 
 
-def resolve_doh(hostname: str) -> str:
-    """Resolve hostname via IP-based DoH with in-memory cache."""
-    if _is_ip(hostname):
-        return hostname
+# ── Plain UDP DNS (RFC 1035) ──────────────────────────────────────────────────
+# RR type numbers we actually use
+_DNS_TYPE_A    = 1
+_DNS_TYPE_AAAA = 28
 
-    cached = _cache_get(hostname)
-    if cached is not None:
-        return cached
 
+def _build_dns_query(hostname: str, tid: int, qtype: int = _DNS_TYPE_A) -> bytes:
+    """Encode a minimal query packet (A or AAAA) for the given hostname."""
+    # Header: id, flags=RD, qd=1, an=ns=ar=0
+    header = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0)
+    qname = b""
+    for part in hostname.encode("ascii").split(b"."):
+        if not part:
+            continue
+        if len(part) > 63:
+            raise ValueError("DNS label too long")
+        qname += bytes([len(part)]) + part
+    qname += b"\x00"
+    question = qname + struct.pack(">HH", qtype, 1)  # QTYPE, QCLASS=IN
+    return header + question
+
+
+def _skip_name(buf: bytes, off: int) -> int:
+    """Advance past a (possibly compressed) DNS name; return new offset."""
+    while off < len(buf):
+        l = buf[off]
+        if l == 0:
+            return off + 1
+        if l & 0xC0 == 0xC0:
+            return off + 2  # pointer — 2 bytes total
+        off += 1 + l
+    return off
+
+
+def _parse_dns_response(buf: bytes, expected_tid: int, want_type: int = _DNS_TYPE_A):
+    """Return (ip, ttl) for the first record of want_type, or None on failure."""
+    if len(buf) < 12:
+        return None
+    tid, flags, qd, an, _ns, _ar = struct.unpack(">HHHHHH", buf[:12])
+    if tid != expected_tid:
+        return None
+    if (flags & 0x000F) != 0:           # non-zero RCODE = error
+        return None
+    if an == 0:
+        return None
+    off = 12
+    # Skip question section
+    for _ in range(qd):
+        off = _skip_name(buf, off)
+        off += 4  # QTYPE + QCLASS
+    # Walk answers — skip CNAMEs and unrelated types, return first match.
+    for _ in range(an):
+        if off >= len(buf):
+            return None
+        off = _skip_name(buf, off)
+        if off + 10 > len(buf):
+            return None
+        rtype, _rclass, ttl, rdlen = struct.unpack(">HHIH", buf[off:off + 10])
+        off += 10
+        if off + rdlen > len(buf):
+            return None
+        if rtype == want_type:
+            if want_type == _DNS_TYPE_A and rdlen == 4:
+                ip = ".".join(str(b) for b in buf[off:off + 4])
+                return ip, int(ttl)
+            if want_type == _DNS_TYPE_AAAA and rdlen == 16:
+                ip = socket.inet_ntop(socket.AF_INET6, buf[off:off + 16])
+                return ip, int(ttl)
+        off += rdlen
+    return None
+
+
+def _udp_dns_query(hostname: str, server_ip: str,
+                   qtype: int = _DNS_TYPE_A,
+                   timeout: float = UDP_DNS_TIMEOUT):
+    """Send one A/AAAA query over UDP/53; return (ip, ttl) or None."""
+    tid = random.randint(0, 0xFFFF)
+    pkt = _build_dns_query(hostname, tid, qtype)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.settimeout(timeout)
+        s.sendto(pkt, (server_ip, 53))
+        # AAAA responses can exceed the classic 512-byte UDP DNS limit on
+        # hosts with many addresses; 2048 covers any realistic answer set.
+        resp, _addr = s.recvfrom(2048)
+    except OSError:
+        return None
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+    return _parse_dns_response(resp, tid, qtype)
+
+
+def _resolve_via_public_udp(hostname: str, qtype: int = _DNS_TYPE_A):
+    """Try plain UDP DNS against public resolvers. Returns (ip, ttl) or None."""
+    for srv in PLAIN_DNS_SERVERS:
+        result = _udp_dns_query(hostname, srv, qtype=qtype)
+        if result is not None:
+            ip, ttl = result
+            log.debug(f"UDP-DNS  {hostname} -> {ip}  [{srv}]")
+            return ip, max(int(ttl), 30)
+    return None
+
+
+def _doh_lookup(hostname: str, qtype_name: str, qtype_num: int):
+    """One DoH pass over all configured servers. Returns (ip, ttl) or None."""
     last_err: Exception | None = None
     for server in DOH_SERVERS:
         try:
-            url = f"{server}?name={urllib.parse.quote(hostname)}&type=A"
+            url = f"{server}?name={urllib.parse.quote(hostname)}&type={qtype_name}"
             # Some local middleware (HTTPS-scanning AV, captive portals)
             # rejects requests without a User-Agent; add a plausible one.
             req = urllib.request.Request(url, headers={
@@ -149,30 +267,110 @@ def resolve_doh(hostname: str) -> str:
             })
             with _no_proxy_opener.open(req, timeout=DOH_TIMEOUT) as resp:
                 data = json.loads(resp.read())
-            # Filter to A records (type 1) and pair each IP with its own TTL.
-            a_records = [(a["data"], a.get("TTL", 60))
-                         for a in data.get("Answer", [])
-                         if a.get("type") == 1 and "data" in a]
-            if not a_records:
+            records = [(a["data"], a.get("TTL", 60))
+                       for a in data.get("Answer", [])
+                       if a.get("type") == qtype_num and "data" in a]
+            if not records:
                 continue
-            ip, ttl = a_records[0]
-            ttl = max(int(ttl), 30)  # clamp tiny TTLs to avoid thrashing
-            _cache_put(hostname, ip, ttl)
-            log.debug(f"DoH  {hostname} -> {ip}  [{server}]")
-            return ip
+            ip, ttl = records[0]
+            log.debug(f"DoH  {hostname} {qtype_name} -> {ip}  [{server}]")
+            return ip, max(int(ttl), 30)
         except Exception as e:
-            log.debug(f"DoH  {server} failed for {hostname}: {type(e).__name__}: {e}")
+            log.debug(f"DoH  {server} failed for {hostname} ({qtype_name}): "
+                      f"{type(e).__name__}: {e}")
             last_err = e
             continue
+    if last_err is not None:
+        log.debug(f"All DoH servers exhausted for {hostname} ({qtype_name}): {last_err}")
+    return None
 
-    log.warning(f"All DoH servers failed ({hostname}): {last_err}  -> falling back to system DNS")
-    return socket.gethostbyname(hostname)
+
+def resolve_doh(hostname: str) -> str:
+    """Resolve hostname via (DoH → public UDP → system DNS), preferring IPv4.
+
+    Tries A records via DoH then public UDP; if no A is available anywhere,
+    repeats the chain for AAAA so IPv6-only hosts (e.g. Windows's
+    ipv6.msftconnecttest.com) still resolve. Falls back to getaddrinfo
+    as a last resort — covers system DNS for both address families.
+    """
+    if _is_ip(hostname):
+        return hostname
+
+    cached = _cache_get(hostname)
+    if cached is not None:
+        return cached
+
+    # 1) DoH A
+    doh_a = _doh_lookup(hostname, "A", _DNS_TYPE_A)
+    if doh_a is not None:
+        ip, ttl = doh_a
+        _cache_put(hostname, ip, ttl)
+        return ip
+
+    log.warning(f"All DoH servers failed ({hostname}): no A record  -> trying public UDP DNS")
+
+    # 2) Plain UDP DNS A to public resolvers — bypasses ISP DoH blocks while
+    #    still avoiding the local poisoned resolver.
+    udp_a = _resolve_via_public_udp(hostname, qtype=_DNS_TYPE_A)
+    if udp_a is not None:
+        ip, ttl = udp_a
+        _cache_put(hostname, ip, ttl)
+        log.info(f"Resolved {hostname} via public UDP DNS -> {ip}")
+        return ip
+
+    # 3) No A records anywhere — try AAAA (IPv6-only hosts like
+    #    ipv6.msftconnecttest.com). DoH first, then UDP.
+    doh_aaaa = _doh_lookup(hostname, "AAAA", _DNS_TYPE_AAAA)
+    if doh_aaaa is not None:
+        ip, ttl = doh_aaaa
+        _cache_put(hostname, ip, ttl)
+        log.info(f"Resolved {hostname} via DoH (IPv6) -> {ip}")
+        return ip
+    udp_aaaa = _resolve_via_public_udp(hostname, qtype=_DNS_TYPE_AAAA)
+    if udp_aaaa is not None:
+        ip, ttl = udp_aaaa
+        _cache_put(hostname, ip, ttl)
+        log.info(f"Resolved {hostname} via public UDP DNS (IPv6) -> {ip}")
+        return ip
+
+    log.warning(f"Public DNS unavailable for {hostname}  -> falling back to system DNS")
+
+    # 4) Last resort — system resolver. Use getaddrinfo so we also see AAAA
+    #    when the host has no A record. Prefer IPv4 when both exist.
+    try:
+        info = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        # Re-raise as gethostbyname would, so callers see the same error class.
+        raise
+    for fam, _t, _p, _c, sa in info:
+        if fam == socket.AF_INET:
+            return sa[0]
+    for fam, _t, _p, _c, sa in info:
+        if fam == socket.AF_INET6:
+            return sa[0]
+    raise socket.gaierror(f"no usable address for {hostname}")
 
 
 # ── TCP connection + ClientHello fragmentation ────────────────────────────────
+def _resolve_for_connect(host: str, use_doh: bool) -> str:
+    """Pick a resolution strategy. With DoH off, getaddrinfo so AAAA-only
+    hosts still resolve through system DNS."""
+    if use_doh:
+        return resolve_doh(host)
+    info = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    for fam, _t, _p, _c, sa in info:
+        if fam == socket.AF_INET:
+            return sa[0]
+    for fam, _t, _p, _c, sa in info:
+        if fam == socket.AF_INET6:
+            return sa[0]
+    raise socket.gaierror(f"no usable address for {host}")
+
+
 def connect_remote(host: str, port: int, use_doh: bool) -> socket.socket:
-    ip = resolve_doh(host) if use_doh else socket.gethostbyname(host)
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    ip = _resolve_for_connect(host, use_doh)
+    family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
     try:
         sock.settimeout(CONNECT_TIMEOUT)
         # Nagle disabled — each send() becomes its own TCP segment (critical for fragmentation)

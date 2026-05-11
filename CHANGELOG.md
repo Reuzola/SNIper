@@ -1,5 +1,72 @@
 # Changelog
 
+## v1.1.1 — 2026-05-11
+
+### DNS resolution chain — survives blocked DoH and IPv6-only hosts
+
+The resolver previously had a two-step chain (DoH → system DNS) which broke
+under two real-world conditions surfaced by user testing on a third x64
+machine:
+
+1. **DoH endpoints unreachable.** On networks where the ISP or local
+   middleware blocks TLS to `1.1.1.1`, `8.8.8.8`, etc., every DoH server
+   failed and the resolver fell back to the system resolver — which is the
+   exact resolver DoH was meant to bypass. Domains under DNS poisoning
+   (e.g. `discord.com`) then returned a poisoned address and connections
+   could not be established.
+2. **IPv6-only hosts.** `ipv6.msftconnecttest.com` (Windows's IPv6
+   connectivity probe) publishes only an AAAA record. The resolver asked
+   only for A records, so DoH and system DNS both returned "no record" and
+   the HTTP relay logged a spurious error.
+
+The chain is now: **DoH-A → public UDP DNS A → DoH-AAAA → public UDP DNS
+AAAA → `getaddrinfo`**. IPv4 is preferred whenever available; IPv6 is used
+only when no A record exists anywhere.
+
+### Plain UDP DNS fallback
+
+When all DoH servers fail, the resolver now sends plain DNS queries over
+UDP/53 to public resolvers (`1.1.1.1`, `8.8.8.8`, `9.9.9.9`, `1.0.0.1`,
+`8.8.4.4`, `208.67.222.222`). Most ISP-level DPI only poisons responses
+from the ISP's own resolver and passes UDP/53 traffic to other IPs
+through untouched, so this fallback recovers connectivity even when DoH
+is blocked. The DNS packet builder and parser are hand-rolled per
+RFC 1035 — no new dependencies.
+
+### AAAA (IPv6) record support
+
+`_udp_dns_query` and `_parse_dns_response` accept a query-type parameter
+(A or AAAA). The DoH path was factored into a `_doh_lookup` helper so it
+can run twice (once for each record type) without duplicating the request
+loop. `connect_remote` inspects the resolved address and opens an
+`AF_INET6` socket when given an IPv6 literal, so IPv6-only hosts are
+reachable on dual-stack machines.
+
+### System-DNS fallback uses `getaddrinfo`
+
+The final fallback was `socket.gethostbyname`, which is IPv4-only. It is
+now `socket.getaddrinfo` with `SOCK_STREAM`, which returns both families.
+IPv4 is preferred when both exist; IPv6 is used only as a last resort.
+This change also matters when `--no-doh` is set — AAAA-only hosts now
+resolve correctly through the system resolver too.
+
+### GUI activity log
+
+New friendly-formatted lines for the additional resolution paths:
+
+- `Secure DNS unavailable for X — trying public DNS` (DoH failed,
+  attempting plain UDP next).
+- `Resolved X via public DNS  (IP)` (plain UDP DNS succeeded).
+- `Resolved X via IPv6  (IP)` (AAAA via DoH succeeded).
+- `Resolved X via IPv6 public DNS  (IP)` (AAAA via plain UDP succeeded).
+- `Public DNS unreachable for X — using system DNS` (both DoH and plain
+  UDP exhausted across all record types).
+
+The `Disable DoH` tooltip was updated to mention that turning DoH off
+also disables the plain UDP fallback.
+
+---
+
 ## v1.1.0 — 2026-05-10
 
 ### Distribution
