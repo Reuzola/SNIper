@@ -1,29 +1,25 @@
+# Build artifacts
+/SNIper_*.exe
+*.spec
+build/
+dist/
+packaging/build/
+packaging/dist/
+
 # Python
 __pycache__/
 *.py[cod]
 *.pyo
-*.pyd
 *.egg-info/
-dist/
-build/
-*.egg
-
-# Virtual environments
 .venv/
 venv/
 env/
 
-# IDE
-.vscode/
-.idea/
-*.suo
-*.user
-
-# OS
-.DS_Store
+# OS / editor
 Thumbs.db
 desktop.ini
-
-# Runtime artifacts
-error_log.txt
-*.log
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

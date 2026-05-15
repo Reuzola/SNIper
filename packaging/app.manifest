@@ -2,10 +2,10 @@
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <assemblyIdentity
       type="win32"
-      name="DPIBypassProxy"
-      version="1.1.0.0"
+      name="SNIper"
+      version="1.1.2.0"
       processorArchitecture="*"/>
-  <description>DPI Bypass Proxy</description>
+  <description>SNIper - SNI-based DPI bypass proxy</description>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>

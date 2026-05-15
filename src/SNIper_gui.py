@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-dpi_bypass_gui.py — modern GUI front-end for the DPI bypass proxy.
+SNIper_gui.py — modern GUI front-end for SNIper.
 
-All proxy logic is embedded; no separate file needed.
+All proxy logic is embedded; no separate file needed (this mirrors the core
+in SNIper.py so the GUI stays a single self-contained, packageable file).
 Requires only the Python standard library (tkinter, ctypes — both ship with
 CPython on Windows). The system-tray icon is implemented directly against
 the Win32 Shell_NotifyIcon API so no third-party packages are needed.
@@ -12,16 +13,14 @@ Windows system proxy is toggled via HKEY_CURRENT_USER, and ClientHello
 fragmentation is a userland send() pattern. No admin rights, no kernel
 drivers, no service install — launching from a non-elevated shell never
 triggers a UAC prompt. Packaged as a portable single-file EXE via PyInstaller
-(see build_exe.bat).
+(see packaging/build_exe.bat).
 """
 
 import tkinter as tk
 from tkinter import ttk, scrolledtext
 import threading
 import socket
-import urllib.request
-import urllib.parse
-import json
+import base64
 import ssl
 import time
 import re
@@ -70,7 +69,7 @@ _enable_high_dpi()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Proxy core (identical to dpi_bypass.py — UNCHANGED logic)
+#  Proxy core (identical to SNIper.py — UNCHANGED logic)
 # ─────────────────────────────────────────────────────────────────────────────
 _IP_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
 def _is_ip(h): return bool(_IP_RE.match(h))
@@ -80,21 +79,26 @@ try:
     _doh_ssl_ctx.set_alpn_protocols(["http/1.1"])
 except (NotImplementedError, AttributeError):
     pass
-_no_proxy_opener = urllib.request.build_opener(
-    urllib.request.ProxyHandler({}),
-    urllib.request.HTTPSHandler(context=_doh_ssl_ctx),
-)
 
 BUFFER          = 32768
 CONNECT_TIMEOUT = 10
 DOH_TIMEOUT     = 4
 UDP_DNS_TIMEOUT = 2.0
 DNS_CACHE_MAX   = 1024
+# Order chosen for resilience on hostile networks: Cloudflare 1.1.1.1 is the
+# fastest when reachable, but it is also the most commonly MITM'd and IP-
+# blocked DoH endpoint (Turkey, Iran, etc. routinely intercept TLS to it),
+# so Google and AdGuard follow immediately as alternates. DNS.SB is included
+# because it is rarely on any block list. Quad9 (9.9.9.9) is intentionally
+# omitted — it requires HTTP/2 (RFC 8484 §5.2), which Python's stdlib does
+# not implement, so it always returns 505 over HTTP/1.1.
 DOH_SERVERS = [
-    "https://1.1.1.1/dns-query",
-    "https://1.0.0.1/dns-query",
-    "https://8.8.8.8/dns-query",
-    "https://9.9.9.9/dns-query",
+    "https://1.1.1.1/dns-query",          # Cloudflare primary
+    "https://8.8.8.8/dns-query",          # Google primary
+    "https://94.140.14.14/dns-query",     # AdGuard primary
+    "https://1.0.0.1/dns-query",          # Cloudflare secondary
+    "https://8.8.4.4/dns-query",          # Google secondary
+    "https://185.222.222.222/dns-query",  # DNS.SB — rarely blocked, last resort
 ]
 # Plain UDP DNS resolvers — used when DoH endpoints are blocked at the
 # network level (common with ISP-level DPI that interferes with TLS to
@@ -229,24 +233,261 @@ def _resolve_via_public_udp(hostname, log_q, qtype=_DNS_TYPE_A):
     return None
 
 
+# ── Plain TCP DNS (RFC 7766) — fallback when UDP/53 is intercepted ───────────
+# Some ISPs rewrite responses on UDP/53 to public resolvers but pass TCP/53
+# through untouched. Wire format: 2-byte big-endian length prefix + DNS msg.
+
+
+def _tcp_dns_query(hostname, server_ip, qtype=_DNS_TYPE_A, timeout=UDP_DNS_TIMEOUT):
+    tid = random.randint(0, 0xFFFF)
+    pkt = _build_dns_query(hostname, tid, qtype)
+    framed = struct.pack(">H", len(pkt)) + pkt
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.settimeout(timeout)
+        s.connect((server_ip, 53))
+        s.sendall(framed)
+        head = b""
+        while len(head) < 2:
+            chunk = s.recv(2 - len(head))
+            if not chunk:
+                return None
+            head += chunk
+        resp_len = struct.unpack(">H", head)[0]
+        body = b""
+        while len(body) < resp_len:
+            chunk = s.recv(resp_len - len(body))
+            if not chunk:
+                return None
+            body += chunk
+    except OSError:
+        return None
+    finally:
+        try: s.close()
+        except OSError: pass
+    return _parse_dns_response(body, tid, qtype)
+
+
+def _resolve_via_public_tcp(hostname, log_q, qtype=_DNS_TYPE_A):
+    for srv in PLAIN_DNS_SERVERS:
+        result = _tcp_dns_query(hostname, srv, qtype=qtype)
+        if result is not None:
+            ip, ttl = result
+            log_q.put(("DEBUG", f"TCP-DNS  {hostname} -> {ip}  [{srv}]"))
+            return ip, max(int(ttl), 30)
+        else:
+            log_q.put(("DEBUG", f"TCP-DNS  {srv} failed for {hostname}"))
+    return None
+
+
+# ── Fragmented HTTPS GET (for DoH) ────────────────────────────────────────────
+# Python's `urllib` (and `ssl.wrap_socket` in general) writes the TLS
+# ClientHello in a single TCP segment. On networks that block DoH via DPI —
+# either by fingerprinting the ClientHello or by RST-injecting traffic to
+# well-known resolver IPs — every DoH request fails before DNS is resolved at
+# all, so the proxy falls back to plain UDP DNS, which is itself often
+# poisoned for blocked hostnames.
+#
+# We drive the TLS handshake by hand through SSL BIOs and send the first
+# outgoing TCP write (the ClientHello, with its TLS fingerprint and extensions)
+# split into 2-byte segments — the same trick the proxy uses for client
+# traffic. Once the handshake completes, the rest of the connection runs at
+# normal speed.
+
+_DOH_FRAGMENT_SIZE = 2  # bytes per TCP segment for the DoH ClientHello
+
+
+def _send_segmented(sock, data, seg_size):
+    """Send `data` in seg_size-byte TCP segments. TCP_NODELAY must be on."""
+    if seg_size < 1:
+        seg_size = 1
+    off, n = 0, len(data)
+    while off < n:
+        end = min(off + seg_size, n)
+        chunk_off = off
+        while chunk_off < end:
+            sent = sock.send(data[chunk_off:end])
+            if sent == 0:
+                raise OSError("socket closed during segmented send")
+            chunk_off += sent
+        off = end
+
+
+def _parse_http_response(raw):
+    """Minimal HTTP/1.x response parser. Handles chunked transfer encoding."""
+    sep = raw.find(b"\r\n\r\n")
+    if sep < 0:
+        raise ValueError("malformed HTTP response (no header terminator)")
+    header_block = raw[:sep].decode("latin-1", errors="replace")
+    body = raw[sep + 4:]
+
+    status_line, _, rest = header_block.partition("\r\n")
+    parts = status_line.split(" ", 2)
+    if len(parts) < 2 or not parts[1].isdigit():
+        raise ValueError("malformed HTTP status line")
+    status = int(parts[1])
+
+    headers = {}
+    for line in rest.split("\r\n"):
+        if ":" in line:
+            k, _, v = line.partition(":")
+            headers[k.strip().lower()] = v.strip()
+
+    if headers.get("transfer-encoding", "").lower() == "chunked":
+        decoded = bytearray()
+        i = 0
+        while i < len(body):
+            j = body.find(b"\r\n", i)
+            if j < 0:
+                break
+            size_str = body[i:j].split(b";", 1)[0].strip()
+            try:
+                size = int(size_str, 16)
+            except ValueError:
+                break
+            if size == 0:
+                break
+            start = j + 2
+            decoded.extend(body[start:start + size])
+            i = start + size + 2
+        body = bytes(decoded)
+    return status, body
+
+
+def _fragmented_https_get(server_ip, path_with_query, headers, timeout):
+    """Issue HTTPS GET to server_ip:443 with the ClientHello fragmented.
+
+    Returns (status, body). Raises on connect / handshake / read errors.
+    """
+    sock = socket.create_connection((server_ip, 443), timeout=timeout)
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        incoming = ssl.MemoryBIO()
+        outgoing = ssl.MemoryBIO()
+        ssl_obj = _doh_ssl_ctx.wrap_bio(
+            incoming, outgoing, server_hostname=server_ip,
+        )
+        client_hello_sent = False
+
+        def _flush():
+            nonlocal client_hello_sent
+            pending = outgoing.read()
+            if not pending:
+                return
+            if not client_hello_sent:
+                _send_segmented(sock, pending, _DOH_FRAGMENT_SIZE)
+                client_hello_sent = True
+            else:
+                sock.sendall(pending)
+
+        def _pull():
+            sock.settimeout(timeout)
+            chunk = sock.recv(16384)
+            if not chunk:
+                raise OSError("EOF during TLS exchange")
+            incoming.write(chunk)
+
+        while True:
+            try:
+                ssl_obj.do_handshake()
+                break
+            except ssl.SSLWantReadError:
+                _flush()
+                _pull()
+            except ssl.SSLWantWriteError:
+                _flush()
+        _flush()
+
+        lines = [
+            f"GET {path_with_query} HTTP/1.1",
+            f"Host: {server_ip}",
+            "Connection: close",
+        ]
+        for k, v in headers.items():
+            lines.append(f"{k}: {v}")
+        req = ("\r\n".join(lines) + "\r\n\r\n").encode("ascii")
+
+        sent = 0
+        while sent < len(req):
+            try:
+                n = ssl_obj.write(req[sent:])
+                sent += n
+                _flush()
+            except ssl.SSLWantReadError:
+                _flush()
+                _pull()
+            except ssl.SSLWantWriteError:
+                _flush()
+
+        response = bytearray()
+        while True:
+            try:
+                data = ssl_obj.read(16384)
+                if not data:
+                    break
+                response.extend(data)
+            except ssl.SSLWantReadError:
+                _flush()
+                try:
+                    _pull()
+                except OSError:
+                    break
+            except ssl.SSLZeroReturnError:
+                break
+            except ssl.SSLError as e:
+                if "UNEXPECTED_EOF" in str(e).upper():
+                    break
+                raise
+
+        return _parse_http_response(bytes(response))
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
 def _doh_lookup(hostname, qtype_name, qtype_num, log_q):
-    """One DoH pass over all configured servers. Returns (ip, ttl) or None."""
+    """One DoH pass over all configured servers. Returns (ip, ttl) or None.
+
+    Uses RFC 8484 wire format (Content-Type: application/dns-message) — the
+    standard binary DoH protocol every compliant resolver implements
+    identically. JSON DoH (`application/dns-json`) is not universally
+    supported: Google rejects it at `/dns-query`, Quad9 only accepts RFC 8484
+    over HTTP/2, others return 400/505 inconsistently. Binary wire format
+    avoids the mismatch entirely and reuses the same parser the UDP path uses.
+    The TLS ClientHello is fragmented so DPI engines that fingerprint or
+    RST-inject DoH connections cannot block the lookup.
+    """
     last_err = None
     for srv in DOH_SERVERS:
         try:
-            url = f"{srv}?name={urllib.parse.quote(hostname)}&type={qtype_name}"
-            req = urllib.request.Request(url, headers={
-                "Accept":     "application/dns-json",
-                "User-Agent": "Mozilla/5.0 dpi_bypass/1.0",
-            })
-            with _no_proxy_opener.open(req, timeout=DOH_TIMEOUT) as r:
-                data = json.loads(r.read())
-            records = [(a["data"], a.get("TTL", 60))
-                       for a in data.get("Answer", [])
-                       if a.get("type") == qtype_num and "data" in a]
-            if not records:
+            after = srv[len("https://"):]
+            slash = after.find("/")
+            server_ip = after[:slash] if slash > 0 else after
+            path = after[slash:] if slash > 0 else "/"
+
+            # RFC 8484 §4.1: id SHOULD be 0 for HTTP cache friendliness.
+            tid = 0
+            pkt = _build_dns_query(hostname, tid, qtype_num)
+            b64 = base64.urlsafe_b64encode(pkt).rstrip(b"=").decode("ascii")
+            status, body = _fragmented_https_get(
+                server_ip, f"{path}?dns={b64}",
+                headers={
+                    "Accept":     "application/dns-message",
+                    "User-Agent": "Mozilla/5.0 SNIper/1.1.2",
+                },
+                timeout=DOH_TIMEOUT,
+            )
+            if status != 200 or len(body) < 12:
+                log_q.put(("DEBUG",
+                           f"DoH  {srv} returned HTTP {status} for {hostname}"))
                 continue
-            ip, ttl = records[0]
+            parsed = _parse_dns_response(body, tid, qtype_num)
+            if parsed is None:
+                continue
+            ip, ttl = parsed
             return ip, max(int(ttl), 30)
         except Exception as e:
             log_q.put(("DEBUG",
@@ -257,8 +498,8 @@ def _doh_lookup(hostname, qtype_name, qtype_num, log_q):
 
 
 def resolve_doh(hostname, use_doh, log_q):
-    """DoH → public UDP → AAAA → system DNS. Prefers IPv4; falls back to IPv6
-    for hosts that publish only AAAA (e.g. ipv6.msftconnecttest.com)."""
+    """DoH → public UDP → public TCP → AAAA → system DNS. Prefers IPv4;
+    falls back to IPv6 for hosts that publish only AAAA."""
     if _is_ip(hostname):
         return hostname
     if not use_doh:
@@ -275,7 +516,7 @@ def resolve_doh(hostname, use_doh, log_q):
     if cached is not None:
         return cached
 
-    # 1) DoH A
+    # 1) DoH A — fragmented ClientHello to bypass DPI on resolver IPs.
     doh_a = _doh_lookup(hostname, "A", _DNS_TYPE_A, log_q)
     if doh_a is not None:
         ip, ttl = doh_a
@@ -294,7 +535,15 @@ def resolve_doh(hostname, use_doh, log_q):
         log_q.put(("INFO", f"Resolved {hostname} via public UDP DNS -> {ip}"))
         return ip
 
-    # 3) AAAA — IPv6-only hosts (e.g. ipv6.msftconnecttest.com).
+    # 3) Plain TCP DNS A — ISPs that rewrite UDP/53 often leave TCP/53 alone.
+    tcp_a = _resolve_via_public_tcp(hostname, log_q, qtype=_DNS_TYPE_A)
+    if tcp_a is not None:
+        ip, ttl = tcp_a
+        _cache_put(hostname, ip, ttl)
+        log_q.put(("INFO", f"Resolved {hostname} via public TCP DNS -> {ip}"))
+        return ip
+
+    # 4) AAAA — IPv6-only hosts (e.g. ipv6.msftconnecttest.com).
     doh_aaaa = _doh_lookup(hostname, "AAAA", _DNS_TYPE_AAAA, log_q)
     if doh_aaaa is not None:
         ip, ttl = doh_aaaa
@@ -307,11 +556,17 @@ def resolve_doh(hostname, use_doh, log_q):
         _cache_put(hostname, ip, ttl)
         log_q.put(("INFO", f"Resolved {hostname} via public UDP DNS (IPv6) -> {ip}"))
         return ip
+    tcp_aaaa = _resolve_via_public_tcp(hostname, log_q, qtype=_DNS_TYPE_AAAA)
+    if tcp_aaaa is not None:
+        ip, ttl = tcp_aaaa
+        _cache_put(hostname, ip, ttl)
+        log_q.put(("INFO", f"Resolved {hostname} via public TCP DNS (IPv6) -> {ip}"))
+        return ip
 
     log_q.put(("WARNING",
                f"Public DNS unavailable for {hostname}  -> system DNS"))
 
-    # 4) Last resort — system resolver. getaddrinfo also sees AAAA, so
+    # 5) Last resort — system resolver. getaddrinfo also sees AAAA, so
     #    AAAA-only hosts still resolve here.
     info = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
     for fam, _t, _p, _c, sa in info:
@@ -809,7 +1064,7 @@ class TrayIcon:
     _MENU_EXIT   = 1003
 
     def __init__(self, on_show, on_toggle, on_exit, is_running, tk_after,
-                 tooltip="DPI Bypass Proxy"):
+                 tooltip="SNIper"):
         self.on_show    = on_show
         self.on_toggle  = on_toggle
         self.on_exit    = on_exit
@@ -819,7 +1074,7 @@ class TrayIcon:
 
         self._hwnd        = None
         self._wndproc_ref = None  # keep WNDPROC alive
-        self._cls_name    = f"DPIBypassTray_{id(self)}"
+        self._cls_name    = f"SNIperTray_{id(self)}"
         self._thread      = None
         self._added       = False
         self._ready       = threading.Event()
@@ -887,7 +1142,7 @@ class TrayIcon:
             return
 
         hwnd = _user32.CreateWindowExW(
-            0, self._cls_name, "DPIBypassTray",
+            0, self._cls_name, "SNIperTray",
             0, 0, 0, 0, 0,
             _HWND_MESSAGE, 0, hinst, None,
         )
@@ -964,8 +1219,10 @@ _RX_FRAG    = re.compile(r"^\[frag\s+\d+B\]\s+(?P<host>[^\s:]+):(?P<port>\d+)$")
 _RX_HTTP    = re.compile(r"^(?P<method>GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)\s+(?P<url>\S+)")
 _RX_DOH_FAIL    = re.compile(r"^All DoH servers failed \((?P<host>[^)]+)\):.*->\s+trying public UDP DNS$")
 _RX_UDP_OK      = re.compile(r"^Resolved (?P<host>\S+) via public UDP DNS -> (?P<ip>\S+)$")
+_RX_TCP_OK      = re.compile(r"^Resolved (?P<host>\S+) via public TCP DNS -> (?P<ip>\S+)$")
 _RX_V6_DOH_OK   = re.compile(r"^Resolved (?P<host>\S+) via DoH \(IPv6\) -> (?P<ip>\S+)$")
 _RX_V6_UDP_OK   = re.compile(r"^Resolved (?P<host>\S+) via public UDP DNS \(IPv6\) -> (?P<ip>\S+)$")
+_RX_V6_TCP_OK   = re.compile(r"^Resolved (?P<host>\S+) via public TCP DNS \(IPv6\) -> (?P<ip>\S+)$")
 _RX_UDP_FAIL    = re.compile(r"^Public DNS unavailable for (?P<host>\S+)\s+->\s+system DNS$")
 _RX_NOCON   = re.compile(r"^Could not connect to (?P<host>[^:]+):(?P<port>\d+)\s+->")
 _RX_HTTPERR = re.compile(r"^HTTP relay error:")
@@ -1016,6 +1273,10 @@ def friendly_format(level, msg):
     if m:
         return ("OK", f"Resolved {m['host']} via public DNS  ({m['ip']})")
 
+    m = _RX_TCP_OK.match(msg)
+    if m:
+        return ("OK", f"Resolved {m['host']} via TCP DNS  ({m['ip']})")
+
     m = _RX_V6_DOH_OK.match(msg)
     if m:
         return ("OK", f"Resolved {m['host']} via IPv6  ({m['ip']})")
@@ -1023,6 +1284,10 @@ def friendly_format(level, msg):
     m = _RX_V6_UDP_OK.match(msg)
     if m:
         return ("OK", f"Resolved {m['host']} via IPv6 public DNS  ({m['ip']})")
+
+    m = _RX_V6_TCP_OK.match(msg)
+    if m:
+        return ("OK", f"Resolved {m['host']} via IPv6 TCP DNS  ({m['ip']})")
 
     m = _RX_UDP_FAIL.match(msg)
     if m:
@@ -1151,7 +1416,7 @@ class HoverButton(tk.Button):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("DPI Bypass Proxy")
+        self.title("SNIper")
         self.configure(bg=C["bg"])
         self.minsize(640, 540)
         self.geometry("760x640")
@@ -1173,7 +1438,7 @@ class App(tk.Tk):
             on_exit=self._tray_exit,
             is_running=lambda: self.proxy.running,
             tk_after=self.after,
-            tooltip="DPI Bypass Proxy",
+            tooltip="SNIper",
         )
 
         self._build()
@@ -1268,7 +1533,7 @@ class App(tk.Tk):
         hdr.grid_columnconfigure(0, weight=1)
         inner_h = tk.Frame(hdr, bg=C["surface"])
         inner_h.grid(row=0, column=0, padx=22, pady=(16, 14), sticky="w")
-        tk.Label(inner_h, text="DPI Bypass Proxy",
+        tk.Label(inner_h, text="SNIper",
                  font=FONT_TITLE, bg=C["surface"], fg=C["text"]
                  ).grid(row=0, column=0, sticky="w")
         tk.Label(inner_h,

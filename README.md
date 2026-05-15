@@ -1,4 +1,4 @@
-# dpi_bypass
+# SNIper
 
 A lightweight, zero-dependency DPI bypass proxy written in pure Python, shipped
 as a portable Windows `.exe`.
@@ -51,7 +51,7 @@ require elevation**.
 
 ### Just run the EXE
 
-**Double-click `DPI_Bypass_Proxy_<arch>.exe`**. No install, no admin prompt,
+**Double-click `SNIper_<arch>.exe`**. No install, no admin prompt,
 no dependencies.
 
 A window opens with all settings visible. Press **START** to activate the proxy
@@ -62,21 +62,37 @@ The EXE is fully portable: copy it anywhere (USB drive, OneDrive, etc.) and it
 will run from there. It writes nothing to the registry except the per-user
 proxy settings, which it restores on exit.
 
-## Files
+## Project layout
 
-| File | Purpose |
+```
+SNIper_v1.1.2/
+├── README.md                  This file
+├── LICENSE                    MIT License
+├── CHANGELOG.md               Version history
+├── .gitignore
+├── src/
+│   ├── SNIper_gui.py          GUI front-end (all proxy logic embedded)
+│   └── SNIper.py              CLI core (no GUI)
+└── packaging/
+    ├── build_exe.bat          Build the portable EXE for this architecture
+    ├── app.manifest           asInvoker (no UAC) + Per-Monitor v2 DPI
+    └── version_info.txt       EXE metadata (anti-false-positive)
+```
+
+The built executable (`SNIper_<arch>.exe`) is dropped at the project root,
+next to this README, after running `packaging\build_exe.bat`.
+
+| Path | Purpose |
 |------|---------|
-| `DPI_Bypass_Proxy_arm64.exe` | Portable GUI executable (ARM64 Windows) |
-| `DPI_Bypass_Proxy_x64.exe` | Portable GUI executable (x64 Windows), built via `build_exe.bat` |
-| `dpi_bypass_gui.py` | GUI source (all proxy logic embedded) |
-| `dpi_bypass.py` | CLI source (no GUI) |
-| `build_exe.bat` | Rebuild the EXE for the current architecture |
-| `README.md` | This file |
+| `src/SNIper_gui.py` | GUI source — the file PyInstaller packages into the EXE |
+| `src/SNIper.py` | CLI source (no GUI), for scripting / headless use |
+| `packaging/build_exe.bat` | Rebuild `SNIper_<arch>.exe` for the current architecture |
+| `SNIper_<arch>.exe` | Portable GUI executable, produced by the build script |
 
 > **Note on architectures:** PyInstaller does not cross-compile, so each EXE
-> must be built on a machine of its own architecture. The repository ships
-> with the ARM64 build; to produce the x64 build, run `build_exe.bat` on an
-> x64 Windows machine.
+> must be built on a machine of its own architecture. To produce the x64
+> build, run `packaging\build_exe.bat` on an x64 Windows machine; for ARM64,
+> run it on an ARM64 machine.
 
 ## Why no admin prompt?
 
@@ -113,12 +129,12 @@ The GUI provides:
 
 ## Running the CLI version (optional)
 
-The repository also ships the original CLI script (`dpi_bypass.py`) for users
-who want to embed the proxy in their own scripts or run it without a GUI.
-This is **not** packaged into the EXE; to use it you need a Python install:
+The repository also ships the CLI script (`src/SNIper.py`) for users who want
+to embed the proxy in their own scripts or run it without a GUI. This is
+**not** packaged into the EXE; to use it you need a Python install:
 
 ```
-python dpi_bypass.py [options]
+python src/SNIper.py [options]
 
   --port N        Listen port (default: 8881)
   --fragment N    ClientHello fragment size in bytes (default: 2)
@@ -169,13 +185,13 @@ If you want to build the EXE yourself (e.g. to inspect the bundle, or to
 produce a build for a different architecture):
 
 ```
-build_exe.bat
+packaging\build_exe.bat
 ```
 
 This installs PyInstaller into the active Python and produces
-`dist\DPI_Bypass_Proxy_<arch>.exe`. The architecture is taken from the Python
-interpreter, so to produce the x64 build, run the script with an x64 Python on
-an x64 host.
+`SNIper_<arch>.exe` at the project root. The architecture is taken from the
+Python interpreter, so to produce the x64 build, run the script with an x64
+Python on an x64 host.
 
 ## Disclaimer
 

@@ -1,5 +1,66 @@
 # Changelog
 
+## v1.1.2 — 2026-05-15
+
+### DoH now survives TLS-MITM and provider quirks (RFC 8484 wire format)
+
+Real-world testing on aggressively filtered networks surfaced three
+independent failures that left DoH unusable, forcing every lookup down to
+plain UDP DNS — which is itself poisoned for blocked hostnames:
+
+1. **DoH ClientHello sent in a single TCP segment.** The resolver used
+   `urllib`, which hands the whole TLS ClientHello to the OS in one write.
+   DPI engines that fingerprint or RST-inject DoH connections dropped every
+   request. The resolver now drives the TLS handshake by hand through SSL
+   BIOs and splits the first write (the ClientHello) into 2-byte TCP
+   segments — the same evasion the proxy already applies to client traffic.
+2. **JSON DoH is not portable.** `application/dns-json` works on Cloudflare
+   but Google rejects it at `/dns-query` (HTTP 400 — JSON only lives at the
+   non-standard `/resolve`), and other providers answered 400/505
+   inconsistently. DoH now uses the **RFC 8484 binary wire format**
+   (`application/dns-message`): the query is the same packet the UDP path
+   builds, base64url-encoded into `?dns=`, and the reply is parsed by the
+   existing DNS message parser. No JSON, no per-provider divergence.
+3. **TLS-MITM on Cloudflare resolver IPs.** Some ISPs present a forged
+   certificate for `1.1.1.1` / `1.0.0.1`, so verification correctly fails
+   (accepting it would hand DNS to the interceptor). The server list was
+   reordered and widened so a fast cert failure on Cloudflare falls through
+   to a working resolver in well under a second.
+
+### DoH server list
+
+Quad9 (`9.9.9.9`) was removed — it enforces HTTP/2 (RFC 8484 §5.2), which
+the standard library does not implement, so it always returned 505. AdGuard
+(`94.140.14.14`, `94.140.15.15`) and DNS.SB (`185.222.222.222`) were added;
+both are rarely MITM'd or IP-blocked and answer the binary wire format over
+HTTP/1.1. New order: Cloudflare → Google → AdGuard → Cloudflare 2 →
+Google 2 → DNS.SB.
+
+### Plain TCP DNS fallback (RFC 7766)
+
+Between the public UDP DNS step and the system-resolver last resort, the
+chain now also tries DNS over TCP/53 to the same public resolvers. Networks
+that rewrite UDP/53 responses frequently leave TCP/53 untouched. Full chain:
+**DoH-A → UDP-A → TCP-A → DoH-AAAA → UDP-AAAA → TCP-AAAA → getaddrinfo**.
+
+### Project restructure & rename
+
+Files were renamed to match the project (`SNIper`) and organised into a
+conventional layout:
+
+- `dpi_bypass.py` → `src/SNIper.py`
+- `dpi_bypass_gui.py` → `src/SNIper_gui.py`
+- `build_exe.bat`, `app.manifest`, `version_info.txt` → `packaging/`
+- The built executable is now `SNIper_<arch>.exe` (was
+  `DPI_Bypass_Proxy_<arch>.exe`), dropped at the project root.
+
+EXE metadata, window title, tray tooltip, log channel and the CLI banner
+were rebranded to **SNIper**; embedded version bumped to `1.1.2.0`. The
+`build_exe.bat` console output (previously partly Turkish) is now fully
+English.
+
+---
+
 ## v1.1.1 — 2026-05-11
 
 ### DNS resolution chain — survives blocked DoH and IPv6-only hosts

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-dpi_bypass.py — Lightweight SNI-based DPI bypass proxy
--------------------------------------------------------
+SNIper.py — Lightweight SNI-based DPI bypass proxy (CLI core)
+-------------------------------------------------------------
 How it works:
   1. Runs as a local HTTP proxy (CONNECT tunnel)
   2. Splits the TLS ClientHello into small TCP segments
@@ -14,7 +14,7 @@ How it works:
      no kernel drivers, no TAP adapters
 
 Usage:
-  python dpi_bypass.py
+  python SNIper.py
   (or run the packaged GUI executable — see README)
 
 Options:
@@ -29,9 +29,7 @@ import sys
 import threading
 import argparse
 import logging
-import urllib.request
-import urllib.parse
-import json
+import base64
 import ssl
 import time
 import re
@@ -66,16 +64,6 @@ try:
 except (NotImplementedError, AttributeError):
     pass  # very old OpenSSL — skip ALPN
 
-# Opener that:
-#   1. Bypasses the system proxy (i.e. ourselves) to avoid loops
-#   2. Uses our DoH SSL context for HTTPS — note that OpenerDirector.open()
-#      does NOT accept a `context` kwarg, so we must wire it in via the
-#      HTTPSHandler at build time.
-_no_proxy_opener = urllib.request.build_opener(
-    urllib.request.ProxyHandler({}),
-    urllib.request.HTTPSHandler(context=_doh_ssl_ctx),
-)
-
 # ── Settings ──────────────────────────────────────────────────────────────────
 DEFAULT_PORT    = 8881
 FRAGMENT_SIZE   = 2       # bytes — smaller is better for DPI evasion
@@ -85,12 +73,22 @@ DOH_TIMEOUT     = 4       # seconds
 UDP_DNS_TIMEOUT = 2.0     # seconds — short, we retry across servers
 DNS_CACHE_MAX   = 1024    # entries — bound the cache to avoid unbounded growth
 
-# IP-based DoH servers — no domain resolution needed, immune to DNS poisoning
+# IP-based DoH servers — no domain resolution needed, immune to DNS poisoning.
+#
+# Order chosen for resilience on hostile networks: Cloudflare 1.1.1.1 is the
+# fastest when reachable, but it is also the most commonly MITM'd and IP-
+# blocked DoH endpoint (Turkey, Iran, etc. routinely intercept TLS to it),
+# so Google and AdGuard follow immediately as alternates. DNS.SB is included
+# because it is rarely on any block list. Quad9 (9.9.9.9) is intentionally
+# omitted — it requires HTTP/2 (RFC 8484 §5.2), which Python's stdlib does
+# not implement, so it always returns 505 over HTTP/1.1.
 DOH_SERVERS = [
-    "https://1.1.1.1/dns-query",   # Cloudflare primary
-    "https://1.0.0.1/dns-query",   # Cloudflare secondary
-    "https://8.8.8.8/dns-query",   # Google
-    "https://9.9.9.9/dns-query",   # Quad9
+    "https://1.1.1.1/dns-query",          # Cloudflare primary
+    "https://8.8.8.8/dns-query",          # Google primary
+    "https://94.140.14.14/dns-query",     # AdGuard primary
+    "https://1.0.0.1/dns-query",          # Cloudflare secondary
+    "https://8.8.4.4/dns-query",          # Google secondary
+    "https://185.222.222.222/dns-query",  # DNS.SB — rarely blocked, last resort
 ]
 
 # Plain UDP DNS resolvers — used when DoH endpoints are blocked at the
@@ -117,7 +115,7 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-7s  %(message)s",
     datefmt="%H:%M:%S",
 )
-log = logging.getLogger("dpi_bypass")
+log = logging.getLogger("sniper")
 
 # ── DNS-over-HTTPS ────────────────────────────────────────────────────────────
 # OrderedDict so we can evict in FIFO order when DNS_CACHE_MAX is reached.
@@ -253,26 +251,280 @@ def _resolve_via_public_udp(hostname: str, qtype: int = _DNS_TYPE_A):
     return None
 
 
+# ── Plain TCP DNS (RFC 7766) ──────────────────────────────────────────────────
+# Some ISPs intercept and rewrite responses on UDP/53 but pass TCP/53 through
+# untouched. RFC 7766 specifies the wire format: 2-byte big-endian length
+# prefix followed by the same DNS message body used over UDP.
+
+
+def _tcp_dns_query(hostname: str, server_ip: str,
+                   qtype: int = _DNS_TYPE_A,
+                   timeout: float = UDP_DNS_TIMEOUT):
+    """Send one A/AAAA query over TCP/53. Returns (ip, ttl) or None."""
+    tid = random.randint(0, 0xFFFF)
+    pkt = _build_dns_query(hostname, tid, qtype)
+    framed = struct.pack(">H", len(pkt)) + pkt
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.settimeout(timeout)
+        s.connect((server_ip, 53))
+        s.sendall(framed)
+        head = b""
+        while len(head) < 2:
+            chunk = s.recv(2 - len(head))
+            if not chunk:
+                return None
+            head += chunk
+        resp_len = struct.unpack(">H", head)[0]
+        body = b""
+        while len(body) < resp_len:
+            chunk = s.recv(resp_len - len(body))
+            if not chunk:
+                return None
+            body += chunk
+    except OSError:
+        return None
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+    return _parse_dns_response(body, tid, qtype)
+
+
+def _resolve_via_public_tcp(hostname: str, qtype: int = _DNS_TYPE_A):
+    """Try plain TCP DNS against public resolvers. Returns (ip, ttl) or None."""
+    for srv in PLAIN_DNS_SERVERS:
+        result = _tcp_dns_query(hostname, srv, qtype=qtype)
+        if result is not None:
+            ip, ttl = result
+            log.debug(f"TCP-DNS  {hostname} -> {ip}  [{srv}]")
+            return ip, max(int(ttl), 30)
+    return None
+
+
+# ── Fragmented HTTPS GET (for DoH) ────────────────────────────────────────────
+# Python's `urllib` (and `ssl.wrap_socket` more generally) writes the TLS
+# ClientHello in a single TCP segment. On networks that block DoH via DPI —
+# either by fingerprinting the ClientHello or by injecting RSTs on traffic to
+# well-known resolver IPs — every DoH request fails before DNS can be resolved
+# at all, so the proxy falls back to plain UDP DNS, which is often itself
+# poisoned for blocked hostnames.
+#
+# We work around that by driving the TLS handshake by hand through SSL BIOs:
+# the first outgoing TCP write (the ClientHello, including TLS fingerprint and
+# extensions) is split into 2-byte segments, the same trick the main proxy
+# uses on client traffic. Once the handshake completes, the rest of the
+# connection runs at normal speed.
+
+_DOH_FRAGMENT_SIZE = 2  # bytes per TCP segment for the DoH ClientHello
+
+
+def _send_segmented(sock: socket.socket, data: bytes, seg_size: int) -> None:
+    """Send `data` in seg_size-byte TCP segments. TCP_NODELAY must be on."""
+    if seg_size < 1:
+        seg_size = 1
+    off, n = 0, len(data)
+    while off < n:
+        end = min(off + seg_size, n)
+        chunk_off = off
+        while chunk_off < end:
+            sent = sock.send(data[chunk_off:end])
+            if sent == 0:
+                raise OSError("socket closed during segmented send")
+            chunk_off += sent
+        off = end
+
+
+def _parse_http_response(raw: bytes) -> tuple[int, bytes]:
+    """Minimal HTTP/1.x response parser. Handles chunked transfer encoding."""
+    sep = raw.find(b"\r\n\r\n")
+    if sep < 0:
+        raise ValueError("malformed HTTP response (no header terminator)")
+    header_block = raw[:sep].decode("latin-1", errors="replace")
+    body = raw[sep + 4:]
+
+    status_line, _, rest = header_block.partition("\r\n")
+    parts = status_line.split(" ", 2)
+    if len(parts) < 2 or not parts[1].isdigit():
+        raise ValueError("malformed HTTP status line")
+    status = int(parts[1])
+
+    headers: dict[str, str] = {}
+    for line in rest.split("\r\n"):
+        if ":" in line:
+            k, _, v = line.partition(":")
+            headers[k.strip().lower()] = v.strip()
+
+    if headers.get("transfer-encoding", "").lower() == "chunked":
+        decoded = bytearray()
+        i = 0
+        while i < len(body):
+            j = body.find(b"\r\n", i)
+            if j < 0:
+                break
+            size_str = body[i:j].split(b";", 1)[0].strip()
+            try:
+                size = int(size_str, 16)
+            except ValueError:
+                break
+            if size == 0:
+                break
+            start = j + 2
+            decoded.extend(body[start:start + size])
+            i = start + size + 2
+        body = bytes(decoded)
+    return status, body
+
+
+def _fragmented_https_get(server_ip: str, path_with_query: str,
+                          headers: dict, timeout: float) -> tuple[int, bytes]:
+    """Issue HTTPS GET to server_ip:443 with the ClientHello fragmented.
+
+    Returns (status, body). Raises on connect / handshake / read errors.
+    """
+    sock = socket.create_connection((server_ip, 443), timeout=timeout)
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        incoming = ssl.MemoryBIO()
+        outgoing = ssl.MemoryBIO()
+        ssl_obj = _doh_ssl_ctx.wrap_bio(
+            incoming, outgoing, server_hostname=server_ip,
+        )
+        client_hello_sent = False
+
+        def _flush() -> None:
+            nonlocal client_hello_sent
+            pending = outgoing.read()
+            if not pending:
+                return
+            if not client_hello_sent:
+                # First TCP write of the connection contains the ClientHello —
+                # this is the segment DPI engines fingerprint.
+                _send_segmented(sock, pending, _DOH_FRAGMENT_SIZE)
+                client_hello_sent = True
+            else:
+                sock.sendall(pending)
+
+        def _pull() -> None:
+            sock.settimeout(timeout)
+            chunk = sock.recv(16384)
+            if not chunk:
+                raise OSError("EOF during TLS exchange")
+            incoming.write(chunk)
+
+        # Drive the TLS handshake.
+        while True:
+            try:
+                ssl_obj.do_handshake()
+                break
+            except ssl.SSLWantReadError:
+                _flush()
+                _pull()
+            except ssl.SSLWantWriteError:
+                _flush()
+        _flush()
+
+        # Build and send the HTTP request inside the TLS tunnel.
+        lines = [
+            f"GET {path_with_query} HTTP/1.1",
+            f"Host: {server_ip}",
+            "Connection: close",
+        ]
+        for k, v in headers.items():
+            lines.append(f"{k}: {v}")
+        req = ("\r\n".join(lines) + "\r\n\r\n").encode("ascii")
+
+        sent = 0
+        while sent < len(req):
+            try:
+                n = ssl_obj.write(req[sent:])
+                sent += n
+                _flush()
+            except ssl.SSLWantReadError:
+                _flush()
+                _pull()
+            except ssl.SSLWantWriteError:
+                _flush()
+
+        # Read response until the server closes (we asked for Connection: close).
+        response = bytearray()
+        while True:
+            try:
+                data = ssl_obj.read(16384)
+                if not data:
+                    break
+                response.extend(data)
+            except ssl.SSLWantReadError:
+                _flush()
+                try:
+                    _pull()
+                except OSError:
+                    break
+            except ssl.SSLZeroReturnError:
+                break
+            except ssl.SSLError as e:
+                # Some servers close without a clean shutdown notify.
+                if "UNEXPECTED_EOF" in str(e).upper():
+                    break
+                raise
+
+        return _parse_http_response(bytes(response))
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
 def _doh_lookup(hostname: str, qtype_name: str, qtype_num: int):
-    """One DoH pass over all configured servers. Returns (ip, ttl) or None."""
+    """One DoH pass over all configured servers. Returns (ip, ttl) or None.
+
+    Uses RFC 8484 wire format (Content-Type: application/dns-message) — the
+    standard binary DoH protocol every compliant resolver implements
+    identically. The previous JSON-over-HTTP variant (`application/dns-json`)
+    works on Cloudflare but is not universally supported: Google rejects it
+    at `/dns-query` (only its non-standard `/resolve` endpoint accepts JSON),
+    Quad9 only accepts RFC 8484 over HTTP/2, and other providers return 400
+    or 505 inconsistently. Binary wire format avoids the mismatch entirely
+    and reuses the same DNS message parser the UDP path uses.
+
+    Each request additionally uses a fragmented TLS ClientHello so DPI
+    engines that fingerprint or RST-inject DoH connections cannot block it.
+    """
     last_err: Exception | None = None
     for server in DOH_SERVERS:
         try:
-            url = f"{server}?name={urllib.parse.quote(hostname)}&type={qtype_name}"
-            # Some local middleware (HTTPS-scanning AV, captive portals)
-            # rejects requests without a User-Agent; add a plausible one.
-            req = urllib.request.Request(url, headers={
-                "Accept":     "application/dns-json",
-                "User-Agent": "Mozilla/5.0 dpi_bypass/1.0",
-            })
-            with _no_proxy_opener.open(req, timeout=DOH_TIMEOUT) as resp:
-                data = json.loads(resp.read())
-            records = [(a["data"], a.get("TTL", 60))
-                       for a in data.get("Answer", [])
-                       if a.get("type") == qtype_num and "data" in a]
-            if not records:
+            # "https://1.1.1.1/dns-query" -> ("1.1.1.1", "/dns-query")
+            after = server[len("https://"):]
+            slash = after.find("/")
+            server_ip = after[:slash] if slash > 0 else after
+            path = after[slash:] if slash > 0 else "/"
+
+            # RFC 8484 §4.1: the DNS message id SHOULD be 0 so identical
+            # queries hash to the same HTTP cache key. We still pass the id
+            # to the parser for verification — 0 in, 0 expected back.
+            tid = 0
+            pkt = _build_dns_query(hostname, tid, qtype_num)
+            b64 = base64.urlsafe_b64encode(pkt).rstrip(b"=").decode("ascii")
+            status, body = _fragmented_https_get(
+                server_ip, f"{path}?dns={b64}",
+                headers={
+                    # Some local middleware (HTTPS-scanning AV, captive portals)
+                    # rejects requests without a User-Agent; add a plausible one.
+                    "Accept":     "application/dns-message",
+                    "User-Agent": "Mozilla/5.0 SNIper/1.1.2",
+                },
+                timeout=DOH_TIMEOUT,
+            )
+            if status != 200 or len(body) < 12:
+                log.debug(f"DoH  {server} returned HTTP {status} for {hostname}")
                 continue
-            ip, ttl = records[0]
+            parsed = _parse_dns_response(body, tid, qtype_num)
+            if parsed is None:
+                continue
+            ip, ttl = parsed
             log.debug(f"DoH  {hostname} {qtype_name} -> {ip}  [{server}]")
             return ip, max(int(ttl), 30)
         except Exception as e:
@@ -286,12 +538,18 @@ def _doh_lookup(hostname: str, qtype_name: str, qtype_num: int):
 
 
 def resolve_doh(hostname: str) -> str:
-    """Resolve hostname via (DoH → public UDP → system DNS), preferring IPv4.
+    """Resolve hostname via (DoH → public UDP → public TCP → system), IPv4 first.
 
-    Tries A records via DoH then public UDP; if no A is available anywhere,
-    repeats the chain for AAAA so IPv6-only hosts (e.g. Windows's
-    ipv6.msftconnecttest.com) still resolve. Falls back to getaddrinfo
-    as a last resort — covers system DNS for both address families.
+    Tries A records via fragmented DoH, then public UDP/53, then TCP/53; if no
+    A is available anywhere, repeats the chain for AAAA so IPv6-only hosts
+    (e.g. Windows's ipv6.msftconnecttest.com) still resolve. Falls back to
+    getaddrinfo as a last resort — covers system DNS for both address families.
+
+    Why this chain: on some networks DoH IPs are RST-injected (handled by
+    fragmenting the ClientHello), UDP/53 to public resolvers is rewritten
+    (mitigated by trying TCP/53 next, which many ISPs leave alone), and only
+    when *all* of that fails do we fall back to the system resolver — which
+    is exactly the resolver this proxy exists to bypass.
     """
     if _is_ip(hostname):
         return hostname
@@ -300,7 +558,7 @@ def resolve_doh(hostname: str) -> str:
     if cached is not None:
         return cached
 
-    # 1) DoH A
+    # 1) DoH A — TLS handshake to resolver IP, ClientHello fragmented.
     doh_a = _doh_lookup(hostname, "A", _DNS_TYPE_A)
     if doh_a is not None:
         ip, ttl = doh_a
@@ -309,8 +567,7 @@ def resolve_doh(hostname: str) -> str:
 
     log.warning(f"All DoH servers failed ({hostname}): no A record  -> trying public UDP DNS")
 
-    # 2) Plain UDP DNS A to public resolvers — bypasses ISP DoH blocks while
-    #    still avoiding the local poisoned resolver.
+    # 2) Plain UDP DNS A to public resolvers.
     udp_a = _resolve_via_public_udp(hostname, qtype=_DNS_TYPE_A)
     if udp_a is not None:
         ip, ttl = udp_a
@@ -318,8 +575,15 @@ def resolve_doh(hostname: str) -> str:
         log.info(f"Resolved {hostname} via public UDP DNS -> {ip}")
         return ip
 
-    # 3) No A records anywhere — try AAAA (IPv6-only hosts like
-    #    ipv6.msftconnecttest.com). DoH first, then UDP.
+    # 3) Plain TCP DNS A — ISPs that rewrite UDP/53 often pass TCP/53 through.
+    tcp_a = _resolve_via_public_tcp(hostname, qtype=_DNS_TYPE_A)
+    if tcp_a is not None:
+        ip, ttl = tcp_a
+        _cache_put(hostname, ip, ttl)
+        log.info(f"Resolved {hostname} via public TCP DNS -> {ip}")
+        return ip
+
+    # 4) No A anywhere — try AAAA (IPv6-only hosts).
     doh_aaaa = _doh_lookup(hostname, "AAAA", _DNS_TYPE_AAAA)
     if doh_aaaa is not None:
         ip, ttl = doh_aaaa
@@ -332,15 +596,20 @@ def resolve_doh(hostname: str) -> str:
         _cache_put(hostname, ip, ttl)
         log.info(f"Resolved {hostname} via public UDP DNS (IPv6) -> {ip}")
         return ip
+    tcp_aaaa = _resolve_via_public_tcp(hostname, qtype=_DNS_TYPE_AAAA)
+    if tcp_aaaa is not None:
+        ip, ttl = tcp_aaaa
+        _cache_put(hostname, ip, ttl)
+        log.info(f"Resolved {hostname} via public TCP DNS (IPv6) -> {ip}")
+        return ip
 
     log.warning(f"Public DNS unavailable for {hostname}  -> falling back to system DNS")
 
-    # 4) Last resort — system resolver. Use getaddrinfo so we also see AAAA
+    # 5) Last resort — system resolver. Use getaddrinfo so we also see AAAA
     #    when the host has no A record. Prefer IPv4 when both exist.
     try:
         info = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
     except socket.gaierror:
-        # Re-raise as gethostbyname would, so callers see the same error class.
         raise
     for fam, _t, _p, _c, sa in info:
         if fam == socket.AF_INET:
@@ -740,7 +1009,7 @@ def main():
     doh_line = "on  (via 1.1.1.1)" if use_doh else "off (system DNS)"
     print(f"""
 +------------------------------------------------------+
-|     DPI Bypass Proxy  -  user-space, no admin        |
+|     SNIper  -  SNI-based DPI bypass (no admin)        |
 +------------------------------------------------------+
 |  Proxy address : 127.0.0.1:{args.port}
 |  Fragment size : {args.fragment} bytes
