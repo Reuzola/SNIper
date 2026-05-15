@@ -70,6 +70,7 @@ SNIper_v1.1.2/
 ├── LICENSE                    MIT License
 ├── CHANGELOG.md               Version history
 ├── .gitignore
+├── SNIper_arm64.exe           Pre-built portable GUI (ARM64 Windows)
 ├── src/
 │   ├── SNIper_gui.py          GUI front-end (all proxy logic embedded)
 │   └── SNIper.py              CLI core (no GUI)
@@ -79,20 +80,23 @@ SNIper_v1.1.2/
     └── version_info.txt       EXE metadata (anti-false-positive)
 ```
 
-The built executable (`SNIper_<arch>.exe`) is dropped at the project root,
-next to this README, after running `packaging\build_exe.bat`.
+This release ships with a pre-built **ARM64** executable
+(`SNIper_arm64.exe`) at the project root — just double-click it, no build
+step needed. To produce an x64 build, run `packaging\build_exe.bat` on an
+x64 Windows machine; the script drops `SNIper_x64.exe` next to this README
+and verifies its architecture before finishing.
 
 | Path | Purpose |
 |------|---------|
+| `SNIper_arm64.exe` | Pre-built portable GUI executable (ARM64 Windows) — ready to run |
 | `src/SNIper_gui.py` | GUI source — the file PyInstaller packages into the EXE |
 | `src/SNIper.py` | CLI source (no GUI), for scripting / headless use |
 | `packaging/build_exe.bat` | Rebuild `SNIper_<arch>.exe` for the current architecture |
-| `SNIper_<arch>.exe` | Portable GUI executable, produced by the build script |
 
 > **Note on architectures:** PyInstaller does not cross-compile, so each EXE
-> must be built on a machine of its own architecture. To produce the x64
-> build, run `packaging\build_exe.bat` on an x64 Windows machine; for ARM64,
-> run it on an ARM64 machine.
+> must be built on a machine of its own architecture. The shipped
+> `SNIper_arm64.exe` runs on ARM64 Windows; for x64, run
+> `packaging\build_exe.bat` on an x64 Windows machine.
 
 ## Why no admin prompt?
 

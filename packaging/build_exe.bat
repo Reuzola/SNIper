@@ -1,61 +1,82 @@
 @echo off
+setlocal EnableExtensions
 chcp 65001 >nul 2>&1
 title Build SNIper EXE
-setlocal
 
-rem Build a portable single-file EXE for the architecture of the Python
-rem interpreter that runs this script. PyInstaller does not cross-compile,
-rem so x64 and ARM64 each require a native build.
+rem ===========================================================================
+rem  Build a portable single-file EXE for the architecture of the Python
+rem  interpreter that runs this script. PyInstaller does not cross-compile,
+rem  so x64 and ARM64 each require a native build on a machine of that arch.
 rem
-rem Project layout (this script lives in packaging\):
-rem     SNIper_vX.Y.Z\
-rem       +- src\SNIper_gui.py        <- PyInstaller entry point
-rem       +- packaging\build_exe.bat  <- this script
-rem       +- packaging\version_info.txt
-rem       +- packaging\app.manifest
-rem   The finished EXE is dropped at the project root next to README.md.
+rem  Layout (this script lives in packaging\):
+rem      SNIper_vX.Y.Z\
+rem        +- src\SNIper_gui.py          <- PyInstaller entry point
+rem        +- packaging\build_exe.bat    <- this script
+rem        +- packaging\version_info.txt
+rem        +- packaging\app.manifest
+rem  The finished EXE (SNIper_<arch>.exe) is dropped at the project root.
 rem
-rem Hardenings against Defender ML false positives (Behavior:*!ml):
-rem   --version-file  embeds CompanyName / FileDescription / ProductName
-rem   --manifest      declares asInvoker (no UAC) + PerMonitorV2 DPI
-rem   --noupx         no runtime decompression
+rem  This script is intentionally verbose and verifies the produced EXE's
+rem  PE architecture so a wrong-arch build can never silently ship.
+rem ===========================================================================
 
-set SCRIPT_DIR=%~dp0
-cd /d "%SCRIPT_DIR%"
-rem Project root is the parent of packaging\
-for %%I in ("%SCRIPT_DIR%..") do set PROJECT_ROOT=%%~fI
+rem ---- Resolve paths (pushd/popd canonicalises, no ".." guesswork) ----------
+set "PKG_DIR=%~dp0"
+pushd "%~dp0.." 2>nul || (echo [ERROR] Cannot locate project root.& goto :fail)
+set "PROJECT_ROOT=%CD%"
+popd
+set "ENTRY=%PROJECT_ROOT%\src\SNIper_gui.py"
 
-where py >nul 2>&1
-if %errorlevel% neq 0 (
-    where python >nul 2>&1
-    if %errorlevel% neq 0 (
-        echo Python not found. Install it from python.org/downloads.
-        exit /b 1
-    )
-    set PY=python
-) else (
-    set PY=py
+echo Project root : %PROJECT_ROOT%
+echo Entry script : %ENTRY%
+echo Packaging    : %PKG_DIR%
+
+if not exist "%ENTRY%" (
+    echo [ERROR] Entry script not found: %ENTRY%
+    goto :fail
 )
 
-for /f "tokens=*" %%A in ('%PY% -c "import platform; print(platform.machine().lower())"') do set ARCH=%%A
-if "%ARCH%"=="amd64"  set SUFFIX=x64
-if "%ARCH%"=="x86_64" set SUFFIX=x64
-if "%ARCH%"=="arm64"  set SUFFIX=arm64
-if "%ARCH%"=="aarch64" set SUFFIX=arm64
+rem ---- Soft warning if running elevated (PyInstaller dislikes admin) --------
+net session >nul 2>&1 && echo [NOTE] Running as Administrator - PyInstaller recommends a normal terminal.
+
+rem ---- Pick the Python interpreter -----------------------------------------
+where py >nul 2>&1 && (set "PY=py") || (set "PY=python")
+where %PY% >nul 2>&1 || (
+    echo [ERROR] Python not found. Install it from python.org/downloads.
+    goto :fail
+)
+
+rem ---- Detect architecture --------------------------------------------------
+for /f "tokens=*" %%A in ('%PY% -c "import platform;print(platform.machine().lower())"') do set "ARCH=%%A"
+set "SUFFIX="
+if /i "%ARCH%"=="amd64"   set "SUFFIX=x64"
+if /i "%ARCH%"=="x86_64"  set "SUFFIX=x64"
+if /i "%ARCH%"=="arm64"   set "SUFFIX=arm64"
+if /i "%ARCH%"=="aarch64" set "SUFFIX=arm64"
 if not defined SUFFIX (
-    echo Unsupported architecture: %ARCH%
-    exit /b 1
+    echo [ERROR] Unsupported architecture: %ARCH%
+    goto :fail
 )
+set "APPNAME=SNIper_%SUFFIX%"
+echo Interpreter  : %PY%  ^(python machine = %ARCH%^)
+echo Target EXE   : %APPNAME%.exe
+echo.
 
-set APPNAME=SNIper_%SUFFIX%
-echo Architecture: %ARCH%  ^|  EXE: %APPNAME%.exe
-
-%PY% -m pip install --upgrade pyinstaller >nul
-if %errorlevel% neq 0 (
-    echo PyInstaller installation failed.
-    exit /b 1
+rem ---- Ensure PyInstaller is available -------------------------------------
+%PY% -m PyInstaller --version >nul 2>&1
+if errorlevel 1 (
+    echo PyInstaller not found - installing ...
+    %PY% -m pip install --upgrade pyinstaller
+    if errorlevel 1 (
+        echo [ERROR] PyInstaller installation failed.
+        goto :fail
+    )
 )
+for /f "tokens=*" %%V in ('%PY% -m PyInstaller --version 2^>nul') do set "PYI_VER=%%V"
+echo PyInstaller  : %PYI_VER%
+echo.
 
+rem ---- Build (all artifacts kept inside packaging\) ------------------------
 if exist "%PROJECT_ROOT%\%APPNAME%.exe" del /Q "%PROJECT_ROOT%\%APPNAME%.exe"
 
 %PY% -m PyInstaller ^
@@ -63,20 +84,56 @@ if exist "%PROJECT_ROOT%\%APPNAME%.exe" del /Q "%PROJECT_ROOT%\%APPNAME%.exe"
     --noconsole ^
     --noupx ^
     --clean ^
+    --noconfirm ^
     --name "%APPNAME%" ^
-    --version-file "version_info.txt" ^
-    --manifest "app.manifest" ^
-    "..\src\SNIper_gui.py"
-if %errorlevel% neq 0 (
-    echo Build failed.
-    exit /b 1
+    --distpath "%PKG_DIR%dist" ^
+    --workpath "%PKG_DIR%build" ^
+    --specpath "%PKG_DIR%." ^
+    --version-file "%PKG_DIR%version_info.txt" ^
+    --manifest "%PKG_DIR%app.manifest" ^
+    "%ENTRY%"
+if errorlevel 1 (
+    echo [ERROR] PyInstaller build failed - see the output above.
+    goto :fail
 )
 
-move /Y "dist\%APPNAME%.exe" "%PROJECT_ROOT%\%APPNAME%.exe" >nul
-rmdir /S /Q build 2>nul
-rmdir /S /Q dist  2>nul
-del /Q "%APPNAME%.spec" 2>nul
+if not exist "%PKG_DIR%dist\%APPNAME%.exe" (
+    echo [ERROR] Build reported success but "%APPNAME%.exe" was not produced.
+    goto :fail
+)
+
+move /Y "%PKG_DIR%dist\%APPNAME%.exe" "%PROJECT_ROOT%\%APPNAME%.exe" >nul
+rmdir /S /Q "%PKG_DIR%build" 2>nul
+rmdir /S /Q "%PKG_DIR%dist"  2>nul
+del /Q "%PKG_DIR%%APPNAME%.spec" 2>nul
+
+set "FINAL=%PROJECT_ROOT%\%APPNAME%.exe"
+
+rem ---- Verify the produced EXE's real PE architecture ----------------------
+set "EXE_ARCH=unknown"
+for /f "tokens=*" %%M in ('%PY% -c "import struct,sys;f=open(sys.argv[1],'rb');f.seek(0x3C);o=struct.unpack('<I',f.read(4))[0];f.seek(o+4);print({0x8664:'x64',0xAA64:'arm64',0x14c:'x86'}.get(struct.unpack('<H',f.read(2))[0],'unknown'))" "%FINAL%"') do set "EXE_ARCH=%%M"
 
 echo.
-echo Done: %APPNAME%.exe  (single file, portable)  ->  %PROJECT_ROOT%\%APPNAME%.exe
+echo ============================================================
+echo  Done: %FINAL%
+echo  EXE architecture : %EXE_ARCH%
+echo  This machine     : %SUFFIX%
+if /i not "%EXE_ARCH%"=="%SUFFIX%" (
+    echo  [WARNING] Architecture mismatch - this EXE will show
+    echo            "This app can't run on your PC" on a %SUFFIX% machine.
+) else (
+    echo  Architecture OK - safe to run on this machine.
+)
+echo ============================================================
+echo.
+pause
 endlocal
+goto :eof
+
+:fail
+echo.
+echo Build did NOT complete. Read the messages above for the cause.
+echo.
+pause
+endlocal
+exit /b 1
