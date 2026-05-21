@@ -189,6 +189,17 @@ The Windows proxy is restored under all normal exit conditions:
   first request to a new domain when DoH hasn't cached it yet and the system
   DNS can't resolve it (because it's blocked). The next request succeeds via
   DoH and the result is cached.
+- **While DoH is active, your `hosts` file and any internal/LAN DNS are
+  bypassed.** DNS-over-HTTPS resolves names straight from public resolvers,
+  so entries in `C:\Windows\System32\drivers\etc\hosts`, corporate intranet
+  names (`intranet.company.local`), local development hostnames
+  (`myapp.local`), and network-level ad-blockers (Pi-hole, AdGuard Home) will
+  not resolve. If you depend on any of these, run with `--no-doh` (CLI) or
+  tick **Disable DoH** in the GUI.
+- **Stale DNS after first launch.** If a site misbehaves right after you
+  start SNIper, Windows may be serving a cached (possibly poisoned) DNS entry
+  from before the proxy was active. Run `ipconfig /flushdns` once in a
+  terminal to clear it, then retry.
 - Traffic is not encrypted by this tool, it only tunnels your existing HTTPS
   connections. Your TLS encryption remains intact end-to-end.
 - The EXE is large (~10 MB) because PyInstaller bundles the Python runtime
