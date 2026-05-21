@@ -1017,7 +1017,12 @@ if _IS_WINDOWS:
     _IDI_APPLICATION = 32512
     _IDC_ARROW       = 32512
 
-    _HWND_MESSAGE = wintypes.HWND(-3)
+    # The tray helper window is a normal (never-shown) top-level window, not
+    # a message-only window: message-only windows do not receive broadcast
+    # messages, and the TaskbarCreated notification (section 8.1) is sent as
+    # a broadcast. WS_EX_TOOLWINDOW keeps the hidden window off the taskbar
+    # and out of the Alt-Tab list.
+    _WS_EX_TOOLWINDOW = 0x00000080
 
     _TPM_RIGHTBUTTON = 0x0002
     _TPM_RETURNCMD   = 0x0100
@@ -1117,6 +1122,14 @@ if _IS_WINDOWS:
 
     _user32.RegisterClassW.argtypes = [ctypes.POINTER(_WNDCLASSW)]
     _user32.RegisterClassW.restype  = wintypes.ATOM
+
+    _user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
+    _user32.RegisterWindowMessageW.restype  = wintypes.UINT
+
+    # Explorer broadcasts "TaskbarCreated" to every top-level window when the
+    # taskbar is (re)built — e.g. after an Explorer crash and restart. The
+    # registered id is the same for every process that asks for it.
+    _TASKBAR_CREATED = _user32.RegisterWindowMessageW("TaskbarCreated")
 
     _user32.CreateWindowExW.argtypes = [
         wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
@@ -1228,6 +1241,12 @@ class TrayIcon:
                 self._remove_icon()
                 _user32.PostQuitMessage(0)
                 return 0
+            if _TASKBAR_CREATED and msg == _TASKBAR_CREATED:
+                # Explorer restarted — the rebuilt taskbar dropped our icon.
+                # Re-register it so it reappears instead of staying gone.
+                self._added = False
+                self._add_icon()
+                return 0
             return _user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
         self._wndproc_ref = _WNDPROC(_wndproc)
@@ -1249,10 +1268,14 @@ class TrayIcon:
             self._ready.set()
             return
 
+        # Normal top-level window with a NULL parent (not HWND_MESSAGE): a
+        # message-only window would never receive the TaskbarCreated
+        # broadcast. It is never shown, and WS_EX_TOOLWINDOW keeps it off the
+        # taskbar and out of Alt-Tab.
         hwnd = _user32.CreateWindowExW(
-            0, self._cls_name, "SNIperTray",
+            _WS_EX_TOOLWINDOW, self._cls_name, "SNIperTray",
             0, 0, 0, 0, 0,
-            _HWND_MESSAGE, 0, hinst, None,
+            0, 0, hinst, None,
         )
         if not hwnd:
             self._ready.set()
