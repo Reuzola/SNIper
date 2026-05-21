@@ -8,6 +8,19 @@ drivers, no TAP adapters, no service installs. Just double-click the `.exe`
 from any folder (USB stick, Downloads, Desktop) and it works for the current
 user only.
 
+## System requirements
+
+- **Operating system:** Windows 10, version 1607 (Anniversary Update) or
+  later, or Windows 11. Both x64 and ARM64 are supported. Windows 7 and 8
+  are **not supported**: the bundled Python runtime depends on a Universal
+  CRT version that does not ship on those releases, so the EXE will fail
+  to start with a "this app can't run on your PC" error. Windows 8.1 may
+  load the EXE with the latest servicing updates installed, but is
+  untested and not officially supported.
+- **Python (CLI only):** if you run `src/SNIper.py` directly instead of
+  the EXE, you need **Python 3.10 or newer**. The EXE bundles its own
+  runtime, so this requirement only applies to the CLI script.
+
 ## Origin
 
 This project started from a personal need. I have an ARM64 Windows machine and

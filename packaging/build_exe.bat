@@ -47,14 +47,29 @@ where %PY% >nul 2>&1 || (
 )
 
 rem ---- Detect architecture --------------------------------------------------
+rem  Only 64-bit targets are supported. 32-bit Windows is detected explicitly
+rem  so the user gets a clear reason rather than a generic "unsupported arch"
+rem  message that they might mistake for a script bug.
 for /f "tokens=*" %%A in ('%PY% -c "import platform;print(platform.machine().lower())"') do set "ARCH=%%A"
 set "SUFFIX="
 if /i "%ARCH%"=="amd64"   set "SUFFIX=x64"
 if /i "%ARCH%"=="x86_64"  set "SUFFIX=x64"
 if /i "%ARCH%"=="arm64"   set "SUFFIX=arm64"
 if /i "%ARCH%"=="aarch64" set "SUFFIX=arm64"
+if /i "%ARCH%"=="x86"     set "IS_X86=1"
+if /i "%ARCH%"=="i386"    set "IS_X86=1"
+if /i "%ARCH%"=="i686"    set "IS_X86=1"
+if /i "%ARCH%"=="win32"   set "IS_X86=1"
+if defined IS_X86 (
+    echo [ERROR] 32-bit Windows ^(x86^) is not supported.
+    echo         Detected python machine = %ARCH%.
+    echo         SNIper ships only x64 and ARM64 builds. Install a 64-bit
+    echo         Python on a 64-bit Windows host and re-run this script.
+    goto :fail
+)
 if not defined SUFFIX (
     echo [ERROR] Unsupported architecture: %ARCH%
+    echo         Supported targets: amd64/x86_64 ^(x64^), arm64/aarch64 ^(ARM64^).
     goto :fail
 )
 set "APPNAME=SNIper_%SUFFIX%"
