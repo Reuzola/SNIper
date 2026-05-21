@@ -1449,8 +1449,32 @@ FONT_UI_B  = ("Segoe UI", 10, "bold")
 FONT_TITLE = ("Segoe UI Semibold", 14)
 FONT_SUB   = ("Segoe UI", 9)
 FONT_TINY  = ("Segoe UI", 8)
+# Monospaced font for the log panel. Cascadia Mono ships in-box only on
+# Windows 11 (and on Windows 10 only when Windows Terminal was installed),
+# so the real family is resolved at runtime by _resolve_mono_font() once a
+# Tk root exists — see App.__init__. These values are placeholders.
 FONT_MONO  = ("Cascadia Mono", 9)
 FONT_LOG   = ("Cascadia Mono", 9)
+
+
+def _resolve_mono_font():
+    """Return the best monospaced family Tk can actually render.
+
+    When a named family is missing Tk silently substitutes a proportional
+    default, which looks wrong for a log panel. Checking the family list
+    lets us fall back deliberately: Consolas (Vista+), then Lucida Console,
+    then Courier New (universal). Needs an existing Tk root, so this runs
+    from App.__init__, not at import time.
+    """
+    import tkinter.font as tkfont
+    try:
+        available = set(tkfont.families())
+    except tk.TclError:
+        return "Courier New"
+    for family in ("Cascadia Mono", "Consolas", "Lucida Console", "Courier New"):
+        if family in available:
+            return family
+    return "Courier New"
 
 
 TOOLTIPS = {
@@ -1526,8 +1550,17 @@ class App(tk.Tk):
         super().__init__()
         self.title("SNIper")
         self.configure(bg=C["bg"])
-        self.minsize(640, 540)
-        self.geometry("760x640")
+        # Clamp the window to the screen. On small displays (1366×768 and
+        # below), especially at >100% DPI scaling, the default 760×640 plus
+        # window chrome can spill off-screen. Never request more than the
+        # screen can show, and lower the minimum size to match so it cannot
+        # override the clamp.
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        win_w = min(760, sw - 60)
+        win_h = min(640, sh - 100)
+        self.minsize(min(640, win_w), min(540, win_h))
+        self.geometry(f"{win_w}x{win_h}")
         self.resizable(True, True)
 
         # tkinter scaling — pairs with SetProcessDpiAwareness for crisp text.
@@ -1536,6 +1569,13 @@ class App(tk.Tk):
             self.tk.call("tk", "scaling", dpi / 72.0)
         except Exception:
             pass
+
+        # Resolve the monospaced font now that a Tk root exists — Cascadia
+        # Mono is absent on stock Windows 10, so fall back gracefully.
+        global FONT_MONO, FONT_LOG
+        _mono = _resolve_mono_font()
+        FONT_MONO = (_mono, 9)
+        FONT_LOG  = (_mono, 9)
 
         self._init_style()
 
