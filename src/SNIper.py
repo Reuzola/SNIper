@@ -78,6 +78,7 @@ CONNECT_TIMEOUT = 10      # seconds
 DOH_TIMEOUT     = 4       # seconds
 UDP_DNS_TIMEOUT = 2.0     # seconds — short, we retry across servers
 DNS_CACHE_MAX   = 1024    # entries — bound the cache to avoid unbounded growth
+MAX_CONNECTIONS = 256     # cap on concurrent handler threads (see accept loop)
 
 # IP-based DoH servers — no domain resolution needed, immune to DNS poisoning.
 #
@@ -692,6 +693,29 @@ def _resolve_for_connect(host: str, use_doh: bool) -> str:
     raise socket.gaierror(f"no usable address for {host}")
 
 
+def _enable_keepalive(sock: socket.socket) -> None:
+    """Turn on TCP keepalive on a remote socket.
+
+    After connect() the socket is switched to blocking (settimeout(None)) and
+    the relay loop sits in recv(). If the peer vanishes without a FIN/RST
+    (laptop sleep, Wi-Fi change, NAT idle-timeout) that recv() blocks forever
+    and leaks the handler plus its two relay threads. Keepalive lets the OS
+    detect the dead peer so recv() raises and the threads unwind.
+    """
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        return
+    # Windows waits 2 hours before the first probe by default; shorten that
+    # so a dead connection is reaped in ~1-2 minutes. SIO_KEEPALIVE_VALS
+    # takes (onoff, idle_ms, interval_ms).
+    if _IS_WINDOWS:
+        try:
+            sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 60_000, 10_000))
+        except (OSError, AttributeError, ValueError):
+            pass
+
+
 def connect_remote(host: str, port: int, use_doh: bool) -> socket.socket:
     ip = _resolve_for_connect(host, use_doh)
     family = socket.AF_INET6 if ":" in ip else socket.AF_INET
@@ -701,6 +725,7 @@ def connect_remote(host: str, port: int, use_doh: bool) -> socket.socket:
         # Nagle disabled — each send() becomes its own TCP segment (critical for fragmentation)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock.connect((ip, port))
+        _enable_keepalive(sock)
         sock.settimeout(None)
     except Exception:
         # Make sure we don't leak a half-open socket on failure
@@ -1050,7 +1075,15 @@ def main():
 
     # Bind early so a port conflict fails before we touch the system proxy.
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # On Windows SO_REUSEADDR lets a *different* process bind the same
+    # address and hijack connections (unlike Unix, where it only frees a
+    # socket lingering in TIME_WAIT). SO_EXCLUSIVEADDRUSE is the correct
+    # exclusive bind there; SO_REUSEADDR stays for other platforms so a
+    # quick restart isn't blocked by the old listener in TIME_WAIT.
+    if _IS_WINDOWS:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    else:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         server.bind(("127.0.0.1", args.port))
     except OSError as e:
@@ -1079,23 +1112,51 @@ def main():
 
     log.info("Listening for connections...")
 
+    # Cap concurrent handler threads. Without a bound, a burst of connections
+    # (a heavy page, several apps starting at once) can spawn enough threads
+    # to hit the OS limit and crash the accept loop with RuntimeError. Over
+    # the cap we refuse the connection; the client retries once a slot frees.
+    conn_slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+
+    def _serve_client(client, addr):
+        # Wrapper so the concurrency slot is always returned, even if the
+        # handler raises.
+        try:
+            handle_client(client, addr, use_doh, args.fragment)
+        finally:
+            conn_slots.release()
+
     try:
         while not _shutdown_event.is_set():
             try:
                 client, addr = server.accept()
-                t = threading.Thread(
-                    target=handle_client,
-                    args=(client, addr, use_doh, args.fragment),
-                    daemon=True,
-                )
-                t.start()
             except socket.timeout:
                 continue
             except OSError as e:
                 if not _shutdown_event.is_set():
                     log.error(f"accept error: {e}")
-                else:
-                    break
+                    continue
+                break
+            if not conn_slots.acquire(blocking=False):
+                log.warning(f"connection limit ({MAX_CONNECTIONS}) reached — "
+                            f"refusing {addr[0]}:{addr[1]}")
+                try:
+                    client.close()
+                except OSError:
+                    pass
+                continue
+            try:
+                threading.Thread(target=_serve_client, args=(client, addr),
+                                 daemon=True).start()
+            except RuntimeError:
+                # The cap makes this very unlikely, but never leak the slot
+                # or the socket if the OS still refuses the thread.
+                conn_slots.release()
+                log.error("could not start handler thread — refusing connection")
+                try:
+                    client.close()
+                except OSError:
+                    pass
     except KeyboardInterrupt:
         pass
     finally:

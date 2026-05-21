@@ -91,6 +91,7 @@ CONNECT_TIMEOUT = 10
 DOH_TIMEOUT     = 4
 UDP_DNS_TIMEOUT = 2.0
 DNS_CACHE_MAX   = 1024
+MAX_CONNECTIONS = 256     # cap on concurrent handler threads (see accept loop)
 # IP-based DoH servers — no domain resolution needed, immune to DNS poisoning.
 #
 # Order chosen for resilience on hostile networks: Cloudflare 1.1.1.1 is the
@@ -635,6 +636,29 @@ def resolve_doh(hostname, use_doh, log_q):
     raise socket.gaierror(f"no usable address for {hostname}")
 
 
+def _enable_keepalive(sock):
+    """Turn on TCP keepalive on a remote socket.
+
+    After connect() the socket is switched to blocking (settimeout(None)) and
+    the relay loop sits in recv(). If the peer vanishes without a FIN/RST
+    (laptop sleep, Wi-Fi change, NAT idle-timeout) that recv() blocks forever
+    and leaks the handler plus its two relay threads. Keepalive lets the OS
+    detect the dead peer so recv() raises and the threads unwind.
+    """
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        return
+    # Windows waits 2 hours before the first probe by default; shorten that
+    # so a dead connection is reaped in ~1-2 minutes. SIO_KEEPALIVE_VALS
+    # takes (onoff, idle_ms, interval_ms).
+    if _IS_WINDOWS:
+        try:
+            sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 60_000, 10_000))
+        except (OSError, AttributeError, ValueError):
+            pass
+
+
 def connect_remote(host, port, use_doh, log_q):
     ip = resolve_doh(host, use_doh, log_q)
     family = socket.AF_INET6 if ":" in ip else socket.AF_INET
@@ -643,6 +667,7 @@ def connect_remote(host, port, use_doh, log_q):
         sock.settimeout(CONNECT_TIMEOUT)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock.connect((ip, port))
+        _enable_keepalive(sock)
         sock.settimeout(None)
     except Exception:
         try: sock.close()
@@ -878,7 +903,13 @@ class ProxyServer:
                 return
 
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # On Windows SO_REUSEADDR lets a different process bind the same
+            # address and hijack connections; SO_EXCLUSIVEADDRUSE is the
+            # correct exclusive bind. SO_REUSEADDR stays for other platforms.
+            if _IS_WINDOWS:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 sock.bind(("127.0.0.1", port))
                 sock.listen(256)
@@ -920,18 +951,38 @@ class ProxyServer:
 
     def _run(self, frag, use_doh):
         sock = self._sock
+        # Cap concurrent handler threads so a connection burst can't exhaust
+        # the OS thread limit and crash the accept loop; over the cap the
+        # client is refused and simply retries once a slot frees.
+        conn_slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+
+        def _serve(client):
+            try:
+                handle_client(client, use_doh, frag, self.log_q)
+            finally:
+                conn_slots.release()
+
         while not self._stop.is_set():
             try:
                 client, _ = sock.accept()
-                threading.Thread(target=handle_client,
-                                 args=(client, use_doh, frag, self.log_q),
-                                 daemon=True).start()
             except socket.timeout:
                 continue
             except OSError:
                 if not self._stop.is_set():
                     self.log_q.put(("ERROR", "Accept error — proxy stopped unexpectedly."))
                 break
+            if not conn_slots.acquire(blocking=False):
+                self.log_q.put(("WARNING",
+                    f"Connection limit ({MAX_CONNECTIONS}) reached — refusing a connection"))
+                try: client.close()
+                except OSError: pass
+                continue
+            try:
+                threading.Thread(target=_serve, args=(client,), daemon=True).start()
+            except RuntimeError:
+                conn_slots.release()
+                try: client.close()
+                except OSError: pass
 
     @property
     def running(self):
