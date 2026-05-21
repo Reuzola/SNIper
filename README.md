@@ -200,6 +200,15 @@ The Windows proxy is restored under all normal exit conditions:
   start SNIper, Windows may be serving a cached (possibly poisoned) DNS entry
   from before the proxy was active. Run `ipconfig /flushdns` once in a
   terminal to clear it, then retry.
+- **On managed/corporate machines, DoH itself can still be intercepted.**
+  SNIper validates each DoH server's TLS certificate against the Windows
+  certificate store. If an extra root CA has been installed — common with
+  corporate device management (MDM) or antivirus HTTPS scanning — traffic to
+  the DoH resolvers can be transparently decrypted by that CA, which
+  re-exposes your DNS lookups to inspection or poisoning. SNIper logs a
+  warning when a DoH certificate fails verification; a recurring warning is a
+  strong hint this is happening. On a personal, unmanaged machine this does
+  not apply.
 - Traffic is not encrypted by this tool, it only tunnels your existing HTTPS
   connections. Your TLS encryption remains intact end-to-end.
 - The EXE is large (~10 MB) because PyInstaller bundles the Python runtime

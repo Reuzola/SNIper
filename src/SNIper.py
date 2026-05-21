@@ -63,6 +63,12 @@ try:
     _doh_ssl_ctx.set_alpn_protocols(["http/1.1"])
 except (NotImplementedError, AttributeError):
     pass  # very old OpenSSL — skip ALPN
+# Pin the TLS floor explicitly. create_default_context() already defaults to
+# 1.2, but stating it removes the version-dependent ambiguity across Python
+# builds. The floor stays at 1.2 (not 1.3) so the handshake still completes
+# through TLS-MITM appliances that lack 1.3 support; 1.3 is still offered and
+# used whenever the path allows it.
+_doh_ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 DEFAULT_PORT    = 8881
@@ -519,6 +525,7 @@ def _doh_lookup(hostname: str, qtype_name: str, qtype_num: int):
     engines that fingerprint or RST-inject DoH connections cannot block it.
     """
     last_err: Exception | None = None
+    cert_failures = 0
     for server in DOH_SERVERS:
         try:
             # "https://1.1.1.1/dns-query" -> ("1.1.1.1", "/dns-query")
@@ -560,13 +567,29 @@ def _doh_lookup(hostname: str, qtype_name: str, qtype_num: int):
             ip, ttl = parsed
             log.debug(f"DoH  {hostname} {qtype_name} -> {ip}  [{server}]")
             return ip, max(int(ttl), 30)
+        except ssl.SSLCertVerificationError as e:
+            # A cert that fails verification is a distinct signal from a DPI
+            # reset/timeout: the resolver either rotated to a cert without an
+            # IP SAN, or the TLS connection is being intercepted by a MITM CA
+            # trusted on this machine. Counted so the pass can flag it loudly.
+            cert_failures += 1
+            log.debug(f"DoH  {server}: certificate verification failed: {e}")
+            last_err = e
+            continue
         except Exception as e:
             log.debug(f"DoH  {server} failed for {hostname} ({qtype_name}): "
                       f"{type(e).__name__}: {e}")
             last_err = e
             continue
     if last_err is not None:
-        log.debug(f"All DoH servers exhausted for {hostname} ({qtype_name}): {last_err}")
+        if cert_failures:
+            log.warning(
+                f"TLS certificate verification failed for {cert_failures} DoH "
+                f"server(s) ({hostname}) — the resolver's certificate changed "
+                f"or the connection is being intercepted (TLS-MITM)")
+        else:
+            log.debug(f"All DoH servers exhausted for {hostname} "
+                      f"({qtype_name}): {last_err}")
     return None
 
 

@@ -79,6 +79,12 @@ try:
     _doh_ssl_ctx.set_alpn_protocols(["http/1.1"])
 except (NotImplementedError, AttributeError):
     pass
+# Pin the TLS floor explicitly. create_default_context() already defaults to
+# 1.2, but stating it removes the version-dependent ambiguity across Python
+# builds. The floor stays at 1.2 (not 1.3) so the handshake still completes
+# through TLS-MITM appliances that lack 1.3 support; 1.3 is still offered and
+# used whenever the path allows it.
+_doh_ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
 
 BUFFER          = 32768
 CONNECT_TIMEOUT = 10
@@ -489,6 +495,7 @@ def _doh_lookup(hostname, qtype_name, qtype_num, log_q):
     RST-inject DoH connections cannot block the lookup.
     """
     last_err = None
+    cert_failures = 0
     for srv in DOH_SERVERS:
         try:
             # IPv6 endpoints wrap the address in brackets, e.g.
@@ -525,11 +532,25 @@ def _doh_lookup(hostname, qtype_name, qtype_num, log_q):
                 continue
             ip, ttl = parsed
             return ip, max(int(ttl), 30)
+        except ssl.SSLCertVerificationError as e:
+            # A cert that fails verification is a distinct signal from a DPI
+            # reset/timeout: the resolver either rotated to a cert without an
+            # IP SAN, or the TLS connection is being intercepted by a MITM CA
+            # trusted on this machine. Counted so the pass can flag it loudly.
+            cert_failures += 1
+            log_q.put(("DEBUG",
+                       f"DoH  {srv}: certificate verification failed: {e}"))
+            last_err = e
         except Exception as e:
             log_q.put(("DEBUG",
                        f"DoH  {srv} failed for {hostname} ({qtype_name}): "
                        f"{type(e).__name__}: {e}"))
             last_err = e
+    if last_err is not None and cert_failures:
+        log_q.put(("WARNING",
+                   f"TLS certificate verification failed for {cert_failures} "
+                   f"DoH server(s) ({hostname}) — the resolver's certificate "
+                   f"changed or the connection is being intercepted (TLS-MITM)"))
     return None
 
 
