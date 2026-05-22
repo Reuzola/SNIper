@@ -115,6 +115,25 @@ For third-party antivirus software, use its equivalent "exclusion" or
 "allow list" feature. Only exclude files you trust — building the EXE
 yourself from source is the surest way to know what you are allowing.
 
+### Antivirus HTTPS scanning can defeat the bypass
+
+Several antivirus suites — ESET, Kaspersky, Bitdefender, Norton, Avast,
+Comodo and others — ship an **"HTTPS scanning"** / **"web protection"** /
+**"encrypted connection scanning"** feature that intercepts TLS traffic
+with the antivirus's own certificate, acting as a local
+man-in-the-middle.
+
+When that feature is on, SNIper's fragmented ClientHello reaches the
+antivirus first. The antivirus reassembles it and opens its *own*,
+un-fragmented TLS connection to the destination — so the DPI device sees
+an intact SNI again and the block comes back.
+
+If sites stay blocked while SNIper is running, **disable your
+antivirus's HTTPS/TLS scanning feature** (usually under its web or
+network protection settings) and retry. Turning it off does not weaken
+your security — it removes a layer that was already decrypting your
+HTTPS traffic locally.
+
 ## Project layout
 
 ```
@@ -249,6 +268,33 @@ The Windows proxy is restored under all normal exit conditions:
   proxy settings" under Settings → Network Settings. Likewise, any host
   listed in the Windows proxy *exceptions* (`ProxyOverride`) list is sent
   direct and skips SNIper.
+- **SNIper is an HTTP/CONNECT proxy, not a SOCKS proxy.** Browsers and
+  most desktop applications speak HTTP CONNECT and route through SNIper
+  without trouble. Software that only supports SOCKS5 — some BitTorrent
+  clients, Tor, and SSH dynamic port forwarding — cannot use SNIper as
+  its proxy.
+- **A blocked site may stall briefly on first load.** Chrome, Edge and
+  Firefox try HTTP/3 (QUIC) first; QUIC runs over UDP, which SNIper's
+  TCP proxy does not carry. The browser falls back to HTTP/2 over TCP
+  within a second or two, and that path *is* fragmented. If a blocked
+  site is reliably slow to open, disable QUIC — in Chrome/Edge, set
+  `chrome://flags/#enable-quic` (`edge://flags` on Edge) to **Disabled**.
+- **Windows Store (UWP) apps are best-effort.** Packaged Store apps such
+  as Mail or the Microsoft Store use their own networking stacks; some
+  honour the system proxy and some perform their own DNS. SNIper is
+  reliable for ordinary desktop programs, but UWP apps may behave
+  inconsistently.
+- **An active VPN can bypass SNIper.** WireGuard, OpenVPN, ProtonVPN and
+  similar clients send traffic through their own network adapter, which
+  may not pass through the Windows system proxy. With a VPN connected,
+  SNIper may have no effect; conversely, if the VPN already reaches the
+  blocked sites, you do not need SNIper alongside it.
+- **SNIper does not cover WSL2.** Linux distributions running under WSL2
+  sit behind their own virtual network adapter and do not inherit the
+  Windows system proxy. To send a WSL2 program through SNIper, set
+  `http_proxy` and `https_proxy` inside the Linux environment, pointing
+  at the Windows host's address as seen from WSL2 (not `127.0.0.1`) on
+  port 8881 — and the program itself must honour those variables.
 - **On corporate machines, proxy changes may be blocked or overridden.** If
   Group Policy disables per-user proxy settings, SNIper logs a warning and
   cannot route traffic on that machine. If a PAC script (`AutoConfigURL`) is
