@@ -181,7 +181,7 @@ The Windows proxy is restored under all normal exit conditions:
 | Stop button (GUI) | Yes |
 | Ctrl+C (CLI) | Yes |
 | Normal script exit | Yes |
-| Power loss / force kill | No, disable manually in Settings → Network → Proxy |
+| Power loss / force kill | No — disable the proxy manually in Settings → Network → Proxy; a PAC script, if you used one, also stays disabled |
 
 ## Notes
 
@@ -200,6 +200,19 @@ The Windows proxy is restored under all normal exit conditions:
   start SNIper, Windows may be serving a cached (possibly poisoned) DNS entry
   from before the proxy was active. Run `ipconfig /flushdns` once in a
   terminal to clear it, then retry.
+- **Some software bypasses the Windows system proxy.** SNIper routes
+  traffic by setting the Windows per-user proxy, which Chrome, Edge, Steam
+  and most apps set to "use system proxy" will honour. **Firefox** is the
+  main exception — by default it uses its own proxy settings and its own
+  DNS-over-HTTPS, so SNIper has no effect until you switch it to "Use system
+  proxy settings" under Settings → Network Settings. Likewise, any host
+  listed in the Windows proxy *exceptions* (`ProxyOverride`) list is sent
+  direct and skips SNIper.
+- **On corporate machines, proxy changes may be blocked or overridden.** If
+  Group Policy disables per-user proxy settings, SNIper logs a warning and
+  cannot route traffic on that machine. If a PAC script (`AutoConfigURL`) is
+  configured, SNIper temporarily disables it while running and restores it
+  on exit.
 - **On managed/corporate machines, DoH itself can still be intercepted.**
   SNIper validates each DoH server's TLS certificate against the Windows
   certificate store. If an extra root CA has been installed — common with

@@ -829,7 +829,29 @@ def handle_client(client, use_doh, frag, log_q):
 # ─────────────────────────────────────────────────────────────────────────────
 #  Windows proxy management (UNCHANGED)
 # ─────────────────────────────────────────────────────────────────────────────
-_IE = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+_IE        = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+_IE_POLICY = r"Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings"
+
+
+def _proxy_gpo_locked():
+    """True if Group Policy disables per-user proxy settings.
+
+    When HKLM ...\\Internet Settings\\ProxySettingsPerUser is 0, Windows
+    ignores the per-user (HKCU) proxy values this program writes — the write
+    succeeds but has no effect. Detecting it lets us warn the user instead of
+    failing silently on a managed/corporate machine.
+    """
+    if not _IS_WINDOWS:
+        return False
+    try:
+        k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _IE_POLICY)
+        try:
+            val = winreg.QueryValueEx(k, "ProxySettingsPerUser")[0]
+        finally:
+            winreg.CloseKey(k)
+        return val == 0
+    except OSError:
+        return False
 
 
 def _refresh():
@@ -844,7 +866,11 @@ def _refresh():
 
 def proxy_enable(addr):
     if not _IS_WINDOWS:
-        return None, None
+        return None, None, None
+    # Captured before the try: if a registry write fails partway through, the
+    # values read so far are still returned so the caller can restore — never
+    # silently drop the restore data and leave the proxy half-changed.
+    old_e, old_s, old_a = None, None, None
     try:
         k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _IE, 0,
                            winreg.KEY_READ | winreg.KEY_WRITE)
@@ -857,17 +883,27 @@ def proxy_enable(addr):
                 old_s = winreg.QueryValueEx(k, "ProxyServer")[0]
             except FileNotFoundError:
                 old_s = ""
+            # AutoConfigURL is a PAC script; Windows evaluates it BEFORE the
+            # static ProxyServer, so a PAC returning DIRECT would bypass us.
+            # None means the value did not exist (leave it absent on restore).
+            try:
+                old_a = winreg.QueryValueEx(k, "AutoConfigURL")[0]
+            except FileNotFoundError:
+                old_a = None
             winreg.SetValueEx(k, "ProxyEnable", 0, winreg.REG_DWORD, 1)
             winreg.SetValueEx(k, "ProxyServer", 0, winreg.REG_SZ, addr)
+            # Temporarily disable any PAC script so it cannot bypass us.
+            if old_a:
+                winreg.SetValueEx(k, "AutoConfigURL", 0, winreg.REG_SZ, "")
         finally:
             winreg.CloseKey(k)
         _refresh()
-        return old_e, old_s
     except Exception:
-        return None, None
+        pass
+    return old_e, old_s, old_a
 
 
-def proxy_restore(old_e, old_s):
+def proxy_restore(old_e, old_s, old_a=None):
     if not _IS_WINDOWS:
         return
     if old_e is None:
@@ -877,6 +913,10 @@ def proxy_restore(old_e, old_s):
         try:
             winreg.SetValueEx(k, "ProxyEnable", 0, winreg.REG_DWORD, int(old_e))
             winreg.SetValueEx(k, "ProxyServer", 0, winreg.REG_SZ, old_s or "")
+            # Restore the PAC script if one was present. None means it never
+            # existed, so leave it absent rather than creating an empty value.
+            if old_a is not None:
+                winreg.SetValueEx(k, "AutoConfigURL", 0, winreg.REG_SZ, old_a)
         finally:
             winreg.CloseKey(k)
         _refresh()
@@ -894,6 +934,7 @@ class ProxyServer:
         self._thread  = None
         self._old_e   = None
         self._old_s   = None
+        self._old_a   = None
         self._lock    = threading.Lock()
         self.log_q    = queue.Queue()
 
@@ -919,13 +960,21 @@ class ProxyServer:
                 except OSError: pass
                 raise
 
-            old_e, old_s = proxy_enable(f"127.0.0.1:{port}")
+            if _proxy_gpo_locked():
+                self.log_q.put(("WARNING",
+                    "Group Policy disables per-user proxy settings on this "
+                    "machine — SNIper cannot change the system proxy here."))
+            old_e, old_s, old_a = proxy_enable(f"127.0.0.1:{port}")
             self._sock = sock
-            self._old_e, self._old_s = old_e, old_s
+            self._old_e, self._old_s, self._old_a = old_e, old_s, old_a
             self._stop.clear()
             self.log_q.put(("INFO",
                 f"Proxy started on 127.0.0.1:{port}  |  fragment={frag}B  "
                 f"|  DoH={'on' if use_doh else 'off'}"))
+            if old_a:
+                self.log_q.put(("WARNING",
+                    "A PAC script (AutoConfigURL) was active; it has been "
+                    "temporarily disabled and will be restored on stop."))
             self._thread = threading.Thread(target=self._run, args=(frag, use_doh),
                                             daemon=True)
             self._thread.start()
@@ -939,14 +988,14 @@ class ProxyServer:
                 try: self._sock.close()
                 except OSError: pass
             thread = self._thread
-            old_e, old_s = self._old_e, self._old_s
+            old_e, old_s, old_a = self._old_e, self._old_s, self._old_a
             self._thread = None
             self._sock = None
-            self._old_e = self._old_s = None
+            self._old_e = self._old_s = self._old_a = None
 
         if thread:
             thread.join(timeout=3)
-        proxy_restore(old_e, old_s)
+        proxy_restore(old_e, old_s, old_a)
         self.log_q.put(("INFO", "Proxy stopped. Windows proxy restored."))
 
     def _run(self, frag, use_doh):

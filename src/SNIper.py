@@ -933,11 +933,34 @@ def handle_client(client: socket.socket, addr, use_doh: bool, frag: int):
 
 # ── Windows proxy management ──────────────────────────────────────────────────
 _IE_SETTINGS = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+_IE_POLICY   = r"Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings"
 
-# Holds the values needed to restore the system proxy. Set BEFORE any change is
-# made so a Ctrl+C arriving mid-write still has something to restore.
-_proxy_restore_args: tuple = (None, None)
+# Holds the values needed to restore the system proxy: (ProxyEnable,
+# ProxyServer, AutoConfigURL). Set BEFORE any change is made so a Ctrl+C
+# arriving mid-write still has something to restore.
+_proxy_restore_args: tuple = (None, None, None)
 _proxy_restored = threading.Event()
+
+
+def _proxy_gpo_locked() -> bool:
+    """True if Group Policy disables per-user proxy settings.
+
+    When HKLM ...\\Internet Settings\\ProxySettingsPerUser is 0, Windows
+    ignores the per-user (HKCU) proxy values this program writes — the write
+    succeeds but has no effect. Detecting it lets us warn the user instead of
+    failing silently on a managed/corporate machine.
+    """
+    if not _IS_WINDOWS:
+        return False
+    try:
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _IE_POLICY)
+        try:
+            val = winreg.QueryValueEx(key, "ProxySettingsPerUser")[0]
+        finally:
+            winreg.CloseKey(key)
+        return val == 0
+    except OSError:
+        return False
 
 
 def _refresh_windows_proxy():
@@ -957,12 +980,16 @@ def enable_windows_proxy(addr: str):
 
     Saves the prior settings into the module-level restore tuple BEFORE any
     write, so an interrupt mid-call can still be cleaned up by atexit.
-    Returns the saved (old_enable, old_server) pair.
+    Returns the saved (old_enable, old_server, old_autoconfig) tuple.
     """
     global _proxy_restore_args
     if not _IS_WINDOWS:
         log.warning("Not running on Windows — system proxy is not managed automatically.")
-        return None, None
+        return None, None, None
+    if _proxy_gpo_locked():
+        log.warning("Group Policy disables per-user proxy settings on this "
+                    "machine (ProxySettingsPerUser=0). SNIper cannot change "
+                    "the system proxy here; traffic will not be routed.")
     try:
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _IE_SETTINGS,
                              0, winreg.KEY_READ | winreg.KEY_WRITE)
@@ -975,24 +1002,38 @@ def enable_windows_proxy(addr: str):
                 old_server = winreg.QueryValueEx(key, "ProxyServer")[0]
             except FileNotFoundError:
                 old_server = ""
+            # AutoConfigURL is a PAC script; Windows evaluates it BEFORE the
+            # static ProxyServer, so a PAC returning DIRECT would route around
+            # us entirely. None means the value did not exist (leave it absent
+            # on restore); a string is saved verbatim and written back later.
+            try:
+                old_autoconfig = winreg.QueryValueEx(key, "AutoConfigURL")[0]
+            except FileNotFoundError:
+                old_autoconfig = None
 
             # Save BEFORE we modify, so cleanup always has correct values.
-            _proxy_restore_args = (old_enable, old_server)
+            _proxy_restore_args = (old_enable, old_server, old_autoconfig)
             _proxy_restored.clear()
 
             winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
             winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, addr)
+            # Temporarily disable any PAC script so it cannot bypass us.
+            if old_autoconfig:
+                winreg.SetValueEx(key, "AutoConfigURL", 0, winreg.REG_SZ, "")
         finally:
             winreg.CloseKey(key)
         _refresh_windows_proxy()
         log.info(f"Windows proxy ENABLED  ->  {addr}")
-        return old_enable, old_server
+        if old_autoconfig:
+            log.info("A PAC script (AutoConfigURL) was active; it has been "
+                     "temporarily disabled and will be restored on exit.")
+        return old_enable, old_server, old_autoconfig
     except Exception as e:
         log.warning(f"Could not enable proxy automatically: {e}")
-        return None, None
+        return None, None, None
 
 
-def restore_windows_proxy(old_enable, old_server):
+def restore_windows_proxy(old_enable, old_server, old_autoconfig=None):
     """Restore Windows proxy settings to their previous state (idempotent)."""
     if not _IS_WINDOWS:
         return
@@ -1008,6 +1049,10 @@ def restore_windows_proxy(old_enable, old_server):
             # Always write ProxyServer back — even an empty string is the
             # correct "no upstream" state and prevents leaving our address behind.
             winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, old_server or "")
+            # Restore the PAC script if one was present. None means it never
+            # existed, so leave it absent rather than creating an empty value.
+            if old_autoconfig is not None:
+                winreg.SetValueEx(key, "AutoConfigURL", 0, winreg.REG_SZ, old_autoconfig)
         finally:
             winreg.CloseKey(key)
         _refresh_windows_proxy()
