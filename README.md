@@ -75,6 +75,46 @@ The EXE is fully portable: copy it anywhere (USB drive, OneDrive, etc.) and it
 will run from there. It writes nothing to the registry except the per-user
 proxy settings, which it restores on exit.
 
+## Antivirus and SmartScreen
+
+The first time you run a freshly downloaded `SNIper_<arch>.exe`, Windows
+SmartScreen or a third-party antivirus may warn about it or move it to
+quarantine. This is expected for a new, unsigned executable and does not mean
+the file is malicious — several of SNIper's normal actions overlap with
+behaviour that heuristic scanners treat as suspicious:
+
+- it opens a local TCP listener and proxies traffic (server-like behaviour);
+- it writes the per-user proxy keys in the registry;
+- it can open many outbound connections in a short burst;
+- the EXE is **not code-signed**, so SmartScreen has no reputation history
+  for it and every new release starts from a zero-reputation baseline.
+
+None of this is hidden — the full source is in this repository, and you can
+build the EXE yourself (see *Building from source*) instead of trusting a
+pre-built binary.
+
+### Getting past SmartScreen
+
+If you see **"Windows protected your PC"**, click **More info**, then
+**Run anyway**. The EXE carries embedded version metadata, an application
+manifest and an icon, all of which help its reputation, but a brand-new
+download still has to be allowed through manually the first time.
+
+### If your antivirus quarantines it
+
+If Microsoft Defender or a third-party product (Avast, Kaspersky,
+Bitdefender, etc.) removes or blocks the EXE, restore it and add an
+exclusion. In **Windows Security**:
+
+1. Open **Windows Security → Virus & threat protection**.
+2. Under **Virus & threat protection settings**, click **Manage settings**.
+3. Scroll to **Exclusions** and click **Add or remove exclusions**.
+4. Choose **Add an exclusion → File** and select `SNIper_<arch>.exe`.
+
+For third-party antivirus software, use its equivalent "exclusion" or
+"allow list" feature. Only exclude files you trust — building the EXE
+yourself from source is the surest way to know what you are allowing.
+
 ## Project layout
 
 ```
@@ -90,7 +130,8 @@ SNIper_v1.1.2/
 └── packaging/
     ├── build_exe.bat          Build the portable EXE for this architecture
     ├── app.manifest           asInvoker (no UAC) + Per-Monitor v2 DPI
-    └── version_info.txt       EXE metadata (anti-false-positive)
+    ├── version_info.txt       EXE metadata (anti-false-positive)
+    └── SNIper.ico             Application icon embedded into the EXE
 ```
 
 This release ships with a pre-built **ARM64** executable
@@ -242,14 +283,6 @@ This installs PyInstaller into the active Python and produces
 `SNIper_<arch>.exe` at the project root. The architecture is taken from the
 Python interpreter, so to produce the x64 build, run the script with an x64
 Python on an x64 host.
-
-Build with **Python 3.10–3.12**. PyInstaller embeds the build-time Python
-runtime into the EXE, and Python 3.13+ requires Windows 10 1809 — which would
-raise the minimum OS above the supported Windows 10 1607. The script prints
-the interpreter path and version it used (so a Microsoft Store stub cannot go
-unnoticed), pins PyInstaller to its 6.x line for reproducible builds, and
-prints the finished EXE's SHA-256 checksum in the build summary so the
-unsigned binary can be verified.
 
 ## Disclaimer
 
