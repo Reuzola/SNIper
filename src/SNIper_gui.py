@@ -71,8 +71,15 @@ _enable_high_dpi()
 # ─────────────────────────────────────────────────────────────────────────────
 #  Proxy core (identical to SNIper.py — UNCHANGED logic)
 # ─────────────────────────────────────────────────────────────────────────────
-_IP_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
-def _is_ip(h): return bool(_IP_RE.match(h))
+def _is_ip(h):
+    """True if h is a literal IPv4 or IPv6 address (so no DNS is needed)."""
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            socket.inet_pton(family, h)
+            return True
+        except (OSError, ValueError):
+            pass
+    return False
 
 _doh_ssl_ctx = ssl.create_default_context()
 try:
@@ -763,20 +770,43 @@ def _strip_hop_by_hop(headers_block):
     return b"\r\n".join(out) + b"\r\n\r\n"
 
 
+def _split_host_port(authority, default_port):
+    """Split a 'host:port' authority into (host, port), or None if malformed.
+
+    A bracketed IPv6 literal ('[2001:db8::1]:443' or '[2001:db8::1]') has its
+    brackets stripped so the bare address reaches the resolver, which rejects
+    the bracketed form.
+    """
+    if authority.startswith("["):
+        end = authority.find("]")
+        if end == -1:
+            return None
+        host, tail = authority[1:end], authority[end + 1:]
+        if not tail:
+            return host, default_port
+        if not tail.startswith(":"):
+            return None
+        port_s = tail[1:]
+    elif ":" in authority:
+        host, _, port_s = authority.rpartition(":")
+    else:
+        return authority, default_port
+    try:
+        return host, int(port_s)
+    except ValueError:
+        return None
+
+
 def handle_http(client, method, url, headers, use_doh, log_q):
     s = url[7:] if url.startswith("http://") else url
     ps = s.find("/")
     hp   = s[:ps] if ps != -1 else s
     path = s[ps:] if ps != -1 else "/"
-    if ":" in hp:
-        host, port_s = hp.rsplit(":", 1)
-        try:
-            port = int(port_s)
-        except ValueError:
-            log_q.put(("ERROR", f"Bad port in URL: {url[:80]}"))
-            return
-    else:
-        host, port = hp, 80
+    parsed = _split_host_port(hp, 80)
+    if parsed is None:
+        log_q.put(("ERROR", f"Bad port in URL: {url[:80]}"))
+        return
+    host, port = parsed
 
     remote = None
     try:
@@ -806,14 +836,10 @@ def handle_client(client, use_doh, frag, log_q):
         method, url = parts[0], parts[1]
         rh = b"\r\n".join(lines[1:]) + b"\r\n\r\n"
         if method.upper() == "CONNECT":
-            if ":" in url:
-                host, port_s = url.rsplit(":", 1)
-                try:
-                    port = int(port_s)
-                except ValueError:
-                    return
-            else:
-                host, port = url, 443
+            parsed = _split_host_port(url, 443)
+            if parsed is None:
+                return
+            host, port = parsed
             log_q.put(("INFO", f"CONNECT  {host}:{port}"))
             handle_connect(client, host, port, use_doh, frag, log_q)
         else:
@@ -2043,6 +2069,48 @@ class App(tk.Tk):
         self.destroy()
 
 
+# ── Single-instance guard ─────────────────────────────────────────────────────
+_singleton_mutex = None  # kept for the process lifetime so the mutex stays held
+
+
+def _acquire_single_instance():
+    """Return False if another SNIper instance is already running this session.
+
+    Two instances would both manage the per-user proxy registry keys and
+    fight over saving and restoring them, so a double launch is blocked. The
+    named mutex is session-local (no 'Global\\' prefix), so separate Windows
+    logon sessions (RDP, Fast User Switching) each run their own instance.
+    The handle is never closed — Windows releases it when the process exits.
+    """
+    global _singleton_mutex
+    if not _IS_WINDOWS:
+        return True
+    try:
+        k = ctypes.windll.kernel32
+        k.CreateMutexW.restype  = ctypes.c_void_p
+        k.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+        handle = k.CreateMutexW(None, False, "SNIper_singleton")
+        already_running = k.GetLastError() == 183  # ERROR_ALREADY_EXISTS
+    except (OSError, AttributeError):
+        return True  # never block startup if the guard itself fails
+    if not handle:
+        return True
+    if already_running:
+        return False
+    _singleton_mutex = handle
+    return True
+
+
 if __name__ == "__main__":
+    if not _acquire_single_instance():
+        if _IS_WINDOWS:
+            _user32.MessageBoxW(
+                0,
+                "SNIper is already running.\n\n"
+                "Look for its window, or its icon in the system tray.",
+                "SNIper",
+                0x40,  # MB_OK | MB_ICONINFORMATION
+            )
+        raise SystemExit(0)
     app = App()
     app.mainloop()

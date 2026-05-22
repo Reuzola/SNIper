@@ -32,7 +32,6 @@ import logging
 import base64
 import ssl
 import time
-import re
 import atexit
 import ctypes
 import struct
@@ -46,10 +45,15 @@ except ImportError:
     _IS_WINDOWS = False
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-_IP_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
-
 def _is_ip(host: str) -> bool:
-    return bool(_IP_RE.match(host))
+    """True if host is a literal IPv4 or IPv6 address (so no DNS is needed)."""
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            socket.inet_pton(family, host)
+            return True
+        except (OSError, ValueError):
+            pass
+    return False
 
 # SSL context for DoH. We connect to DoH servers BY IP, but their certificates
 # include the IP in the SAN, so default verification works. Built once and
@@ -852,6 +856,33 @@ def _strip_hop_by_hop(headers_block: bytes) -> bytes:
     return b"\r\n".join(out_lines) + b"\r\n\r\n"
 
 
+def _split_host_port(authority: str, default_port: int):
+    """Split a 'host:port' authority into (host, port), or None if malformed.
+
+    A bracketed IPv6 literal ('[2001:db8::1]:443' or '[2001:db8::1]') has its
+    brackets stripped so the bare address reaches the resolver — inet_pton and
+    getaddrinfo both reject the bracketed form.
+    """
+    if authority.startswith("["):
+        end = authority.find("]")
+        if end == -1:
+            return None
+        host, tail = authority[1:end], authority[end + 1:]
+        if not tail:
+            return host, default_port
+        if not tail.startswith(":"):
+            return None
+        port_s = tail[1:]
+    elif ":" in authority:
+        host, _, port_s = authority.rpartition(":")
+    else:
+        return authority, default_port
+    try:
+        return host, int(port_s)
+    except ValueError:
+        return None
+
+
 def handle_http(client: socket.socket, method: str, url: str,
                 headers: bytes, use_doh: bool):
     stripped = url[7:] if url.startswith("http://") else url
@@ -859,15 +890,11 @@ def handle_http(client: socket.socket, method: str, url: str,
     hostport = stripped[:path_start] if path_start != -1 else stripped
     path     = stripped[path_start:] if path_start != -1 else "/"
 
-    if ":" in hostport:
-        host, port_s = hostport.rsplit(":", 1)
-        try:
-            port = int(port_s)
-        except ValueError:
-            log.error(f"  Bad port in URL: {url[:80]}")
-            return
-    else:
-        host, port = hostport, 80
+    parsed = _split_host_port(hostport, 80)
+    if parsed is None:
+        log.error(f"  Bad port in URL: {url[:80]}")
+        return
+    host, port = parsed
 
     remote = None
     try:
@@ -908,14 +935,10 @@ def handle_client(client: socket.socket, addr, use_doh: bool, frag: int):
         rest_headers = b"\r\n".join(lines[1:]) + b"\r\n\r\n"
 
         if method.upper() == "CONNECT":
-            if ":" in url:
-                host, port_s = url.rsplit(":", 1)
-                try:
-                    port = int(port_s)
-                except ValueError:
-                    return
-            else:
-                host, port = url, 443
+            parsed = _split_host_port(url, 443)
+            if parsed is None:
+                return
+            host, port = parsed
             log.info(f"CONNECT  {host}:{port}")
             handle_connect(client, host, port, use_doh, frag)
         else:
@@ -1087,6 +1110,42 @@ _HandlerRoutine = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_uint) if _IS_WINDOW
 _console_handler = _HandlerRoutine(_win_console_handler) if _IS_WINDOWS else None
 
 
+# ── Single-instance guard ─────────────────────────────────────────────────────
+_singleton_mutex = None  # kept for the process lifetime so the mutex stays held
+
+
+def _acquire_single_instance() -> bool:
+    """Return False if another SNIper instance is already running this session.
+
+    Two instances would both write and later restore the per-user proxy
+    registry keys, so the second one to exit would clobber the first one's
+    saved state. A named mutex makes a double launch fail fast and cleanly.
+
+    The mutex name is session-local (no 'Global\\' prefix), so separate
+    Windows logon sessions — RDP or Fast User Switching — each run their own
+    instance, matching the per-user scope of the proxy keys. The handle is
+    deliberately never closed: Windows frees it when the process exits.
+    Non-Windows platforms have no shared mutex, so the guard is a no-op.
+    """
+    global _singleton_mutex
+    if not _IS_WINDOWS:
+        return True
+    try:
+        k = ctypes.windll.kernel32
+        k.CreateMutexW.restype  = ctypes.c_void_p
+        k.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+        handle = k.CreateMutexW(None, False, "SNIper_singleton")
+        already_running = k.GetLastError() == 183  # ERROR_ALREADY_EXISTS
+    except (OSError, AttributeError):
+        return True  # never block startup if the guard itself fails
+    if not handle:
+        return True
+    if already_running:
+        return False
+    _singleton_mutex = handle
+    return True
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
@@ -1108,6 +1167,10 @@ def main():
 
     if args.verbose:
         log.setLevel(logging.DEBUG)
+
+    if not _acquire_single_instance():
+        log.error("SNIper is already running — only one instance per session.")
+        sys.exit(1)
 
     use_doh    = not args.no_doh
     proxy_addr = f"127.0.0.1:{args.port}"
