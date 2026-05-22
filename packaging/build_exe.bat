@@ -109,6 +109,7 @@ if exist "%PROJECT_ROOT%\%APPNAME%.exe" del /Q "%PROJECT_ROOT%\%APPNAME%.exe"
     --version-file "%PKG_DIR%version_info.txt" ^
     --manifest "%PKG_DIR%app.manifest" ^
     --icon "%ICON%" ^
+    --add-data "%ICON%;." ^
     "%ENTRY%"
 if errorlevel 1 (
     echo [ERROR] PyInstaller build failed - see the output above.

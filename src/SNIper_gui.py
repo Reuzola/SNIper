@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import tkinter as tk
 from tkinter import ttk, scrolledtext
+import os
+import sys
 import threading
 import socket
 import base64
@@ -41,6 +43,30 @@ try:
     _IS_WINDOWS = True
 except ImportError:
     _IS_WINDOWS = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Application icon — resolved once, shared by the window and the tray icon.
+# ─────────────────────────────────────────────────────────────────────────────
+def _icon_path():
+    """Absolute path to SNIper.ico, or None if it cannot be located.
+
+    Frozen (PyInstaller onefile): the icon is bundled with the program and
+    extracted next to it (sys._MEIPASS), so it travels inside the single EXE
+    no matter where the EXE is moved. Run as a plain script: it lives in the
+    repo's packaging/ folder, one level up from src/.
+    """
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+        candidate = os.path.join(base, "SNIper.ico")
+    else:
+        candidate = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "..", "packaging", "SNIper.ico")
+    candidate = os.path.normpath(candidate)
+    return candidate if os.path.isfile(candidate) else None
+
+
+_ICON_PATH = _icon_path()  # resolved once at import; None if the .ico is absent
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1097,6 +1123,12 @@ if _IS_WINDOWS:
     _IDI_APPLICATION = 32512
     _IDC_ARROW       = 32512
 
+    # LoadImageW flags and GetSystemMetrics index for loading the app icon
+    # from the bundled SNIper.ico file at runtime.
+    _IMAGE_ICON      = 1
+    _LR_LOADFROMFILE = 0x00000010
+    _SM_CXSMICON     = 49
+
     # The tray helper window is a normal (never-shown) top-level window, not
     # a message-only window: message-only windows do not receive broadcast
     # messages, and the TaskbarCreated notification (section 8.1) is sent as
@@ -1200,6 +1232,14 @@ if _IS_WINDOWS:
     _user32.LoadCursorW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
     _user32.LoadCursorW.restype  = wintypes.HANDLE
 
+    _user32.LoadImageW.argtypes  = [
+        wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT,
+        ctypes.c_int, ctypes.c_int, wintypes.UINT,
+    ]
+    _user32.LoadImageW.restype   = wintypes.HANDLE
+    _user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+    _user32.GetSystemMetrics.restype  = ctypes.c_int
+
     _user32.RegisterClassW.argtypes = [ctypes.POINTER(_WNDCLASSW)]
     _user32.RegisterClassW.restype  = wintypes.ATOM
 
@@ -1242,6 +1282,9 @@ if _IS_WINDOWS:
     ]
     _shell32.Shell_NotifyIconW.restype  = wintypes.BOOL
 
+    _shell32.SetCurrentProcessExplicitAppUserModelID.argtypes = [wintypes.LPCWSTR]
+    _shell32.SetCurrentProcessExplicitAppUserModelID.restype  = ctypes.c_long
+
     _kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
     _kernel32.GetModuleHandleW.restype  = wintypes.HMODULE
 
@@ -1249,6 +1292,25 @@ if _IS_WINDOWS:
         # Win32 stock IDs are passed as LPCWSTR with the pointer value being
         # the small integer. ctypes won't auto-convert int→LPCWSTR; cast it.
         return ctypes.cast(ctypes.c_void_p(i), wintypes.LPCWSTR)
+
+    _tray_hicon_cache = None
+
+    def _tray_hicon():
+        """HICON for the tray, loaded once from SNIper.ico at small-icon size.
+
+        Falls back to the generic Windows application icon if the bundled
+        .ico is missing, so the tray entry is never blank. The handle lives
+        for the whole process; Windows reclaims it when the process exits.
+        """
+        global _tray_hicon_cache
+        if _tray_hicon_cache is None and _ICON_PATH:
+            size = _user32.GetSystemMetrics(_SM_CXSMICON)
+            _tray_hicon_cache = _user32.LoadImageW(
+                None, _ICON_PATH, _IMAGE_ICON, size, size, _LR_LOADFROMFILE)
+        if not _tray_hicon_cache:
+            _tray_hicon_cache = _user32.LoadIconW(
+                None, _MAKEINTRESOURCE(_IDI_APPLICATION))
+        return _tray_hicon_cache
 
 
 class TrayIcon:
@@ -1377,7 +1439,7 @@ class TrayIcon:
         nid.uID              = 1
         nid.uFlags           = _NIF_MESSAGE | _NIF_ICON | _NIF_TIP
         nid.uCallbackMessage = _WM_TRAY_CB
-        nid.hIcon            = _user32.LoadIconW(None, _MAKEINTRESOURCE(_IDI_APPLICATION))
+        nid.hIcon            = _tray_hicon()
         nid.szTip            = self.tooltip[:127]
         if _shell32.Shell_NotifyIconW(_NIM_ADD, ctypes.byref(nid)):
             self._added = True
@@ -1648,10 +1710,42 @@ class HoverButton(tk.Button):
         self.config(bg=bg, activebackground=hover)
 
 
+def _set_app_user_model_id():
+    """Give the process an explicit taskbar identity.
+
+    Without this, a frozen Python app can inherit a generic or
+    interpreter-derived identity, which makes the taskbar button show the
+    wrong icon. Tagging the process ties the taskbar button (and any
+    pinned shortcut) to SNIper. Must run before the first window appears.
+    """
+    if not _IS_WINDOWS:
+        return
+    try:
+        _shell32.SetCurrentProcessExplicitAppUserModelID("SNIper.DPIBypassProxy")
+    except (OSError, AttributeError):
+        pass
+
+
+def _apply_window_icon(win):
+    """Give a Tk window the SNIper icon — title bar, Alt-Tab and taskbar.
+
+    Uses iconbitmap(default=...) so every Toplevel opened afterwards picks
+    up the same icon. Silently does nothing if the .ico cannot be found.
+    """
+    if not _ICON_PATH:
+        return
+    try:
+        win.iconbitmap(default=_ICON_PATH)
+    except Exception:
+        pass
+
+
 class App(tk.Tk):
     def __init__(self):
+        _set_app_user_model_id()   # taskbar identity — before any window
         super().__init__()
         self.title("SNIper")
+        _apply_window_icon(self)   # title bar, Alt-Tab and taskbar icon
         self.configure(bg=C["bg"])
         # Clamp the window to the screen. On small displays (1366×768 and
         # below), especially at >100% DPI scaling, the default 760×640 plus
