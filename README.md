@@ -18,7 +18,7 @@ user only.
   load the EXE with the latest servicing updates installed, but is
   untested and not officially supported.
 - **Python (CLI only):** if you run `src/SNIper.py` directly instead of
-  the EXE, you need **Python 3.10 or newer**. The EXE bundles its own
+  the EXE, you need **Python 3.7 or newer**. The EXE bundles its own
   runtime, so this requirement only applies to the CLI script.
 
 ## Origin
@@ -208,7 +208,8 @@ The GUI provides:
 
 The repository also ships the CLI script (`src/SNIper.py`) for users who want
 to embed the proxy in their own scripts or run it without a GUI. This is
-**not** packaged into the EXE; to use it you need a Python install:
+**not** packaged into the EXE; to use it you need Python 3.7 or newer
+installed:
 
 ```
 python src/SNIper.py [options]

@@ -24,6 +24,11 @@ Options:
   --verbose   Enable debug logging
 """
 
+# PEP 563 lazy annotations: the `X | Y` and `tuple[...]` type hints used
+# below are never evaluated at runtime, so the module still imports on
+# Python 3.7-3.9. This must remain the first statement in the file.
+from __future__ import annotations
+
 import socket
 import sys
 import threading

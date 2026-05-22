@@ -16,6 +16,11 @@ triggers a UAC prompt. Packaged as a portable single-file EXE via PyInstaller
 (see packaging/build_exe.bat).
 """
 
+# PEP 563 lazy annotations: the `X | Y` and `tuple[...]` type hints used
+# below are never evaluated at runtime, so the module still imports on
+# Python 3.7-3.9. This must remain the first statement in the file.
+from __future__ import annotations
+
 import tkinter as tk
 from tkinter import ttk, scrolledtext
 import threading
