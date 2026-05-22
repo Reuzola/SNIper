@@ -243,6 +243,14 @@ This installs PyInstaller into the active Python and produces
 Python interpreter, so to produce the x64 build, run the script with an x64
 Python on an x64 host.
 
+Build with **Python 3.10–3.12**. PyInstaller embeds the build-time Python
+runtime into the EXE, and Python 3.13+ requires Windows 10 1809 — which would
+raise the minimum OS above the supported Windows 10 1607. The script prints
+the interpreter path and version it used (so a Microsoft Store stub cannot go
+unnoticed), pins PyInstaller to its 6.x line for reproducible builds, and
+prints the finished EXE's SHA-256 checksum in the build summary so the
+unsigned binary can be verified.
+
 ## Disclaimer
 
 This tool is published for **educational and personal use**. It is intended to

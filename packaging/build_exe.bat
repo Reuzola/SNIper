@@ -46,6 +46,32 @@ where %PY% >nul 2>&1 || (
     goto :fail
 )
 
+rem ---- Identify the interpreter (catch the Microsoft Store stub) -----------
+rem  A bare "python" on PATH can be the Microsoft Store stub, which does not
+rem  run code -- it just opens the Store page. Resolving sys.executable both
+rem  proves a real interpreter answered and shows which Python is in use.
+set "PY_EXE="
+for /f "delims=" %%E in ('%PY% -c "import sys;print(sys.executable)" 2^>nul') do set "PY_EXE=%%E"
+if not defined PY_EXE (
+    echo [ERROR] "%PY%" did not run Python - it produced no interpreter path.
+    echo         This is usually the Microsoft Store stub. Install the real
+    echo         Python from python.org/downloads and re-run this script.
+    goto :fail
+)
+set "PY_VER="
+for /f "delims=" %%V in ('%PY% -c "import sys;print(sys.version.split()[0])" 2^>nul') do set "PY_VER=%%V"
+echo Python exe   : %PY_EXE%
+echo Python ver   : %PY_VER%
+
+rem  PyInstaller embeds this interpreter's runtime in the EXE. Python 3.13+
+rem  dropped Windows 8.1 and needs Windows 10 1809, which would raise the
+rem  EXE's OS floor above the documented Windows 10 1607 minimum.
+for /f "tokens=1,2 delims=." %%a in ("%PY_VER%") do (set "PY_MAJOR=%%a" & set "PY_MINOR=%%b")
+if "%PY_MAJOR%"=="3" if defined PY_MINOR if %PY_MINOR% GEQ 13 (
+    echo [NOTE] Python %PY_VER% bundles a runtime that needs Windows 10 1809+.
+    echo        Build with Python 3.10-3.12 to keep the Windows 10 1607 floor.
+)
+
 rem ---- Detect architecture --------------------------------------------------
 rem  Only 64-bit targets are supported. 32-bit Windows is detected explicitly
 rem  so the user gets a clear reason rather than a generic "unsupported arch"
@@ -81,7 +107,9 @@ rem ---- Ensure PyInstaller is available -------------------------------------
 %PY% -m PyInstaller --version >nul 2>&1
 if errorlevel 1 (
     echo PyInstaller not found - installing ...
-    %PY% -m pip install --upgrade pyinstaller
+    rem  Pin the major version: a future PyInstaller 7.x could change CLI
+    rem  flags or hooks and break this build without warning.
+    %PY% -m pip install "pyinstaller>=6.0,<7.0"
     if errorlevel 1 (
         echo [ERROR] PyInstaller installation failed.
         goto :fail
@@ -93,6 +121,8 @@ echo.
 
 rem ---- Build (all artifacts kept inside packaging\) ------------------------
 if exist "%PROJECT_ROOT%\%APPNAME%.exe" del /Q "%PROJECT_ROOT%\%APPNAME%.exe"
+rem  Remove a stale checksum file left by an older build of this script.
+del /Q "%PROJECT_ROOT%\%APPNAME%.exe.sha256" 2>nul
 
 %PY% -m PyInstaller ^
     --onefile ^
@@ -128,11 +158,23 @@ rem ---- Verify the produced EXE's real PE architecture ----------------------
 set "EXE_ARCH=unknown"
 for /f "tokens=*" %%M in ('%PY% -c "import struct,sys;f=open(sys.argv[1],'rb');f.seek(0x3C);o=struct.unpack('<I',f.read(4))[0];f.seek(o+4);print({0x8664:'x64',0xAA64:'arm64',0x14c:'x86'}.get(struct.unpack('<H',f.read(2))[0],'unknown'))" "%FINAL%"') do set "EXE_ARCH=%%M"
 
+rem ---- SHA-256 of the finished EXE -----------------------------------------
+rem  The EXE is unsigned; printing its checksum lets the builder publish it
+rem  for users to verify. Shown in the summary below only -- no file is
+rem  written, so the project root stays clean.
+set "SHA256="
+for /f "skip=1 delims=" %%H in ('certutil -hashfile "%FINAL%" SHA256 2^>nul') do if not defined SHA256 set "SHA256=%%H"
+
 echo.
 echo ============================================================
 echo  Done: %FINAL%
 echo  EXE architecture : %EXE_ARCH%
 echo  This machine     : %SUFFIX%
+if defined SHA256 (
+    echo  SHA-256          : %SHA256%
+) else (
+    echo  SHA-256          : ^(certutil unavailable - checksum skipped^)
+)
 if /i not "%EXE_ARCH%"=="%SUFFIX%" (
     echo  [WARNING] Architecture mismatch - this EXE will show
     echo            "This app can't run on your PC" on a %SUFFIX% machine.
