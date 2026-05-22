@@ -564,7 +564,7 @@ def _doh_lookup(hostname: str, qtype_name: str, qtype_num: int):
                     # Some local middleware (HTTPS-scanning AV, captive portals)
                     # rejects requests without a User-Agent; add a plausible one.
                     "Accept":     "application/dns-message",
-                    "User-Agent": "Mozilla/5.0 SNIper/1.1.2",
+                    "User-Agent": "Mozilla/5.0 SNIper/1.1.3",
                 },
                 timeout=DOH_TIMEOUT,
             )

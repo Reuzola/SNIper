@@ -1,5 +1,147 @@
 # Changelog
 
+## v1.1.3 — 2026-05-22
+
+A compatibility-focused release. The goal was to let SNIper start and route
+traffic unmodified on as many machine configurations as possible — different
+Windows versions, Python versions, network types and hardware. Every change
+below closes a specific case where the application could fail to start, fail
+to bypass, or behave inconsistently.
+
+### CLI runs on Python 3.7-3.9 again
+
+`src/SNIper.py` and `src/SNIper_gui.py` used PEP 604 (`X | Y`) and PEP 585
+(`tuple[...]`) type hints. A Python 3.9-or-older parser rejects those with a
+`SyntaxError` before the module can load. Both files now begin with
+`from __future__ import annotations`, so annotations are evaluated lazily and
+the script imports cleanly on Python 3.7 and later. The EXE bundles its own
+runtime and was never affected — this only matters when running the script
+directly.
+
+### Windows version claims corrected
+
+`app.manifest` declared support for Windows 7 and 8, but the bundled Python
+runtime depends on a Universal CRT version those releases do not ship, so the
+EXE fails there with "this app can't run on your PC". The two false
+`supportedOS` GUIDs were removed — the manifest now declares only Windows
+10/11 and Windows 8.1 — and the README documents the real minimum
+(Windows 10 1607). On older Windows 10 builds limited to Per-Monitor v1 DPI
+awareness, the GUI now rescales when moved between monitors of different DPI
+instead of staying blurry.
+
+### DNS resolution on IPv6-only networks
+
+On NAT64/DNS64, DS-Lite and 464XLAT networks there is no IPv4 path, so every
+IPv4 DoH and plain-DNS resolver was unreachable and resolution failed:
+
+- The DoH list and the plain-DNS list each gained IPv6 resolver addresses
+  (Cloudflare, Google, AdGuard), tried after the IPv4 entries so dual-stack
+  hosts still prefer the faster IPv4 path.
+- The DoH URL parser is now IPv6-aware: a bracketed literal such as
+  `https://[2606:4700:4700::1111]/dns-query` has its brackets stripped before
+  the address reaches `socket.create_connection()`, which rejects the
+  bracketed form.
+- The resolver list was widened (AdGuard, DNS.SB), so a fast certificate
+  failure on one provider falls through to a working one quickly.
+
+### TLS handshake floor and certificate diagnostics
+
+The DoH SSL context now sets `minimum_version = TLSv1_2` explicitly, removing
+the version-dependent ambiguity between Python builds; the floor is kept at
+1.2 (not 1.3) so the handshake still completes through TLS-MITM appliances
+that lack 1.3 support. A DoH certificate-verification failure is now counted
+and logged separately from an ordinary DPI reset or timeout — a recurring
+warning is a clear signal that the connection is being intercepted by a MITM
+CA trusted on the machine.
+
+### Listener and connection handling hardened
+
+- On Windows the listening socket now uses `SO_EXCLUSIVEADDRUSE` instead of
+  `SO_REUSEADDR`. On Windows `SO_REUSEADDR` lets an unrelated process bind the
+  same address and hijack connections; `SO_EXCLUSIVEADDRUSE` is the correct
+  exclusive bind. Other platforms keep `SO_REUSEADDR`.
+- Concurrent connection handlers are capped with a bounded semaphore (256). A
+  burst of connections can no longer exhaust the OS thread limit and crash the
+  accept loop; over the cap a connection is refused and the client retries.
+- Remote sockets enable TCP keepalive (with a shortened Windows probe
+  interval), so a peer that vanishes without a FIN/RST — laptop sleep, Wi-Fi
+  change, NAT idle-timeout — no longer leaks a handler stuck forever in
+  `recv()`.
+
+### GUI on stock Windows 10
+
+- The log panel asked for "Cascadia Mono", which ships in-box only on Windows
+  11. When it is missing Tk silently substitutes a proportional font. The
+  monospaced family is now resolved at runtime against the actual font list,
+  falling back Cascadia Mono → Consolas → Lucida Console → Courier New.
+- The window is clamped to the screen. On small displays (1366×768 and below),
+  especially above 100% DPI scaling, the fixed 760×640 geometry plus chrome
+  could spill off-screen; it now never requests more than the screen can show,
+  and the minimum size was lowered to match.
+
+### Tray icon survives an Explorer restart
+
+When Explorer crashes and restarts it rebuilds the taskbar and drops every
+tray icon. The tray helper is now a normal (hidden, tool-window) top-level
+window rather than a message-only window — message-only windows do not receive
+broadcasts — and it listens for the `TaskbarCreated` broadcast, re-adding the
+icon so it reappears instead of staying gone.
+
+### Corporate proxy environments
+
+- **Group Policy:** if `ProxySettingsPerUser` is 0 under the HKLM policy key,
+  Windows ignores the per-user proxy values SNIper writes — the write succeeds
+  but has no effect. SNIper now detects this and logs a clear warning instead
+  of failing silently on a managed machine.
+- **PAC scripts:** an `AutoConfigURL` (PAC) is evaluated by Windows before the
+  static proxy, so a PAC returning `DIRECT` would route around SNIper. The PAC
+  value is now saved, temporarily cleared while SNIper runs, and restored on
+  exit; the log notes when this happens.
+
+### Bracketed IPv6 targets and a double-launch guard
+
+- A `CONNECT [2001:db8::1]:443` request — the form modern browsers send for an
+  IPv6 literal — previously kept the brackets and failed to resolve. Host/port
+  splitting is now bracket-aware across both the CONNECT and plain-HTTP paths.
+- A session-local named mutex makes a second launch fail fast with a clear
+  message instead of two instances fighting over the proxy registry keys. The
+  mutex is per-session, so RDP and Fast User Switching each get their own
+  instance.
+
+### Build script
+
+- PyInstaller is pinned to `>=6.0,<7.0`, so a future major release cannot
+  change CLI flags or hooks and break the build silently.
+- The script resolves `sys.executable` before building. This proves a real
+  interpreter answered — a bare `python` on PATH can be the Microsoft Store
+  stub, which runs no code — and prints which Python is in use. It also warns
+  when Python 3.13+ is used, since that runtime would raise the EXE's OS floor
+  above the documented Windows 10 1607 minimum.
+- The finished EXE's SHA-256 is printed in the build summary so the builder
+  can publish it for verification (the EXE is unsigned).
+- 32-bit Windows (x86) is detected and rejected with a clear explanation
+  rather than a generic "unsupported architecture" message.
+
+### Application icon
+
+A dedicated `SNIper.ico` is embedded into the EXE and shown in the window
+title bar, the taskbar, Alt-Tab and the system-tray entry. A generic
+executable icon is both a low-reputation signal for antivirus heuristics and
+makes the app hard to pick out among other tray icons.
+
+### Documentation
+
+The README gained a System Requirements section (minimum Windows and Python
+versions) and explicit notes on the situations where a proxy-based bypass has
+limits: antivirus HTTPS/TLS scanning re-exposing the SNI, SOCKS-only
+applications, HTTP/3 (QUIC) over UDP, Firefox's own proxy and DoH settings,
+WSL2, UWP apps, active VPNs, the `hosts` file and internal/LAN DNS being
+bypassed while DoH is on, and a recommendation to run `ipconfig /flushdns`
+after first launch. A SmartScreen / antivirus section explains why a new
+unsigned build is flagged and how to add an exclusion.
+
+---
+
 ## v1.1.2 — 2026-05-15
 
 ### DoH now survives TLS-MITM and provider quirks (RFC 8484 wire format)

@@ -137,7 +137,7 @@ HTTPS traffic locally.
 ## Project layout
 
 ```
-SNIper_v1.1.2/
+SNIper_v1.1.3/
 ├── README.md                  This file
 ├── LICENSE                    MIT License
 ├── CHANGELOG.md               Version history

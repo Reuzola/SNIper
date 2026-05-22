@@ -558,7 +558,7 @@ def _doh_lookup(hostname, qtype_name, qtype_num, log_q):
                 server_ip, f"{path}?dns={b64}",
                 headers={
                     "Accept":     "application/dns-message",
-                    "User-Agent": "Mozilla/5.0 SNIper/1.1.2",
+                    "User-Agent": "Mozilla/5.0 SNIper/1.1.3",
                 },
                 timeout=DOH_TIMEOUT,
             )
