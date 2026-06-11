@@ -206,9 +206,14 @@ has been installed (common with MDM or antivirus HTTPS scanning). SNIper
 validates each DoH server's certificate. A recurring certificate warning in
 the log is a strong hint this is happening.
 
-**errno 11001 warnings** in the log are harmless. They appear on the first
-request to a new domain when DoH has not cached it yet. The next request
-succeeds and the result is cached.
+**"host does not exist (NXDOMAIN)" messages** mean a client asked for a
+hostname that genuinely has no DNS entry — dead telemetry endpoints, removed
+CDN hosts, typo'd domains. SNIper confirms this with an authenticated DoH
+resolver, rejects the request immediately and briefly caches the negative
+answer, so these lines are expected and harmless. A transient `errno 11001`
+without the NXDOMAIN wording can still appear in the rare case the whole DNS
+chain was momentarily unreachable; that one resolves itself on the next
+request.
 
 **Power loss or force-kill** does not restore the proxy automatically. If
 that happens, disable the proxy manually in Windows Settings, under Network
@@ -231,7 +236,7 @@ and Internet, then Proxy.
 ## Project layout
 
 ```
-SNIper_v1.1.3/
+SNIper_v1.1.4/
   README.md
   LICENSE
   CHANGELOG.md

@@ -86,6 +86,9 @@ BUFFER          = 32768
 CONNECT_TIMEOUT = 10      # seconds
 DOH_TIMEOUT     = 4       # seconds
 UDP_DNS_TIMEOUT = 2.0     # seconds — short, we retry across servers
+RESOLVE_BUDGET  = 3.0     # seconds — wall-clock cap for resolving ONE name
+                          # (separate from CONNECT_TIMEOUT, which governs the
+                          # TCP connect to the already-resolved IP)
 DNS_CACHE_MAX   = 1024    # entries — bound the cache to avoid unbounded growth
 MAX_CONNECTIONS = 256     # cap on concurrent handler threads (see accept loop)
 
@@ -181,10 +184,121 @@ def _cache_put(hostname: str, ip: str, ttl: float):
             _dns_cache.popitem(last=False)
 
 
+# Negative cache — remembers authoritative "does not exist" (NXDOMAIN) and
+# "no usable address" (NODATA for both families) answers so repeated requests
+# for the same dead host fail instantly instead of re-running the chain.
+# Bounded like the positive cache; shares its lock.
+_dns_neg_cache: "OrderedDict[str, tuple[float, str]]" = OrderedDict()
+
+
+def _neg_cache_get(hostname: str):
+    """Return the cached negative reason ('nxdomain' / 'noaddr') or None."""
+    with _dns_lock:
+        entry = _dns_neg_cache.get(hostname)
+        if entry is None:
+            return None
+        expires, reason = entry
+        if time.time() >= expires:
+            _dns_neg_cache.pop(hostname, None)
+            return None
+        _dns_neg_cache.move_to_end(hostname)
+        return reason
+
+
+def _neg_cache_put(hostname: str, reason: str, ttl: float):
+    with _dns_lock:
+        _dns_neg_cache[hostname] = (time.time() + ttl, reason)
+        _dns_neg_cache.move_to_end(hostname)
+        while len(_dns_neg_cache) > DNS_CACHE_MAX:
+            _dns_neg_cache.popitem(last=False)
+
+
+def _negative_error(hostname: str, reason: str) -> socket.gaierror:
+    """gaierror for an authoritative negative answer ('nxdomain' / 'noaddr')."""
+    if reason == "nxdomain":
+        msg = f"{hostname} does not exist (NXDOMAIN)"
+    else:
+        msg = f"{hostname} has no usable address (no A or AAAA record)"
+    return socket.gaierror(getattr(socket, "EAI_NONAME", -2), msg)
+
+
+# ── Address-family routing probe ──────────────────────────────────────────────
+# Reachability of each address family, probed via a connected UDP socket.
+# connect() on a datagram socket sends no packets — it only asks the kernel to
+# pick a route and a source address — so the probe is free and silent. On an
+# IPv4-only host this lets the resolver skip the IPv6 DoH/DNS endpoints
+# instead of collecting a WSAENETUNREACH from each of them on every pass.
+# Cached and re-probed on a coarse timer so a host that gains or loses a
+# family is noticed without paying the syscall on every lookup.
+_FAMILY_PROBE_ADDR = {
+    socket.AF_INET:  "1.1.1.1",
+    socket.AF_INET6: "2606:4700:4700::1111",
+}
+_FAMILY_RECHECK = 30.0  # seconds between route re-probes
+_family_state: dict = {}
+_family_lock = threading.Lock()
+
+
+def _family_usable(family) -> bool:
+    """True if the host currently has a usable route for this address family."""
+    now = time.monotonic()
+    with _family_lock:
+        cached = _family_state.get(family)
+        if cached is not None and now < cached[1]:
+            return cached[0]
+    usable = False
+    try:
+        s = socket.socket(family, socket.SOCK_DGRAM)
+        try:
+            s.connect((_FAMILY_PROBE_ADDR[family], 53))
+            src = s.getsockname()[0]
+            # A link-local or loopback source address means an interface
+            # exists but there is no usable global route.
+            usable = not (src.startswith("fe80") or src in ("::", "::1", "0.0.0.0", "127.0.0.1"))
+        finally:
+            s.close()
+    except OSError:
+        usable = False
+    with _family_lock:
+        _family_state[family] = (usable, now + _FAMILY_RECHECK)
+    return usable
+
+
+def _skip_unroutable(server_ip: str) -> bool:
+    """True if this resolver's address family has no route while the other one
+    does — skipping it avoids a guaranteed network-unreachable error. When
+    NEITHER family probes usable the filter disengages (fail open), so the
+    resolver still tries everything rather than nothing."""
+    if ":" in server_ip:
+        fam, other = socket.AF_INET6, socket.AF_INET
+    else:
+        fam, other = socket.AF_INET, socket.AF_INET6
+    return not _family_usable(fam) and _family_usable(other)
+
+
 # ── Plain UDP DNS (RFC 1035) ──────────────────────────────────────────────────
 # RR type numbers we actually use
 _DNS_TYPE_A    = 1
 _DNS_TYPE_AAAA = 28
+_DNS_TYPE_SOA  = 6
+
+# DNS lookup outcome classes. The parser distinguishes an authoritative
+# negative ("this name does not exist") from a transport-level failure
+# ("we never got a trustworthy answer") so the resolver chain can stop
+# immediately on the former instead of marching through every fallback.
+_DNS_OK             = 0   # positive answer — payload is (ip, ttl)
+_DNS_NXDOMAIN       = 1   # RCODE 3: the name does not exist (all record types)
+_DNS_NODATA         = 2   # RCODE 0, no answer of the queried type
+_DNS_TRANSPORT_FAIL = 3   # SERVFAIL / malformed / timeout / no usable reply
+
+# Negative answers are cached with the SOA minimum TTL when the authority
+# section provides one (RFC 2308), clamped to these bounds; without a SOA a
+# short default keeps dead hosts from being re-queried in a tight loop.
+_NEG_TTL_DEFAULT = 30
+_NEG_TTL_MIN     = 15
+_NEG_TTL_MAX     = 600
+
+_MIN_ATTEMPT_SECS = 0.2   # skip a server when less budget than this remains
 
 
 def _build_dns_query(hostname: str, tid: int, qtype: int = _DNS_TYPE_A) -> bytes:
@@ -215,48 +329,95 @@ def _skip_name(buf: bytes, off: int) -> int:
     return off
 
 
+def _negative_ttl(buf: bytes, off: int, nscount: int) -> int:
+    """Negative-cache TTL from the authority section's SOA record (RFC 2308).
+
+    `off` points at the first authority record. Returns min(SOA record TTL,
+    SOA MINIMUM field) clamped to [_NEG_TTL_MIN, _NEG_TTL_MAX], or
+    _NEG_TTL_DEFAULT when there is no parseable SOA.
+    """
+    for _ in range(nscount):
+        if off >= len(buf):
+            break
+        off = _skip_name(buf, off)
+        if off + 10 > len(buf):
+            break
+        rtype, _rclass, ttl, rdlen = struct.unpack(">HHIH", buf[off:off + 10])
+        off += 10
+        if off + rdlen > len(buf):
+            break
+        # SOA rdata = MNAME + RNAME (variable-length names) + 5×uint32;
+        # MINIMUM is the last of the five, i.e. the final 4 bytes of the
+        # rdata. 22 = two 1-byte root names + the 20 fixed bytes.
+        if rtype == _DNS_TYPE_SOA and rdlen >= 22:
+            minimum = struct.unpack(">I", buf[off + rdlen - 4:off + rdlen])[0]
+            return max(_NEG_TTL_MIN, min(int(min(ttl, minimum)), _NEG_TTL_MAX))
+        off += rdlen
+    return _NEG_TTL_DEFAULT
+
+
 def _parse_dns_response(buf: bytes, expected_tid: int, want_type: int = _DNS_TYPE_A):
-    """Return (ip, ttl) for the first record of want_type, or None on failure."""
+    """Classify a DNS response. Returns an (outcome, data) tuple:
+
+      (_DNS_OK, (ip, ttl))          — first record of want_type found
+      (_DNS_NXDOMAIN, neg_ttl)      — RCODE 3: the name does not exist
+      (_DNS_NODATA, neg_ttl)        — name exists, no record of want_type
+      (_DNS_TRANSPORT_FAIL, None)   — malformed / mismatched / server failure
+
+    NXDOMAIN and NODATA are *authoritative* negatives — whether they may be
+    trusted is the caller's decision (DoH yes, plain UDP/TCP no). Never
+    raises on malformed or truncated input.
+    """
+    fail = (_DNS_TRANSPORT_FAIL, None)
     if len(buf) < 12:
-        return None
-    tid, flags, qd, an, _ns, _ar = struct.unpack(">HHHHHH", buf[:12])
+        return fail
+    tid, flags, qd, an, ns, _ar = struct.unpack(">HHHHHH", buf[:12])
     if tid != expected_tid:
-        return None
-    if (flags & 0x000F) != 0:           # non-zero RCODE = error
-        return None
-    if an == 0:
-        return None
+        return fail
+    rcode = flags & 0x000F
+    if rcode == 3:
+        nxdomain = True
+    elif rcode == 0:
+        nxdomain = False
+    else:
+        return fail                  # SERVFAIL, REFUSED, ... — not an answer
     off = 12
     # Skip question section
     for _ in range(qd):
         off = _skip_name(buf, off)
         off += 4  # QTYPE + QCLASS
     # Walk answers — skip CNAMEs and unrelated types, return first match.
+    # (Walked even for NXDOMAIN, which may carry CNAME answers, so that
+    # `off` lands on the authority section for the SOA scan below.)
     for _ in range(an):
         if off >= len(buf):
-            return None
+            return fail
         off = _skip_name(buf, off)
         if off + 10 > len(buf):
-            return None
+            return fail
         rtype, _rclass, ttl, rdlen = struct.unpack(">HHIH", buf[off:off + 10])
         off += 10
         if off + rdlen > len(buf):
-            return None
-        if rtype == want_type:
+            return fail
+        if not nxdomain and rtype == want_type:
             if want_type == _DNS_TYPE_A and rdlen == 4:
                 ip = ".".join(str(b) for b in buf[off:off + 4])
-                return ip, int(ttl)
+                return _DNS_OK, (ip, int(ttl))
             if want_type == _DNS_TYPE_AAAA and rdlen == 16:
                 ip = socket.inet_ntop(socket.AF_INET6, buf[off:off + 16])
-                return ip, int(ttl)
+                return _DNS_OK, (ip, int(ttl))
         off += rdlen
-    return None
+    if nxdomain:
+        return _DNS_NXDOMAIN, _negative_ttl(buf, off, ns)
+    if flags & 0x0200:               # TC: answers truncated — not trustworthy
+        return fail
+    return _DNS_NODATA, _negative_ttl(buf, off, ns)
 
 
 def _udp_dns_query(hostname: str, server_ip: str,
                    qtype: int = _DNS_TYPE_A,
                    timeout: float = UDP_DNS_TIMEOUT):
-    """Send one A/AAAA query over UDP/53; return (ip, ttl) or None."""
+    """Send one A/AAAA query over UDP/53; returns a _parse_dns_response tuple."""
     tid = random.randint(0, 0xFFFF)
     pkt = _build_dns_query(hostname, tid, qtype)
     family = socket.AF_INET6 if ":" in server_ip else socket.AF_INET
@@ -268,7 +429,7 @@ def _udp_dns_query(hostname: str, server_ip: str,
         # hosts with many addresses; 2048 covers any realistic answer set.
         resp, _addr = s.recvfrom(2048)
     except OSError:
-        return None
+        return _DNS_TRANSPORT_FAIL, None
     finally:
         try:
             s.close()
@@ -277,14 +438,32 @@ def _udp_dns_query(hostname: str, server_ip: str,
     return _parse_dns_response(resp, tid, qtype)
 
 
-def _resolve_via_public_udp(hostname: str, qtype: int = _DNS_TYPE_A):
-    """Try plain UDP DNS against public resolvers. Returns (ip, ttl) or None."""
+def _resolve_via_public_udp(hostname: str, qtype: int = _DNS_TYPE_A,
+                            deadline: float | None = None):
+    """Try plain UDP DNS against public resolvers. Returns (ip, ttl) or None.
+
+    Trust boundary: answers on UDP/53 are unauthenticated, so a negative
+    (NXDOMAIN/NODATA) here may be a spoofed injection from a hostile network
+    and must NOT end the resolution chain — it is treated like any other
+    failure and the next server is tried.
+    """
     for srv in PLAIN_DNS_SERVERS:
-        result = _udp_dns_query(hostname, srv, qtype=qtype)
-        if result is not None:
-            ip, ttl = result
+        if _skip_unroutable(srv):
+            continue
+        timeout = UDP_DNS_TIMEOUT
+        if deadline is not None:
+            timeout = min(timeout, deadline - time.monotonic())
+            if timeout < _MIN_ATTEMPT_SECS:
+                break
+        outcome, data = _udp_dns_query(hostname, srv, qtype=qtype, timeout=timeout)
+        if outcome == _DNS_OK:
+            ip, ttl = data
             log.debug(f"UDP-DNS  {hostname} -> {ip}  [{srv}]")
             return ip, max(int(ttl), 30)
+        elif outcome in (_DNS_NXDOMAIN, _DNS_NODATA):
+            log.debug(f"UDP-DNS  {srv}: unauthenticated negative for {hostname} — ignored")
+        else:
+            log.debug(f"UDP-DNS  {srv} failed for {hostname}")
     return None
 
 
@@ -297,7 +476,7 @@ def _resolve_via_public_udp(hostname: str, qtype: int = _DNS_TYPE_A):
 def _tcp_dns_query(hostname: str, server_ip: str,
                    qtype: int = _DNS_TYPE_A,
                    timeout: float = UDP_DNS_TIMEOUT):
-    """Send one A/AAAA query over TCP/53. Returns (ip, ttl) or None."""
+    """Send one A/AAAA query over TCP/53; returns a _parse_dns_response tuple."""
     tid = random.randint(0, 0xFFFF)
     pkt = _build_dns_query(hostname, tid, qtype)
     framed = struct.pack(">H", len(pkt)) + pkt
@@ -312,17 +491,17 @@ def _tcp_dns_query(hostname: str, server_ip: str,
         while len(head) < 2:
             chunk = s.recv(2 - len(head))
             if not chunk:
-                return None
+                return _DNS_TRANSPORT_FAIL, None
             head += chunk
         resp_len = struct.unpack(">H", head)[0]
         body = b""
         while len(body) < resp_len:
             chunk = s.recv(resp_len - len(body))
             if not chunk:
-                return None
+                return _DNS_TRANSPORT_FAIL, None
             body += chunk
     except OSError:
-        return None
+        return _DNS_TRANSPORT_FAIL, None
     finally:
         try:
             s.close()
@@ -331,14 +510,31 @@ def _tcp_dns_query(hostname: str, server_ip: str,
     return _parse_dns_response(body, tid, qtype)
 
 
-def _resolve_via_public_tcp(hostname: str, qtype: int = _DNS_TYPE_A):
-    """Try plain TCP DNS against public resolvers. Returns (ip, ttl) or None."""
+def _resolve_via_public_tcp(hostname: str, qtype: int = _DNS_TYPE_A,
+                            deadline: float | None = None):
+    """Try plain TCP DNS against public resolvers. Returns (ip, ttl) or None.
+
+    Trust boundary: same as the UDP pass — an unauthenticated negative must
+    NOT end the chain, so it is treated as a failure and the next server is
+    tried.
+    """
     for srv in PLAIN_DNS_SERVERS:
-        result = _tcp_dns_query(hostname, srv, qtype=qtype)
-        if result is not None:
-            ip, ttl = result
+        if _skip_unroutable(srv):
+            continue
+        timeout = UDP_DNS_TIMEOUT
+        if deadline is not None:
+            timeout = min(timeout, deadline - time.monotonic())
+            if timeout < _MIN_ATTEMPT_SECS:
+                break
+        outcome, data = _tcp_dns_query(hostname, srv, qtype=qtype, timeout=timeout)
+        if outcome == _DNS_OK:
+            ip, ttl = data
             log.debug(f"TCP-DNS  {hostname} -> {ip}  [{srv}]")
             return ip, max(int(ttl), 30)
+        elif outcome in (_DNS_NXDOMAIN, _DNS_NODATA):
+            log.debug(f"TCP-DNS  {srv}: unauthenticated negative for {hostname} — ignored")
+        else:
+            log.debug(f"TCP-DNS  {srv} failed for {hostname}")
     return None
 
 
@@ -519,8 +715,17 @@ def _fragmented_https_get(server_ip: str, path_with_query: str,
             pass
 
 
-def _doh_lookup(hostname: str, qtype_name: str, qtype_num: int):
-    """One DoH pass over all configured servers. Returns (ip, ttl) or None.
+def _doh_lookup(hostname: str, qtype_name: str, qtype_num: int,
+                deadline: float | None = None):
+    """One DoH pass over the configured servers. Returns (outcome, data).
+
+    Stops at the FIRST authoritative answer — positive, NXDOMAIN or NODATA —
+    because DoH runs over verified TLS to a known resolver IP, so a clean
+    answer can be trusted (a MITM fails certificate verification, which is
+    counted separately below). Servers that transport-fail are skipped; only
+    when no server produced a trustworthy reply does the whole pass report
+    _DNS_TRANSPORT_FAIL, and only then may the caller fall back to
+    unauthenticated UDP/TCP.
 
     Uses RFC 8484 wire format (Content-Type: application/dns-message) — the
     standard binary DoH protocol every compliant resolver implements
@@ -552,6 +757,14 @@ def _doh_lookup(hostname: str, qtype_name: str, qtype_num: int):
             else:
                 server_ip = authority
 
+            if _skip_unroutable(server_ip):
+                continue
+            timeout = DOH_TIMEOUT
+            if deadline is not None:
+                timeout = min(timeout, deadline - time.monotonic())
+                if timeout < _MIN_ATTEMPT_SECS:
+                    break
+
             # RFC 8484 §4.1: the DNS message id SHOULD be 0 so identical
             # queries hash to the same HTTP cache key. We still pass the id
             # to the parser for verification — 0 in, 0 expected back.
@@ -564,19 +777,26 @@ def _doh_lookup(hostname: str, qtype_name: str, qtype_num: int):
                     # Some local middleware (HTTPS-scanning AV, captive portals)
                     # rejects requests without a User-Agent; add a plausible one.
                     "Accept":     "application/dns-message",
-                    "User-Agent": "Mozilla/5.0 SNIper/1.1.3",
+                    "User-Agent": "Mozilla/5.0 SNIper/1.1.4",
                 },
-                timeout=DOH_TIMEOUT,
+                timeout=timeout,
             )
             if status != 200 or len(body) < 12:
                 log.debug(f"DoH  {server} returned HTTP {status} for {hostname}")
                 continue
-            parsed = _parse_dns_response(body, tid, qtype_num)
-            if parsed is None:
-                continue
-            ip, ttl = parsed
-            log.debug(f"DoH  {hostname} {qtype_name} -> {ip}  [{server}]")
-            return ip, max(int(ttl), 30)
+            outcome, data = _parse_dns_response(body, tid, qtype_num)
+            if outcome == _DNS_OK:
+                ip, ttl = data
+                log.debug(f"DoH  {hostname} {qtype_name} -> {ip}  [{server}]")
+                return _DNS_OK, (ip, max(int(ttl), 30))
+            if outcome == _DNS_NXDOMAIN or outcome == _DNS_NODATA:
+                # Authoritative negative over authenticated TLS — trustworthy,
+                # so it ends the pass just like a positive answer would.
+                label = "NXDOMAIN" if outcome == _DNS_NXDOMAIN else "NODATA"
+                log.debug(f"DoH  {hostname} {qtype_name}: {label} "
+                          f"(authoritative)  [{server}]")
+                return outcome, data
+            continue  # transport-level failure from this server — try next
         except ssl.SSLCertVerificationError as e:
             # A cert that fails verification is a distinct signal from a DPI
             # reset/timeout: the resolver either rotated to a cert without an
@@ -600,7 +820,7 @@ def _doh_lookup(hostname: str, qtype_name: str, qtype_num: int):
         else:
             log.debug(f"All DoH servers exhausted for {hostname} "
                       f"({qtype_name}): {last_err}")
-    return None
+    return _DNS_TRANSPORT_FAIL, None
 
 
 def resolve_doh(hostname: str) -> str:
@@ -610,6 +830,14 @@ def resolve_doh(hostname: str) -> str:
     A is available anywhere, repeats the chain for AAAA so IPv6-only hosts
     (e.g. Windows's ipv6.msftconnecttest.com) still resolve. Falls back to
     getaddrinfo as a last resort — covers system DNS for both address families.
+
+    DoH answers arrive over verified TLS, so an authoritative negative from
+    DoH ends the chain immediately: NXDOMAIN raises at once, and NODATA on
+    the A query skips the pointless UDP/TCP A fallbacks and goes straight to
+    AAAA. Unauthenticated negatives (plain UDP/TCP) never terminate the
+    chain — a hostile network could inject them. The whole call is bounded
+    by RESOLVE_BUDGET so a dead name cannot hang the calling CONNECT for
+    many seconds.
 
     Why this chain: on some networks DoH IPs are RST-injected (handled by
     fragmenting the ClientHello), UDP/53 to public resolvers is rewritten
@@ -623,46 +851,86 @@ def resolve_doh(hostname: str) -> str:
     cached = _cache_get(hostname)
     if cached is not None:
         return cached
+    neg = _neg_cache_get(hostname)
+    if neg is not None:
+        log.debug(f"DNS negative cache hit for {hostname} ({neg})")
+        raise _negative_error(hostname, neg)
+
+    deadline = time.monotonic() + RESOLVE_BUDGET
+    # The A-side DoH pass gets at most half the budget, so a silently
+    # dropped DoH path always leaves room for the UDP/TCP bypass stages.
+    a_deadline = time.monotonic() + RESOLVE_BUDGET / 2
 
     # 1) DoH A — TLS handshake to resolver IP, ClientHello fragmented.
-    doh_a = _doh_lookup(hostname, "A", _DNS_TYPE_A)
-    if doh_a is not None:
-        ip, ttl = doh_a
+    a_outcome, a_data = _doh_lookup(hostname, "A", _DNS_TYPE_A,
+                                    deadline=a_deadline)
+    if a_outcome == _DNS_OK:
+        ip, ttl = a_data
         _cache_put(hostname, ip, ttl)
         return ip
+    if a_outcome == _DNS_NXDOMAIN:
+        # Authoritative, authenticated "no such name" — applies to every
+        # record type, so no fallback can change the answer. Fail fast.
+        _neg_cache_put(hostname, "nxdomain", a_data)
+        log.debug(f"DoH NXDOMAIN for {hostname} — failing fast, no fallback")
+        raise _negative_error(hostname, "nxdomain")
 
-    log.warning(f"All DoH servers failed ({hostname}): no A record  -> trying public UDP DNS")
+    a_nodata = a_outcome == _DNS_NODATA
+    if a_nodata:
+        # The name exists but has no IPv4 — asking UDP/TCP for an A record
+        # is pointless; go straight to the AAAA path.
+        log.debug(f"DoH NODATA for {hostname} (A) — skipping to AAAA")
+    else:
+        log.warning(f"All DoH servers failed ({hostname}): no A record  -> trying public UDP DNS")
 
-    # 2) Plain UDP DNS A to public resolvers.
-    udp_a = _resolve_via_public_udp(hostname, qtype=_DNS_TYPE_A)
-    if udp_a is not None:
-        ip, ttl = udp_a
-        _cache_put(hostname, ip, ttl)
-        log.info(f"Resolved {hostname} via public UDP DNS -> {ip}")
-        return ip
+        # 2) Plain UDP DNS A to public resolvers.
+        udp_a = _resolve_via_public_udp(hostname, qtype=_DNS_TYPE_A,
+                                        deadline=deadline)
+        if udp_a is not None:
+            ip, ttl = udp_a
+            _cache_put(hostname, ip, ttl)
+            log.info(f"Resolved {hostname} via public UDP DNS -> {ip}")
+            return ip
 
-    # 3) Plain TCP DNS A — ISPs that rewrite UDP/53 often pass TCP/53 through.
-    tcp_a = _resolve_via_public_tcp(hostname, qtype=_DNS_TYPE_A)
-    if tcp_a is not None:
-        ip, ttl = tcp_a
-        _cache_put(hostname, ip, ttl)
-        log.info(f"Resolved {hostname} via public TCP DNS -> {ip}")
-        return ip
+        # 3) Plain TCP DNS A — ISPs that rewrite UDP/53 often pass TCP/53 through.
+        tcp_a = _resolve_via_public_tcp(hostname, qtype=_DNS_TYPE_A,
+                                        deadline=deadline)
+        if tcp_a is not None:
+            ip, ttl = tcp_a
+            _cache_put(hostname, ip, ttl)
+            log.info(f"Resolved {hostname} via public TCP DNS -> {ip}")
+            return ip
 
-    # 4) No A anywhere — try AAAA (IPv6-only hosts).
-    doh_aaaa = _doh_lookup(hostname, "AAAA", _DNS_TYPE_AAAA)
-    if doh_aaaa is not None:
-        ip, ttl = doh_aaaa
+    # 4) AAAA (IPv6-only hosts).
+    aaaa_outcome, aaaa_data = _doh_lookup(hostname, "AAAA", _DNS_TYPE_AAAA,
+                                          deadline=deadline)
+    if aaaa_outcome == _DNS_OK:
+        ip, ttl = aaaa_data
         _cache_put(hostname, ip, ttl)
         log.info(f"Resolved {hostname} via DoH (IPv6) -> {ip}")
         return ip
-    udp_aaaa = _resolve_via_public_udp(hostname, qtype=_DNS_TYPE_AAAA)
+    if aaaa_outcome == _DNS_NXDOMAIN:
+        # RCODE 3 covers the whole name, not just AAAA — fail fast.
+        _neg_cache_put(hostname, "nxdomain", aaaa_data)
+        log.debug(f"DoH NXDOMAIN for {hostname} — failing fast, no fallback")
+        raise _negative_error(hostname, "nxdomain")
+    if aaaa_outcome == _DNS_NODATA and a_nodata:
+        # Both families authoritatively answered: the name exists but has
+        # neither an A nor an AAAA record. Nothing below can change that.
+        _neg_cache_put(hostname, "noaddr", min(a_data, aaaa_data))
+        log.debug(f"DoH NODATA for {hostname} (A and AAAA) — no usable address")
+        raise _negative_error(hostname, "noaddr")
+    # An AAAA NODATA while the A pass transport-failed is NOT conclusive —
+    # the A side was never authoritatively answered — so keep falling back.
+    udp_aaaa = _resolve_via_public_udp(hostname, qtype=_DNS_TYPE_AAAA,
+                                       deadline=deadline)
     if udp_aaaa is not None:
         ip, ttl = udp_aaaa
         _cache_put(hostname, ip, ttl)
         log.info(f"Resolved {hostname} via public UDP DNS (IPv6) -> {ip}")
         return ip
-    tcp_aaaa = _resolve_via_public_tcp(hostname, qtype=_DNS_TYPE_AAAA)
+    tcp_aaaa = _resolve_via_public_tcp(hostname, qtype=_DNS_TYPE_AAAA,
+                                       deadline=deadline)
     if tcp_aaaa is not None:
         ip, ttl = tcp_aaaa
         _cache_put(hostname, ip, ttl)
@@ -673,6 +941,13 @@ def resolve_doh(hostname: str) -> str:
 
     # 5) Last resort — system resolver. Use getaddrinfo so we also see AAAA
     #    when the host has no A record. Prefer IPv4 when both exist.
+    #    getaddrinfo cannot be timeboxed, so it only runs while the budget
+    #    lasts; past the deadline, surface the failure instead of hanging.
+    if time.monotonic() >= deadline:
+        log.debug(f"DNS budget exhausted for {hostname} — skipping system resolver")
+        raise socket.gaierror(
+            getattr(socket, "EAI_AGAIN", -3),
+            f"could not resolve {hostname} within {RESOLVE_BUDGET:.0f}s")
     try:
         info = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
     except socket.gaierror:

@@ -1,5 +1,76 @@
 # Changelog
 
+## v1.1.4 — 2026-06-12
+
+A resolver-correctness release. A CONNECT to a hostname that does not exist
+anywhere (dead telemetry endpoints, removed CDN shards, typo'd hosts) used to
+tie up its handler for ~6 seconds while every fallback was tried; it now fails
+in a single DoH round-trip with one concise log line. The censorship-bypass
+chain for real hosts is unchanged.
+
+### DNS answers are classified, not collapsed
+
+`_parse_dns_response` used to return `None` for everything that was not a
+usable address, making an authoritative "this name does not exist" look
+identical to "the resolver was unreachable". The parser now classifies every
+response — POSITIVE, NXDOMAIN (RCODE 3), NODATA (NOERROR with no record of
+the queried type) or TRANSPORT-FAIL (SERVFAIL, malformed, timeout, reset) —
+so the resolution chain can act on the difference. Negative answers also
+carry the RFC 2308 negative TTL taken from the authority section's SOA
+record.
+
+### Authoritative DoH negatives end the chain immediately
+
+DoH answers arrive over verified TLS to a known resolver IP, so a clean
+answer can be trusted. An NXDOMAIN from a DoH server now stops the whole
+chain at once — no remaining DoH servers, no UDP/TCP fallback, no AAAA pass,
+no system resolver — and the CONNECT fails immediately with a clear
+"host does not exist (NXDOMAIN)" line instead of a cascade of per-server
+warnings (previously up to ~60 lookups across six passes). A NODATA on the
+A query means the name exists without IPv4, so the pointless UDP/TCP A
+fallbacks are skipped and the AAAA path is tried directly; NODATA on both
+families fails cleanly with "no usable address". AAAA-only hosts (e.g.
+`ipv6.msftconnecttest.com`) still resolve exactly as before.
+
+The trust boundary is deliberate: negatives received over plain UDP/53 or
+TCP/53 are unauthenticated and spoofable, so they are still treated as
+failures to route around — a poisoning ISP cannot convince SNIper to give up
+on a name it is lying about. Certificate-verification failures remain
+transport failures (never authoritative negatives) and keep the distinct
+TLS-MITM warning.
+
+### Unroutable address families are skipped
+
+On an IPv4-only host every IPv6 resolver endpoint failed with
+`WinError 10051` on every pass, adding latency and log noise. A
+connected-UDP route probe (sends no packets — it only asks the kernel for a
+route) now detects which address families are usable, caches the answer for
+30 seconds, and the resolver skips endpoints of a family that has no route.
+If neither family probes usable the filter disengages rather than skip
+everything, and IPv6-only networks symmetrically skip the IPv4 entries.
+
+### Negative caching and a resolution budget
+
+NXDOMAIN and no-address answers are now cached (SOA-derived TTL clamped to
+15–600 s, default 30 s; bounded to the same 1024 entries as the positive
+cache), so repeated requests for the same dead host fail instantly.
+Independently of the cache, one `resolve_doh` call is bounded by a 3-second
+wall-clock budget (`RESOLVE_BUDGET`, separate from `CONNECT_TIMEOUT`, which
+governs the TCP connect to the already-resolved IP): per-attempt timeouts
+shrink to the remaining budget, the DoH A pass may use at most half of it so
+a silently-dropped DoH path cannot starve the UDP/TCP bypass stages, and the
+untimeboxable system-resolver step only runs while budget remains.
+
+### Log output
+
+The GUI's friendly formatter renders the new outcomes ("host does not
+exist", "no IPv4/IPv6 address") in normal mode; verbose mode shows the raw
+detail, including which DoH server returned the authoritative negative and
+which unauthenticated negatives were ignored. The README note that called
+errno 11001 warnings "harmless cold-cache misses" was corrected — for a
+genuinely nonexistent name that error was the definitive answer, and it is
+now recognised and reported as such.
+
 ## v1.1.3 — 2026-05-22
 
 A compatibility-focused release. The goal was to let SNIper start and route
