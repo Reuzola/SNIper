@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased - Project restructure: GUI-only, modular package
+
+Pure structural refactor. Runtime behavior is unchanged: every function
+behaves identically to v1.1.4, and this change only moves and re-organizes
+code. No algorithm, timeout, server list, chain order or protocol detail was
+touched.
+
+- Removed the command-line variant (src/SNIper.py). SNIper is now GUI-only,
+  matching how it is actually shipped (the portable EXE was always the GUI).
+- The proxy logic that used to be duplicated between the CLI and the GUI is
+  de-duplicated into a single layered package under src/sniper/ (compat,
+  resources, config, dns, proxy, server, winproxy, logformat, tray, ui, app).
+- DOH_SERVERS and PLAIN_DNS_SERVERS (and every other tunable) are now defined
+  exactly once, in sniper/config.py, instead of as two hand-synced copies.
+- The entry point is src/run_sniper.py (it calls sniper.app.main); running
+  with "python -m sniper" works too. packaging/build_exe.bat points at it and
+  adds src/ to the PyInstaller search path.
+- Added a headless test suite under tests/ covering the DNS builder/parser,
+  host:port splitting, HTTP response parsing and the friendly log formatter,
+  checked against a golden baseline captured before the move.
+- The embedded version metadata (version_info.txt, app.manifest) is left
+  unchanged on purpose; bumping it is a release decision for the maintainer.
+
 ## v1.1.4 — 2026-06-12
 
 A resolver-correctness release. A CONNECT to a hostname that does not exist

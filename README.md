@@ -65,8 +65,8 @@ drivers, no TAP adapters, no service install.
 - Windows 7, 8, and 8.1 are not supported. The bundled Python runtime
   depends on a Universal CRT version that does not ship on those releases.
   The EXE will fail to start with a "this app can't run on your PC" error.
-- If you run the CLI script directly instead of the EXE, you need Python 3.7
-  or newer. The EXE bundles its own runtime and has no Python requirement.
+- If you build or run from source instead of using the EXE, you need Python
+  3.7 or newer. The EXE bundles its own runtime and has no Python requirement.
 
 ---
 
@@ -109,23 +109,6 @@ per-user proxy registry keys, which it restores on exit.
 | Fragment size | 2 | Bytes per TCP segment during the TLS handshake | Try 1 if connections are being refused; try 4-8 if non-blocked sites feel slow |
 | Disable DoH | off | Uses system DNS instead of DNS-over-HTTPS | Turn on only if DoH is timing out and system DNS works fine on its own |
 | Verbose | off | Shows all internal debug messages in the log | Turn on when troubleshooting a specific problem |
-
----
-
-## Running the CLI version
-
-The repository also includes a command-line script for scripting or headless
-use. This requires Python 3.7 or newer installed separately, as it is not
-packaged into the EXE.
-
-```
-python src/SNIper.py [options]
-
-  --port N        Listen port (default: 8881)
-  --fragment N    ClientHello fragment size in bytes (default: 2)
-  --no-doh        Disable DNS-over-HTTPS, use system DNS instead
-  --verbose       Enable debug logging
-```
 
 ---
 
@@ -227,8 +210,7 @@ and Internet, then Proxy.
 |---|---|
 | Close window (X button) | Yes |
 | Stop button in the GUI | Yes |
-| Ctrl+C in the CLI | Yes |
-| Normal script exit | Yes |
+| Normal process exit | Yes |
 | Power loss or force-kill | No |
 
 ---
@@ -242,18 +224,39 @@ SNIper_v1.1.4/
   CHANGELOG.md
   .gitignore
   src/
-    SNIper_gui.py           GUI front-end (all proxy logic embedded)
-    SNIper.py               CLI core (no GUI)
+    run_sniper.py           PyInstaller entry point (-> sniper.app.main)
+    sniper/
+      __init__.py           package version
+      __main__.py           enables `python -m sniper`
+      compat.py             IS_WINDOWS flag + winreg shim
+      resources.py          locates the bundled SNIper.ico
+      config.py             tunables, DoH/plain-DNS server lists
+      dns.py                resolver chain (DoH/UDP/TCP, caches, parser)
+      proxy.py              per-connection handling, ClientHello fragmentation
+      server.py             ProxyServer accept-loop thread
+      winproxy.py           Windows system-proxy registry management
+      logformat.py          friendly activity-log formatter
+      tray.py               Win32 system-tray icon
+      ui.py                 Tk application window
+      app.py                main(), single-instance guard
   packaging/
     build_exe.bat           Build the portable EXE for this architecture
     app.manifest            asInvoker (no UAC) + Per-Monitor v2 DPI awareness
     version_info.txt        EXE version metadata
     SNIper.ico              Application icon
+  tests/
+    conftest.py             puts src/ on sys.path
+    test_dns.py             DNS builder/parser equivalence tests
+    test_proxy.py           host:port, ClientHello and header tests
+    test_logformat.py       friendly-formatter tests
 ```
 
 To produce an x64 or ARM64 build, run `packaging\build_exe.bat` on a
 machine of the target architecture. PyInstaller does not cross-compile,
 so each architecture requires its own native build.
+
+To run from source without building, use `python src/run_sniper.py` (or
+`python -m sniper` from inside `src/`). This needs Python 3.7 or newer.
 
 ---
 

@@ -10,7 +10,8 @@ rem  so x64 and ARM64 each require a native build on a machine of that arch.
 rem
 rem  Layout (this script lives in packaging\):
 rem      SNIper_vX.Y.Z\
-rem        +- src\SNIper_gui.py          <- PyInstaller entry point
+rem        +- src\run_sniper.py          <- PyInstaller entry point
+rem        +- src\sniper\               <- the package (logic lives here)
 rem        +- packaging\build_exe.bat    <- this script
 rem        +- packaging\version_info.txt
 rem        +- packaging\app.manifest
@@ -25,7 +26,7 @@ set "PKG_DIR=%~dp0"
 pushd "%~dp0.." 2>nul || (echo [ERROR] Cannot locate project root.& goto :fail)
 set "PROJECT_ROOT=%CD%"
 popd
-set "ENTRY=%PROJECT_ROOT%\src\SNIper_gui.py"
+set "ENTRY=%PROJECT_ROOT%\src\run_sniper.py"
 set "ICON=%PKG_DIR%SNIper.ico"
 
 echo Project root : %PROJECT_ROOT%
@@ -132,6 +133,7 @@ del /Q "%PROJECT_ROOT%\%APPNAME%.exe.sha256" 2>nul
     --noupx ^
     --clean ^
     --noconfirm ^
+    --paths "%PROJECT_ROOT%\src" ^
     --name "%APPNAME%" ^
     --distpath "%PKG_DIR%dist" ^
     --workpath "%PKG_DIR%build" ^
