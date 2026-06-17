@@ -12,7 +12,9 @@ import queue
 from sniper.compat import IS_WINDOWS
 from sniper.config import MAX_CONNECTIONS
 from sniper.proxy import handle_client
-from sniper.winproxy import proxy_enable, proxy_restore, _proxy_gpo_locked
+from sniper.winproxy import (
+    proxy_enable, proxy_restore, recover_orphaned_proxy, _proxy_gpo_locked,
+)
 
 
 class ProxyServer:
@@ -20,11 +22,31 @@ class ProxyServer:
         self._sock    = None
         self._stop    = threading.Event()
         self._thread  = None
-        self._old_e   = None
-        self._old_s   = None
-        self._old_a   = None
         self._lock    = threading.Lock()
         self.log_q    = queue.Queue()
+
+    def recover(self):
+        """Self-heal a proxy left stranded by a previous ungraceful exit.
+
+        Runs once at startup, before any new session, so merely opening the app
+        undoes a proxy left behind by a prior force-kill / power-loss / shutdown.
+        Footprint-gated: the genuine baseline is put back only when the live
+        proxy is still exactly what SNIper applied; if the user changed it
+        between the crash and this launch, that change is left in place. A clean
+        state is a no-op and logs nothing (no false recovery).
+        """
+        try:
+            result = recover_orphaned_proxy()
+        except Exception:
+            result = None
+        if result == "restored":
+            self.log_q.put(("INFO",
+                "Recovered a proxy left by a previous unclean exit — "
+                "Windows proxy restored."))
+        elif result == "kept":
+            self.log_q.put(("INFO",
+                "A previous unclean exit was detected, but the proxy had since "
+                "been changed manually — your change was left in place."))
 
     def start(self, port, frag, use_doh):
         with self._lock:
@@ -52,9 +74,10 @@ class ProxyServer:
                 self.log_q.put(("WARNING",
                     "Group Policy disables per-user proxy settings on this "
                     "machine — SNIper cannot change the system proxy here."))
-            old_e, old_s, old_a = proxy_enable(f"127.0.0.1:{port}")
+            # Records the genuine baseline durably before overwriting the live
+            # values; returns the genuine PAC (or None) for the note below.
+            old_a = proxy_enable(f"127.0.0.1:{port}")
             self._sock = sock
-            self._old_e, self._old_s, self._old_a = old_e, old_s, old_a
             self._stop.clear()
             self.log_q.put(("INFO",
                 f"Proxy started on 127.0.0.1:{port}  |  fragment={frag}B  "
@@ -76,15 +99,20 @@ class ProxyServer:
                 try: self._sock.close()
                 except OSError: pass
             thread = self._thread
-            old_e, old_s, old_a = self._old_e, self._old_s, self._old_a
             self._thread = None
             self._sock = None
-            self._old_e = self._old_s = self._old_a = None
 
         if thread:
             thread.join(timeout=3)
-        proxy_restore(old_e, old_s, old_a)
-        self.log_q.put(("INFO", "Proxy stopped. Windows proxy restored."))
+        # Undo our own change from the durable baseline and clear it. If the
+        # user changed the proxy while we ran, restore backs off and leaves it;
+        # a clean stop leaves no residue for the next launch either way.
+        result = proxy_restore()
+        if result == "kept":
+            self.log_q.put(("INFO",
+                "Proxy server stopped; your manual proxy change was left in place."))
+        else:
+            self.log_q.put(("INFO", "Proxy stopped. Windows proxy restored."))
 
     def _run(self, frag, use_doh):
         sock = self._sock

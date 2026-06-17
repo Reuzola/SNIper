@@ -1,6 +1,71 @@
 # Changelog
 
-## Unreleased - Project restructure: GUI-only, modular package
+## v1.1.5 - 2026-06-17
+
+A reliability release for Windows system-proxy restoration. Earlier builds kept
+the "original proxy configuration to restore to" only in memory and captured it
+unconditionally. An ungraceful exit (Task Manager force-kill, power loss, OS
+logoff/shutdown) therefore left the system proxy pointed at a SNIper instance
+that no longer existed, and a later restart could cement SNIper's own loopback
+values as the "original", permanently destroying the genuine settings. The
+restore baseline is now durable, self-healing and footprint-aware.
+
+### Durable restore baseline
+
+Before SNIper overwrites the live HKCU Internet Settings, it now records the
+genuine pre-SNIper configuration (the ProxyEnable flag, the ProxyServer string,
+and the AutoConfigURL PAC presence and value) to a durable per-user registry key
+(HKCU\Software\SNIper\ProxyRestore), writing a commit marker last so a crash
+mid-write leaves an incomplete record that is ignored rather than acted on.
+Nothing is written to the filesystem; the baseline lives only in the registry.
+This strengthens the existing partial-write safety: a baseline remains available
+for restore even if enabling is interrupted partway through, and it now also
+survives process death.
+
+### Self-heal on launch
+
+Every launch, before establishing a new proxy session, SNIper checks for a
+baseline left behind by a prior unclean exit and, if it finds one, returns the
+system proxy to that genuine configuration and clears the record. Merely opening
+the app is enough to recover a proxy stranded by a previous force-kill, power
+loss or shutdown; clicking Start is not required. A clean state is a no-op and
+logs nothing, so there is no false "recovered" line.
+
+### Footprint-aware capture (no more blind toggle)
+
+SNIper distinguishes its own leftover footprint from the user's genuine
+configuration using the durable record it writes, never by guessing from the
+loopback address. It never records its own footprint as the baseline, and
+applying the proxy is idempotent: if a complete baseline already exists it is
+treated as the genuine one and reused untouched, so a re-apply (or an
+already-applied state) cannot overwrite the real settings. Any number of
+crash-then-relaunch cycles preserves the genuine original.
+
+### Restore is complete and residue-free
+
+A restore, whether the immediate graceful one or the deferred self-heal, puts
+ProxyEnable, ProxyServer and AutoConfigURL all back to their genuine values,
+removing SNIper's footprint entirely (it no longer leaves the proxy enabled and
+pointed at loopback) and notifies WinInet so the change applies at once. After a
+successful graceful restore the durable record is deleted, so the next launch
+sees a clean state and performs no recovery; a clean exit leaves no proxy-related
+residue. Restore now reads the durable registry record as its single source of
+truth, so the graceful-stop path and the on-launch self-heal are one and the
+same operation.
+
+### Unchanged
+
+Graceful exits (window close, Stop button, normal process exit) still restore
+immediately. The Group Policy lock case is preserved: where per-user proxy is
+policy-disabled SNIper changes nothing, writes no baseline, performs no false
+recovery, and still shows its warning. The single-instance guard (still
+session-local, so RDP and Fast User Switching sessions stay independent), PAC
+handling, the WinInet refresh, the DNS resolution chain, ClientHello
+fragmentation and the proxy relay core are untouched. No new dependency is added
+(standard library only), no admin rights or helper process are introduced, and
+all proxy state stays under HKCU.
+
+### Also in this release: project restructure (GUI-only, modular package)
 
 Pure structural refactor. Runtime behavior is unchanged: every function
 behaves identically to v1.1.4, and this change only moves and re-organizes
@@ -20,8 +85,8 @@ touched.
 - Added a headless test suite under tests/ covering the DNS builder/parser,
   host:port splitting, HTTP response parsing and the friendly log formatter,
   checked against a golden baseline captured before the move.
-- The embedded version metadata (version_info.txt, app.manifest) is left
-  unchanged on purpose; bumping it is a release decision for the maintainer.
+- The embedded version metadata (version_info.txt, app.manifest) is bumped to
+  1.1.5.0 in this release to match the package version.
 
 ## v1.1.4 — 2026-06-12
 

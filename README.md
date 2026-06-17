@@ -198,9 +198,14 @@ without the NXDOMAIN wording can still appear in the rare case the whole DNS
 chain was momentarily unreachable; that one resolves itself on the next
 request.
 
-**Power loss or force-kill** does not restore the proxy automatically. If
-that happens, disable the proxy manually in Windows Settings, under Network
-and Internet, then Proxy.
+**Power loss or force-kill** cannot restore the proxy at the instant it
+happens, because no SNIper code runs at that moment. Instead the proxy is
+restored automatically the next time you launch SNIper: it detects the
+settings left behind by the unclean exit and puts your original proxy
+configuration back before starting a new session. Just opening the app is
+enough, with no need to click Start and no manual editing of Windows
+proxy settings. Graceful exits (X, Stop, normal exit) still restore
+immediately.
 
 ---
 
@@ -208,17 +213,17 @@ and Internet, then Proxy.
 
 | How you exit | Proxy restored? |
 |---|---|
-| Close window (X button) | Yes |
-| Stop button in the GUI | Yes |
-| Normal process exit | Yes |
-| Power loss or force-kill | No |
+| Close window (X button) | Yes, immediately |
+| Stop button in the GUI | Yes, immediately |
+| Normal process exit | Yes, immediately |
+| Power loss or force-kill | Yes, automatically on next launch |
 
 ---
 
 ## Project layout
 
 ```
-SNIper_v1.1.4/
+SNIper_v1.1.5/
   README.md
   LICENSE
   CHANGELOG.md

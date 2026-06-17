@@ -629,7 +629,7 @@ def _doh_lookup(hostname, qtype_name, qtype_num, log_q, deadline=None):
                 server_ip, f"{path}?dns={b64}",
                 headers={
                     "Accept":     "application/dns-message",
-                    "User-Agent": "Mozilla/5.0 SNIper/1.1.4",
+                    "User-Agent": "Mozilla/5.0 SNIper/1.1.5",
                 },
                 timeout=timeout,
             )

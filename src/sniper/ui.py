@@ -244,6 +244,12 @@ class App(tk.Tk):
         self._init_style()
 
         self.proxy = ProxyServer()
+        # Self-heal before any new session: if a prior force-kill / power-loss
+        # / shutdown left the system proxy pointed at a dead SNIper, restore
+        # the genuine baseline now. Merely opening the app is enough; clicking
+        # Start is not required. Any recovery line queued here surfaces once
+        # _poll_log() starts draining the queue below.
+        self.proxy.recover()
         self._tray = TrayIcon(
             on_show=self._tray_show,
             on_toggle=self._tray_toggle,
