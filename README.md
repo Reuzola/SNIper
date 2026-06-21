@@ -79,6 +79,10 @@ adapters, no service install, just a portable .exe.
 
 ## Usage
 
+| Idle | Running |
+|---|---|
+| <img width="320" src="https://github.com/user-attachments/assets/9727d69a-62f9-4ced-ae78-5f7c9649f2bc" /> | <img width="320" src="https://github.com/user-attachments/assets/54470925-51c2-40ef-bf6f-ad1b8343e42b" /> |
+
 Download `SNIper_<arch>.exe` and double-click it.
 Press **Start** to turn the proxy on; SNIper sets the Windows system proxy automatically, so
 Chrome, Spotify, Steam and most other apps route through it right away. Press **Stop** or close
