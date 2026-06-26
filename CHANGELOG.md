@@ -1,5 +1,78 @@
 # Changelog
 
+## v1.1.6 - 2026-06-26
+
+This release completes the migration of the portable EXE build from PyInstaller
+to Nuitka, now verified building and running on both x64 and ARM64. It is a
+packaging release: the proxy runtime (ClientHello fragmentation, the DoH/UDP/TCP
+resolver chain, and the per-user proxy-registry management) is byte-for-byte
+identical, and the shipped output is still a single SNIper_<arch>.exe at the
+project root. Nuitka compiles the package to a native binary instead of bundling
+a Python interpreter, so the EXE is smaller and faster, and the compiled native
+code together with real embedded version metadata reduces antivirus
+false-positives (a generic interpreter bundle with blank metadata is a common
+heuristic flag). The trade-off is on the build side, not the user side: building
+now requires a C toolchain on the build machine.
+
+### Build: PyInstaller replaced by Nuitka
+
+- `packaging/build_exe.bat` now invokes Nuitka (`--mode=onefile`, the `tk-inter`
+  plugin for the GUI) instead of PyInstaller. All packager-agnostic guards are
+  preserved: path canonicalization, Microsoft-Store-stub detection, explicit
+  32-bit (x86) rejection, x64/ARM64 detection, post-build PE-architecture
+  verification, the SHA-256 print, and the Python 3.13+ OS-floor note. Nuitka
+  does not cross-compile either, so x64 and ARM64 still each need a native build.
+- Building now requires a C toolchain (MSVC or MinGW64): Nuitka compiles to C,
+  whereas PyInstaller shipped a prebuilt bootloader and needed no compiler. The
+  build preflights both Nuitka and the compiler and stops early with an
+  actionable message if either is missing, instead of failing deep in
+  compilation.
+- Repeat builds of unchanged sources reuse Nuitka's compiler cache (ccache), so
+  the first build is slower (C compilation) and later ones are faster.
+
+### Preserved behavior (no user-visible change)
+
+- Embedded version metadata is now stamped via Nuitka's `--company-name` /
+  `--product-name` / `--file-version` / `--product-version` /
+  `--file-description` / `--copyright` flags; the PyInstaller-only
+  `packaging/version_info.txt` is removed. Explorer and Defender still see real,
+  non-blank metadata (file/product version 1.1.6.0, CompanyName SNIper, the same
+  FileDescription, LegalCopyright, InternalName "SNIper" and OriginalFilename
+  "SNIper.exe"). The file/product version is derived from `sniper.__version__` at
+  build time so it cannot drift from the package.
+- Icon resolution in `src/sniper/resources.py` is now packager-independent: it no
+  longer depends on `sys.frozen` / `sys._MEIPASS` (PyInstaller-only). The build
+  embeds `SNIper.ico` beside the package and the lookup finds it relative to the
+  module, so the icon still shows on all four surfaces (title bar, Alt-Tab,
+  taskbar, tray) under Nuitka and when run straight from source.
+- Per-Monitor V2 DPI awareness is guaranteed at runtime by the existing ctypes
+  call in `src/sniper/ui.py`, which runs before any Tk window is created. Under
+  PyInstaller this was redundant with the embedded manifest; under Nuitka it is
+  the sole guarantee, and it holds whether or not a manifest DPI line survives.
+  asInvoker (no UAC) is Nuitka's default. `packaging/app.manifest` is kept for
+  reference but is no longer embedded by the build.
+
+### tkinter / zlib1.dll bundling
+
+- `zlib1.dll` (a transitive Tcl dependency: `_tkinter.pyd` -> `tcl86t.dll` ->
+  `zlib1.dll`) is bundled correctly on both architectures, handled differently
+  per host because Nuitka's DLL detection differs:
+  - On **ARM64** there is no native Dependency Walker, so Nuitka misses the
+    transitive edge and the GUI aborted at import with a `_tkinter` LoadLibrary
+    error (silently, once the console was disabled). The build includes
+    `zlib1.dll` explicitly, sourced from the interpreter's own `DLLs` directory
+    (no hardcoded path).
+  - On **x64** Nuitka runs Dependency Walker and bundles `zlib1.dll` itself, so
+    the explicit include is omitted -- adding it would make Nuitka abort with
+    "data file 'zlib1.dll' conflicts with dll 'zlib1.dll'".
+  The include is gated on the architecture the build script already detects, so
+  `zlib1.dll` ends up in the bundle exactly once on each host. Tcl/Tk ship with
+  CPython, so no third-party runtime dependency is added.
+- The build no longer passes Nuitka's `--remove-output` (its post-build delete
+  raced with antivirus file locks and could fail an otherwise-successful build);
+  the script moves the finished EXE out and cleans its own build tree tolerantly
+  instead.
+
 ## v1.1.5 - 2026-06-17
 
 A reliability release for Windows system-proxy restoration. Earlier builds kept

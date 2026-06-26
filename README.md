@@ -79,6 +79,10 @@ adapters, no service install, just a portable .exe.
 
 ## Usage
 
+| Idle | Running |
+|---|---|
+| <img width="320" src="https://github.com/user-attachments/assets/9727d69a-62f9-4ced-ae78-5f7c9649f2bc" /> | <img width="320" src="https://github.com/user-attachments/assets/54470925-51c2-40ef-bf6f-ad1b8343e42b" /> |
+
 Download `SNIper_<arch>.exe` and double-click it.
 Press **Start** to turn the proxy on; SNIper sets the Windows system proxy automatically, so
 Chrome, Spotify, Steam and most other apps route through it right away. Press **Stop** or close
@@ -138,8 +142,8 @@ your IP. A few cases where it won't help:
 
 ```packaging\build_exe.bat```
 
-Installs PyInstaller if needed, builds a single-file `SNIper_<arch>.exe` at the
-project root, verifies its PE architecture, and prints its SHA-256. PyInstaller
+Installs Nuitka if needed, builds a single-file `SNIper_<arch>.exe` at the
+project root, verifies its PE architecture, and prints its SHA-256. Nuitka
 doesn't cross-compile, so x64 and ARM64 each need a native build.
 
 To run without building: `python src/run_sniper.py` (Python 3.7+). The EXE itself
@@ -166,7 +170,6 @@ src/
 packaging/
   build_exe.bat        builds the portable EXE
   app.manifest         no-UAC + Per-Monitor v2 DPI manifest
-  version_info.txt     EXE version metadata
 tests/                 DNS / proxy / formatter unit tests
 ```
 

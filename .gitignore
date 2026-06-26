@@ -1,10 +1,13 @@
 # Build artifacts
 /SNIper_*.exe
-*.spec
 build/
 dist/
-packaging/build/
-packaging/dist/
+
+# Nuitka build artifacts (intermediate compile trees)
+packaging/nuitka-build/
+*.build/
+*.dist/
+*.onefile-build/
 
 # Python
 __pycache__/
