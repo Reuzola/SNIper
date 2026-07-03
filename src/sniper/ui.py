@@ -180,7 +180,7 @@ class HoverButton(tk.Button):
 def _set_app_user_model_id():
     """Give the process an explicit taskbar identity.
 
-    Without this, a packaged Python app can inherit a generic or
+    Without this, a frozen Python app can inherit a generic or
     interpreter-derived identity, which makes the taskbar button show the
     wrong icon. Tagging the process ties the taskbar button (and any
     pinned shortcut) to SNIper. Must run before the first window appears.

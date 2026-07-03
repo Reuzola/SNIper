@@ -2,35 +2,25 @@
 from __future__ import annotations
 
 import os
+import sys
 
 
 def _icon_path():
     """Absolute path to SNIper.ico, or None if it cannot be located.
 
-    Packager-independent: this never consults ``sys.frozen`` / ``sys._MEIPASS``
-    (those are PyInstaller-only and absent under Nuitka). Both supported run
-    modes place the icon at a path relative to *this* module's ``__file__``,
-    so the first candidate that exists wins:
-
-    * Compiled build (Nuitka onefile / standalone): the build embeds SNIper.ico
-      beside this package, so it travels inside the single EXE no matter where
-      the EXE is moved. At runtime the compiled module's ``__file__`` points
-      into the unpacked program directory and the icon sits next to this file.
-      The build wires this up with ``--include-data-files=...=sniper/SNIper.ico``;
-      that target and the first candidate below must stay in sync.
-    * Plain script run from the source tree: the icon lives in the repo's
-      packaging/ folder, two levels up from src/sniper/.
+    Frozen (PyInstaller onefile): the icon is bundled with the program and
+    extracted next to it (sys._MEIPASS), so it travels inside the single EXE
+    no matter where the EXE is moved. Run as a plain script: it lives in the
+    repo's packaging/ folder, two levels up from src/sniper/.
     """
-    here = os.path.dirname(os.path.abspath(__file__))
-    candidates = (
-        os.path.join(here, "SNIper.ico"),                            # compiled build
-        os.path.join(here, "..", "..", "packaging", "SNIper.ico"),   # source tree
-    )
-    for candidate in candidates:
-        candidate = os.path.normpath(candidate)
-        if os.path.isfile(candidate):
-            return candidate
-    return None
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+        candidate = os.path.join(base, "SNIper.ico")
+    else:
+        candidate = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "..", "..", "packaging", "SNIper.ico")
+    candidate = os.path.normpath(candidate)
+    return candidate if os.path.isfile(candidate) else None
 
 
 ICON_PATH = _icon_path()  # resolved once at import; None if the .ico is absent
