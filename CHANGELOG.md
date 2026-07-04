@@ -1,5 +1,63 @@
 # Changelog
 
+## v1.1.6 - 2026-07-04
+
+A transport-correctness release. On a host with no usable IPv6 route, a name
+that publishes only an AAAA record was resolved to its sole IPv6 address, and
+the outbound connect then failed with `WSAENETUNREACH` (WinError 10051). On the
+plain-HTTP relay path that failure surfaced as a silent drop of the client
+connection with no response at all. The most visible casualty was the Windows
+NCSI IPv6 connectivity probe (`ipv6.msftconnecttest.com`, `ipv6.msftncsi.com`),
+whose relayed request died exactly this way and left the machine flagged
+offline. Target-address selection is now aware of which address families can
+actually be reached, and the plain-HTTP path fails in a defined way.
+
+### Route-aware target selection
+
+Address selection for the target host now consults which address families have
+a usable route on this machine, reusing the same connected-UDP route probe that
+already skips unroutable resolver endpoints. An address whose family has no
+route here is no longer committed to when the other family is usable. The
+fail-open behavior is preserved: when neither family probes usable the check
+disengages and every address is still tried, exactly as before.
+
+### Clean failure instead of a raw socket error
+
+An AAAA-only name on a host without an IPv6 route now fails promptly and
+cleanly as "no reachable address for this host," decided within the existing
+resolution budget, rather than escaping as a bare connect-time socket error
+(`WinError 10051`) partway through the relay.
+
+### Defined response on the plain-HTTP relay path
+
+A connect or resolve failure on the plain-HTTP path now returns
+`HTTP/1.1 502 Bad Gateway`, mirroring the CONNECT path, instead of silently
+closing the client connection. The 502 is scoped to the connect attempt only
+and is never emitted once relaying has begun. A connectivity probe made through
+the proxy now reaches the same verdict a direct connection on the same host
+would, so an unreachable IPv6-only target no longer degrades the machine's
+overall connectivity state to offline.
+
+### DNS trust invariant unchanged
+
+The route check is purely transport-level and is kept entirely separate from
+resolution trust. It never lowers the trust of a DoH answer, never re-queries
+an `A` record over plain UDP/TCP, and never reclassifies an authoritative DNS
+negative. A verified DoH negative still terminates the chain immediately; an
+unverified (plain UDP/TCP) negative still does not.
+
+### Unchanged
+
+The resolver chain order and its fallbacks, the positive and negative caches,
+ClientHello fragmentation, and the dual-stack IPv4 preference are all untouched.
+Genuine IPv6-only-network operation is preserved: an AAAA host still connects
+over IPv6 whenever IPv6 has a usable route — IPv6 is not disabled. SNIper
+remains standard-library only, with no admin rights, no new dependency and no
+new process.
+
+- The embedded version metadata (version_info.txt, app.manifest) is bumped to
+  1.1.6.0 in this release to match the package version.
+
 ## v1.1.5 - 2026-06-17
 
 A reliability release for Windows system-proxy restoration. Earlier builds kept

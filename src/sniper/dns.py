@@ -113,6 +113,24 @@ def _negative_error(hostname, reason):
     return socket.gaierror(getattr(socket, "EAI_NONAME", -2), msg)
 
 
+def _no_route_error(hostname, ip):
+    """gaierror for a name that resolved only to an address family with no
+    usable route on this host (e.g. an AAAA-only host on an IPv4-only network).
+
+    This is a *transport* reachability failure and is kept deliberately
+    distinct from the authoritative DNS negatives above: the resolver's answer
+    was legitimate — the address simply cannot be reached from here. Raising it
+    lets the caller fail fast with a defined "no reachable address" instead of
+    committing a socket that is guaranteed to raise WSAENETUNREACH mid-connect.
+    It never feeds back into a resolution-trust decision and never triggers an
+    unverified re-query."""
+    family = "IPv6" if ":" in ip else "IPv4"
+    return socket.gaierror(
+        getattr(socket, "EAI_NONAME", -2),
+        f"{hostname} resolved only to {family} {ip}, which has no usable "
+        f"route on this host")
+
+
 # ── Address-family routing probe ──────────────────────────────────────────────
 # Reachability of each address family, probed via a connected UDP socket.
 # connect() on a datagram socket sends no packets — it only asks the kernel to
@@ -165,6 +183,30 @@ def _skip_unroutable(server_ip):
     else:
         fam, other = socket.AF_INET, socket.AF_INET6
     return not _family_usable(fam) and _family_usable(other)
+
+
+def _routable_or_raise(hostname, ip, log_q):
+    """Gate a *resolved target* address on address-family routability.
+
+    Returns `ip` unchanged when its family has a usable route on this host — or
+    when the route state is inconclusive (neither family probes usable → fail
+    open, exactly as `_skip_unroutable`). Raises a clean `_no_route_error` when
+    the address is in a family with no route while the OTHER family works, e.g.
+    an AAAA-only host on an IPv4-only network. This makes target-address
+    selection route-aware so an unreachable family is never committed to a
+    socket: the caller gets a prompt "no reachable address" instead of a
+    mid-connect WSAENETUNREACH (WinError 10051) that would otherwise escape.
+
+    This is a transport-reachability check only. It consults the same route
+    probe used to skip unroutable resolver endpoints — never the DNS-trust
+    state — so it neither reclassifies an authoritative negative nor triggers
+    any fallback to an unverified resolution path."""
+    if _skip_unroutable(ip):
+        log_q.put(("DEBUG",
+                   f"{hostname} -> {ip}: address family has no route on this "
+                   f"host — no reachable address"))
+        raise _no_route_error(hostname, ip)
+    return ip
 
 
 # ── Plain UDP DNS (RFC 1035) — fallback when DoH endpoints are blocked ──────
@@ -629,7 +671,7 @@ def _doh_lookup(hostname, qtype_name, qtype_num, log_q, deadline=None):
                 server_ip, f"{path}?dns={b64}",
                 headers={
                     "Accept":     "application/dns-message",
-                    "User-Agent": "Mozilla/5.0 SNIper/1.1.5",
+                    "User-Agent": "Mozilla/5.0 SNIper/1.1.6",
                 },
                 timeout=timeout,
             )
@@ -680,6 +722,23 @@ def _doh_lookup(hostname, qtype_name, qtype_num, log_q, deadline=None):
 
 
 def resolve_doh(hostname, use_doh, log_q):
+    """Resolve `hostname` to a single reachable IP for an outbound connection.
+
+    Delegates the resolution chain to `_resolve_name`, then applies the
+    address-family routability gate to the result so the caller never commits a
+    socket to an address whose family has no route on this host (an AAAA-only
+    target on an IPv4-only network is the reference case). An explicit IP
+    literal is honored as given — the user chose it, so it is not second-
+    guessed. The gate is a transport check layered *around* resolution; it
+    leaves the DNS-trust invariants below completely untouched.
+    """
+    ip = _resolve_name(hostname, use_doh, log_q)
+    if _is_ip(hostname):
+        return ip
+    return _routable_or_raise(hostname, ip, log_q)
+
+
+def _resolve_name(hostname, use_doh, log_q):
     """DoH → public UDP → public TCP → AAAA → system DNS. Prefers IPv4;
     falls back to IPv6 for hosts that publish only AAAA.
 

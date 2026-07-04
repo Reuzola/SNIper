@@ -182,11 +182,25 @@ def handle_http(client, method, url, headers, use_doh, log_q):
 
     remote = None
     try:
-        remote = connect_remote(host, port, use_doh, log_q)
-        remote.sendall(f"{method} {path} HTTP/1.1\r\n".encode() + _strip_hop_by_hop(headers))
+        try:
+            remote = connect_remote(host, port, use_doh, log_q)
+        except Exception as e:
+            # Surface an unreachable/unresolvable target as a defined 502,
+            # exactly as the CONNECT path does — never a silent client drop.
+            # A connectivity probe (Windows NCSI) made through the proxy then
+            # reaches the same verdict a direct connection would: on an
+            # IPv4-only host an IPv6-only target fails cleanly here instead of
+            # collapsing the machine's connectivity state to "offline".
+            log_q.put(("ERROR", f"Could not connect to {host}:{port} -> {e}"))
+            try: client.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            except OSError: pass
+            return
+        try:
+            remote.sendall(f"{method} {path} HTTP/1.1\r\n".encode() + _strip_hop_by_hop(headers))
+        except OSError as e:
+            log_q.put(("DEBUG", f"initial send failed for {host}:{port}: {e}"))
+            return
         relay(client, remote)
-    except Exception as e:
-        log_q.put(("ERROR", f"HTTP relay error: {e}"))
     finally:
         if remote is not None:
             try: remote.close()
