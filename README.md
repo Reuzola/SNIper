@@ -16,6 +16,10 @@ press the start button. You can easily monitor what is happening through a live 
 ![Python](https://img.shields.io/badge/python-3.7%2B-blue)
 ![Portable](https://img.shields.io/badge/portable-no%20install-blue)
 
+| Stopped | Running |
+|:---:|:---:|
+| <img src="https://github.com/user-attachments/assets/feca0063-a013-40a1-bfd4-23f61913b67b" width="380"> | <img src="https://github.com/user-attachments/assets/5b8e9473-1e6e-4872-a1c4-62e98f7b1dfb" width="380"> |
+
 ---
 
 ## Origin
