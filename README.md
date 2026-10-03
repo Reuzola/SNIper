@@ -89,6 +89,7 @@ Chrome, Spotify, Steam and most other apps route through it right away. Press **
 the window to turn it off and restore your previous proxy settings.
 
 You can minimize it to the system tray and control it from there. Settings are locked while the proxy is running.
+Tick **Remember settings** to keep them for the next launch: they are stored for your Windows user only, nothing is written next to the EXE, and unticking the box forgets them.
 
 ### Settings
 
@@ -98,6 +99,7 @@ You can minimize it to the system tray and control it from there. Settings are l
 | Fragment size | 2 | Bytes per TCP segment during the TLS handshake |
 | Disable DoH | off | Use system DNS instead of DNS-over-HTTPS |
 | Verbose | off | Show detailed debug messages in the log |
+| Remember settings | off | Keep your settings for the next launch |
 
 ---
 
@@ -163,6 +165,7 @@ src/
     proxy.py           per-connection handling, ClientHello fragmentation
     server.py          accept-loop thread
     winproxy.py        Windows system-proxy registry management
+    settings.py        remembered GUI settings (per-user registry)
     logformat.py       activity-log formatter
     tray.py            Win32 system-tray icon
     ui.py              Tk application window
@@ -171,7 +174,7 @@ packaging/
   build_exe.bat        builds the portable EXE
   app.manifest         no-UAC + Per-Monitor v2 DPI manifest
   version_info.txt     EXE version metadata
-tests/                 DNS / proxy / formatter unit tests
+tests/                 DNS / proxy / formatter / settings unit tests
 ```
 
 ---

@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.1.7 - 2026-10-03
+
+SNIper can now remember your settings between launches, as suggested in [#1](https://github.com/Reuzola/SNIper/issues/1).
+
+- **New "Remember settings" option.** Tick it and your port, fragment size, Disable DoH and Verbose logging choices are kept for the next time you open SNIper. They are saved right away, and again whenever you press Start or close the app.
+- **Optional and off by default.** Nothing is saved unless you tick the box. Untick it at any time to forget your saved settings, and the next launch starts from the defaults.
+- **Saved for your Windows user, not next to the app.** Your settings are stored in the registry for your user only, so this works even when SNIper runs from a USB stick or a read-only folder, and they stay when you move or replace the .exe.
+
+Remembering your settings never starts the proxy by itself; you still press Start. Everything else works as before.
+
+---
+
 ## v1.1.6 - 2026-07-04
 
 A fix for computers without working IPv6.

@@ -1,7 +1,9 @@
 """Tk App window: theme palette, fonts, tooltips, hover buttons, DPI
-awareness and the window/tray wiring. Logic unchanged from the embedded
-original; the platform flag, icon path, proxy server, tray icon and friendly
-formatter now come from their dedicated modules.
+awareness, the window/tray wiring and the opt-in "Remember settings" row.
+The platform flag, icon path, proxy server, tray icon, friendly formatter
+and the user settings (defaults, limits and their registry store) come from
+their dedicated modules; the rest of the logic is unchanged from the
+embedded original.
 """
 from __future__ import annotations
 
@@ -18,6 +20,10 @@ from sniper.resources import ICON_PATH
 from sniper.server import ProxyServer
 from sniper.tray import TrayIcon
 from sniper.logformat import friendly_format
+from sniper.settings import (
+    PORT_MIN, PORT_MAX, FRAGMENT_MIN, FRAGMENT_MAX,
+    default_settings, load_settings, save_settings, clear_settings,
+)
 
 # shell32 handle for the taskbar-identity call below. The matching argtypes
 # are bound once in sniper.tray (imported above); this is the same cached
@@ -133,6 +139,13 @@ TOOLTIPS = {
         "Default: off. The log stays concise and user-friendly.\n"
         "Enable when troubleshooting a specific issue — output becomes very detailed."
     ),
+    "remember": (
+        "Keep these settings for the next time you open SNIper.\n\n"
+        "Default: off. Ticking saves them right away, and again whenever you\n"
+        "press Start or close SNIper. They are stored for your Windows user\n"
+        "only (in the registry, never next to the EXE).\n"
+        "Untick to forget them; the next launch starts from the defaults."
+    ),
 }
 
 
@@ -214,18 +227,6 @@ class App(tk.Tk):
         self.title("SNIper")
         _apply_window_icon(self)   # title bar, Alt-Tab and taskbar icon
         self.configure(bg=C["bg"])
-        # Clamp the window to the screen. On small displays (1366×768 and
-        # below), especially at >100% DPI scaling, the default 760×640 plus
-        # window chrome can spill off-screen. Never request more than the
-        # screen can show, and lower the minimum size to match so it cannot
-        # override the clamp.
-        sw = self.winfo_screenwidth()
-        sh = self.winfo_screenheight()
-        win_w = min(760, sw - 60)
-        win_h = min(640, sh - 100)
-        self.minsize(min(640, win_w), min(540, win_h))
-        self.geometry(f"{win_w}x{win_h}")
-        self.resizable(True, True)
 
         # tkinter scaling — pairs with SetProcessDpiAwareness for crisp text.
         try:
@@ -260,7 +261,35 @@ class App(tk.Tk):
         )
 
         self._build()
+
+        # Clamp the window to the screen. On small displays (1366×768 and
+        # below), especially at >100% DPI scaling, the default 760×640 plus
+        # window chrome can spill off-screen. Never request more than the
+        # screen can show, and lower the minimum size to match so it cannot
+        # override the clamp.
+        # Both heights were tuned for the original four settings rows, so they
+        # grow by each row added since ("Remember settings") to keep the log's
+        # room. Rows are measured, as their tallest widget plus 4px pady above
+        # and below, because they scale with DPI; widgets know their requested
+        # size as soon as they exist, so this still runs before the window
+        # first shows.
+        added_rows = [w.master for w in self._rows[4:]]
+        extra = sum(max(c.winfo_reqheight() for c in row.winfo_children()) + 8
+                    for row in added_rows)
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        win_w = min(760, sw - 60)
+        win_h = min(640 + extra, sh - 100)
+        self.minsize(min(640, win_w), min(540 + extra, win_h))
+        self.geometry(f"{win_w}x{win_h}")
+        self.resizable(True, True)
+
         self._poll_log()
+        # One short line when remembered settings were applied (the box can
+        # only be ticked this early if they were), after any recovery line
+        # _poll_log() just drained. Nothing otherwise.
+        if self._remember_var.get():
+            self._append_friendly("INFO", "Loaded your saved settings.")
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         atexit.register(self._ensure_stop)
@@ -370,16 +399,28 @@ class App(tk.Tk):
                  bg=C["bg"], fg=C["muted"]
                  ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
 
-        self._port_var    = tk.IntVar(value=8881)
-        self._frag_var    = tk.IntVar(value=2)
-        self._nodoh_var   = tk.BooleanVar(value=False)
-        self._verbose_var = tk.BooleanVar(value=False)
+        # Start from the remembered settings if the user opted in, otherwise
+        # from the defaults. load_settings() already turns a registry error
+        # into "nothing stored"; this guard just makes sure a settings problem
+        # of any kind can never stop the window from opening.
+        try:
+            stored = load_settings()
+        except Exception:
+            stored = None
+        initial = stored if stored is not None else default_settings()
+
+        self._port_var     = tk.IntVar(value=initial["port"])
+        self._frag_var     = tk.IntVar(value=initial["fragment"])
+        self._nodoh_var    = tk.BooleanVar(value=initial["no_doh"])
+        self._verbose_var  = tk.BooleanVar(value=initial["verbose"])
+        self._remember_var = tk.BooleanVar(value=stored is not None)
 
         cfg = [
-            ("port",     "Port",            self._port_var,    "int"),
-            ("fragment", "Fragment size",   self._frag_var,    "int"),
-            ("no_doh",   "Disable DoH",     self._nodoh_var,   "bool"),
-            ("verbose",  "Verbose logging", self._verbose_var, "bool"),
+            ("port",     "Port",              self._port_var,     "int"),
+            ("fragment", "Fragment size",     self._frag_var,     "int"),
+            ("no_doh",   "Disable DoH",       self._nodoh_var,    "bool"),
+            ("verbose",  "Verbose logging",   self._verbose_var,  "bool"),
+            ("remember", "Remember settings", self._remember_var, "bool"),
         ]
         self._rows = []
         for i, (key, label, var, kind) in enumerate(cfg, start=1):
@@ -406,6 +447,10 @@ class App(tk.Tk):
             else:
                 chk = ttk.Checkbutton(row, variable=var,
                                       style="Modern.TCheckbutton")
+                if key == "remember":
+                    # Acts the moment it is clicked: ticking saves the values
+                    # on screen, unticking forgets the stored ones.
+                    chk.config(command=self._on_remember_toggled)
                 chk.grid(row=0, column=2, sticky="w")
                 self._rows.append(chk)
 
@@ -503,12 +548,20 @@ class App(tk.Tk):
         except (tk.TclError, ValueError):
             self._append_friendly("ERROR", "Port and fragment size must be integers.")
             return
-        if not (1 <= port <= 65535):
-            self._append_friendly("ERROR", "Port must be between 1 and 65535.")
+        if not (PORT_MIN <= port <= PORT_MAX):
+            self._append_friendly(
+                "ERROR", f"Port must be between {PORT_MIN} and {PORT_MAX}.")
             return
-        if not (1 <= frag <= 512):
-            self._append_friendly("ERROR", "Fragment size must be between 1 and 512.")
+        if not (FRAGMENT_MIN <= frag <= FRAGMENT_MAX):
+            self._append_friendly(
+                "ERROR",
+                f"Fragment size must be between {FRAGMENT_MIN} and {FRAGMENT_MAX}.")
             return
+
+        # Save now rather than only on exit, so the values survive even if
+        # SNIper is force-killed while running.
+        if self._remember_var.get():
+            self._save_settings()
 
         try:
             self.proxy.start(port, frag, not self._nodoh_var.get())
@@ -540,6 +593,45 @@ class App(tk.Tk):
         self._btn.set_bg(C["ok"], C["ok_hov"])
         self._status_dot.config(fg=C["danger"])
         self._status_text.config(text="Stopped", fg=C["text_dim"])
+
+    # ── Remembered settings ──────────────────────────────────────────────────
+    def _on_remember_toggled(self):
+        # The values on screen stay as they are either way; only what the
+        # next launch starts from changes.
+        if self._remember_var.get():
+            self._save_settings()
+        elif not clear_settings():
+            self._append_friendly("WARNING", "Could not forget your saved settings.")
+
+    def _screen_settings(self):
+        """The settings as shown on screen, keyed like default_settings().
+
+        A number field that does not hold an integer right now (text typed
+        into Port, say) is None, which save_settings() skips, so that field
+        keeps its previously stored value. OverflowError is caught too: Tk
+        reads "inf" as a float that int() cannot convert.
+        """
+        values = {}
+        for name, var in (("port",     self._port_var),
+                          ("fragment", self._frag_var),
+                          ("no_doh",   self._nodoh_var),
+                          ("verbose",  self._verbose_var)):
+            try:
+                values[name] = var.get()
+            except (tk.TclError, ValueError, OverflowError):
+                values[name] = None
+        return values
+
+    def _save_settings(self, quiet=False):
+        """Store the on-screen settings for the next launch. A failure shows
+        one WARNING line in the log, or nothing when quiet (on exit, where the
+        log is about to disappear and nothing may hold up shutdown)."""
+        try:
+            ok = save_settings(self._screen_settings())
+        except Exception:
+            ok = False
+        if not ok and not quiet:
+            self._append_friendly("WARNING", "Could not save your settings.")
 
     # ── Tray actions ─────────────────────────────────────────────────────────
     def _hide_to_tray(self):
@@ -619,6 +711,11 @@ class App(tk.Tk):
             pass
 
     def _on_close(self):
+        # The window close button and tray Quit both end here: save remembered
+        # settings while the window still exists, quietly, so a registry
+        # problem can never hold up the exit.
+        if self._remember_var.get():
+            self._save_settings(quiet=True)
         if self.proxy.running:
             self._btn.config(state="disabled")
             threading.Thread(target=self._shutdown_and_close, daemon=True).start()
