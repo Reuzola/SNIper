@@ -22,6 +22,25 @@ def test_started_doh_off():
         "OK", "Started — listening on port 9999  ·  fragment 4B  ·  system DNS")
 
 
+def test_started_safe_mode():
+    msg = "Proxy started on 127.0.0.1:8881  |  fragment=2B  |  DoH=on  |  mode=safe"
+    assert friendly_format("INFO", msg) == (
+        "OK", "Started — listening on port 8881  ·  fragment 2B  ·  secure DNS"
+              "  ·  safe mode")
+
+
+def test_started_compat_mode():
+    msg = "Proxy started on 127.0.0.1:9999  |  fragment=4B  |  DoH=off  |  mode=compat"
+    assert friendly_format("INFO", msg) == (
+        "OK", "Started — listening on port 9999  ·  fragment 4B  ·  system DNS"
+              "  ·  compatibility mode")
+
+
+def test_started_unknown_mode_is_not_mistaken_for_a_start_line():
+    msg = "Proxy started on 127.0.0.1:8881  |  fragment=2B  |  DoH=on  |  mode=turbo"
+    assert friendly_format("INFO", msg) == ("INFO", msg)
+
+
 def test_stopped():
     assert friendly_format("INFO", "Proxy stopped. Windows proxy restored.") == (
         "OK", "Stopped — system proxy restored")

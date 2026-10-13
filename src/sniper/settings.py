@@ -1,10 +1,10 @@
 """User settings behind the opt-in "Remember settings" option.
 
-Single source of truth for the four GUI settings: Port, Fragment size,
-Disable DoH and Verbose logging. Holds their defaults and valid ranges, the
-sanitizing that keeps a bad value out, and loading, saving and clearing them
-in the registry. ui.py takes its initial values and its Start validation
-limits from here.
+Single source of truth for the five GUI settings: Port, Fragment size,
+Disable DoH, Verbose logging and Compatibility mode. Holds their defaults and
+valid ranges, the sanitizing that keeps a bad value out, and loading, saving
+and clearing them in the registry. ui.py takes its initial values and its
+Start validation limits from here.
 
 Storage is HKCU\\Software\\SNIper\\Settings, one REG_DWORD per setting, and
 the key exists only while the user has opted in. Registry, never a file: the
@@ -42,11 +42,14 @@ _Field = namedtuple("_Field", "value_name default low high")
 # Every setting, keyed by the name each settings dict uses here and in ui.py.
 # value_name is the on-disk format: renaming one would silently drop what
 # users have stored. The switches are stored as DWORD 0/1, hence 0..1.
+# compat_mode is off by default, which is safe mode; settings stored before
+# it existed have no such value and so load as safe mode too.
 _FIELDS = {
-    "port":     _Field("Port",           8881,  PORT_MIN,     PORT_MAX),
-    "fragment": _Field("FragmentSize",   2,     FRAGMENT_MIN, FRAGMENT_MAX),
-    "no_doh":   _Field("DisableDoH",     False, 0,            1),
-    "verbose":  _Field("VerboseLogging", False, 0,            1),
+    "port":        _Field("Port",              8881,  PORT_MIN,     PORT_MAX),
+    "fragment":    _Field("FragmentSize",      2,     FRAGMENT_MIN, FRAGMENT_MAX),
+    "no_doh":      _Field("DisableDoH",        False, 0,            1),
+    "verbose":     _Field("VerboseLogging",    False, 0,            1),
+    "compat_mode": _Field("CompatibilityMode", False, 0,            1),
 }
 
 

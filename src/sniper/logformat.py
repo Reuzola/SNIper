@@ -6,9 +6,13 @@ from __future__ import annotations
 
 import re
 
+# The mode suffix is optional so the line from before safe mode existed
+# still formats exactly as it always did.
 _RX_STARTED = re.compile(
-    r"^Proxy started on 127\.0\.0\.1:(?P<port>\d+)\s+\|\s+fragment=(?P<frag>\d+)B\s+\|\s+DoH=(?P<doh>on|off)$"
+    r"^Proxy started on 127\.0\.0\.1:(?P<port>\d+)\s+\|\s+fragment=(?P<frag>\d+)B\s+\|\s+DoH=(?P<doh>on|off)"
+    r"(?:\s+\|\s+mode=(?P<mode>safe|compat))?$"
 )
+_MODE_TEXT = {"safe": "safe mode", "compat": "compatibility mode"}
 _RX_CONNECT = re.compile(r"^CONNECT\s+(?P<host>[^\s:]+):(?P<port>\d+)$")
 _RX_FRAG    = re.compile(r"^\[frag\s+\d+B\]\s+(?P<host>[^\s:]+):(?P<port>\d+)$")
 _RX_HTTP    = re.compile(r"^(?P<method>GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)\s+(?P<url>\S+)")
@@ -38,8 +42,10 @@ def friendly_format(level, msg):
     m = _RX_STARTED.match(msg)
     if m:
         doh = "secure DNS" if m["doh"] == "on" else "system DNS"
+        mode = f"  ·  {_MODE_TEXT[m['mode']]}" if m["mode"] else ""
         return ("OK",
-                f"Started — listening on port {m['port']}  ·  fragment {m['frag']}B  ·  {doh}")
+                f"Started — listening on port {m['port']}  ·  fragment {m['frag']}B  ·  {doh}"
+                f"{mode}")
 
     if _RX_STOPPED.match(msg):
         return ("OK", "Stopped — system proxy restored")

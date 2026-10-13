@@ -20,6 +20,8 @@ from sniper.compat import IS_WINDOWS
 _TOOL = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                       "..", "tools", "proxy_state.py"))
 KEYS = {"live", "winhttp_ie_config", "record", "runonce", "processes", "verdict"}
+HARMLESS = "STRANDED (harmless: fail-open PAC)"
+VERDICTS = {"CLEAN", "SNIPER ACTIVE", "STRANDED", HARMLESS, "UNKNOWN"}
 
 
 @pytest.fixture(scope="module")
@@ -47,7 +49,7 @@ def test_json_output():
     assert set(state) == KEYS
     assert set(state["live"]) == {"ProxyEnable", "ProxyServer", "ProxyOverride",
                                   "AutoConfigURL"}
-    assert state["verdict"] in {"CLEAN", "SNIPER ACTIVE", "STRANDED", "UNKNOWN"}
+    assert state["verdict"] in VERDICTS
     assert "error" in state["winhttp_ie_config"] or \
         {"auto_detect", "auto_config_url", "proxy", "proxy_bypass"} <= set(state["winhttp_ie_config"])
     assert state["processes"] is None or isinstance(state["processes"], list)
@@ -88,6 +90,9 @@ CLEAN_LIVE = {"ProxyEnable": 0, "ProxyServer": "127.0.0.1:8881",
 SNIPER_LIVE = dict(CLEAN_LIVE, ProxyEnable=1)
 RECORD = {"ProxyEnable": 0, "ProxyServer": "", "AutoConfigURLPresent": 0,
           "AppliedProxyServer": "127.0.0.1:8881", "Complete": 1}
+PAC_URL = "http://127.0.0.1:8881/sniper-0123456789abcdef.pac"
+PAC_LIVE = dict(CLEAN_LIVE, ProxyServer="", AutoConfigURL=PAC_URL)
+PAC_RECORD = dict(RECORD, AppliedMode="pac", AppliedAutoConfigURL=PAC_URL)
 SNIPER_PROC = {"pid": 1, "name": "SNIper_x64.exe", "command_line": "x", "is_sniper": True}
 OTHER_PROC = {"pid": 2, "name": "Code.exe", "command_line": r"C:\SNIper", "is_sniper": False}
 
@@ -103,6 +108,27 @@ OTHER_PROC = {"pid": 2, "name": "Code.exe", "command_line": r"C:\SNIper", "is_sn
     (SNIPER_LIVE, RECORD, None, "UNKNOWN"),
     (dict(SNIPER_LIVE, ProxyServer="corp:8080"), None, [], "CLEAN"),
     (dict(SNIPER_LIVE, ProxyServer="127.0.0.1:x"), None, [], "CLEAN"),
+    # Safe mode: the script URL is the footprint.
+    (PAC_LIVE, PAC_RECORD, [SNIPER_PROC], "SNIPER ACTIVE"),
+    (PAC_LIVE, PAC_RECORD, [OTHER_PROC], HARMLESS),
+    (PAC_LIVE, None, [], HARMLESS),               # footprint without a record
+    (PAC_LIVE, PAC_RECORD, None, "UNKNOWN"),
+    (CLEAN_LIVE, PAC_RECORD, [], "STRANDED"),     # record without a footprint
+    # A manual proxy of the user's own is what a dead script falls back to.
+    (dict(PAC_LIVE, ProxyEnable=1, ProxyServer="corp:8080"), None, [], HARMLESS),
+    # SNIper's static proxy is enabled too: that one is not harmless.
+    (dict(PAC_LIVE, ProxyEnable=1, ProxyServer="127.0.0.1:8881"), PAC_RECORD, [],
+     "STRANDED"),
+    # Setup scripts that are not SNIper's.
+    (dict(CLEAN_LIVE, AutoConfigURL="http://127.0.0.1:8881/proxy.pac"), None, [], "CLEAN"),
+    (dict(CLEAN_LIVE, AutoConfigURL="http://127.0.0.1:8881/sniper-0123.pac"), None, [],
+     "CLEAN"),
+    (dict(CLEAN_LIVE, AutoConfigURL=PAC_URL.upper()), None, [], "CLEAN"),
+    (dict(CLEAN_LIVE, AutoConfigURL=PAC_URL.replace("http:", "https:")), None, [], "CLEAN"),
+    (dict(CLEAN_LIVE, AutoConfigURL=PAC_URL.replace("127.0.0.1", "localhost")), None, [],
+     "CLEAN"),
+    (dict(CLEAN_LIVE, AutoConfigURL=PAC_URL + "?x"), None, [], "CLEAN"),
+    (dict(CLEAN_LIVE, AutoConfigURL="http://corp/p.pac"), None, [], "CLEAN"),
 ])
 def test_verdict(tool, live, record, processes, expected):
     assert tool.verdict(live, record, processes) == expected
@@ -123,6 +149,18 @@ def test_verdict(tool, live, record, processes, expected):
 ])
 def test_is_sniper_process(tool, name, cmd, expected):
     assert tool.is_sniper_process(name, cmd) is expected
+
+
+@pytest.mark.parametrize("record, expected", [
+    (None, None),
+    (PAC_RECORD, "safe mode (auto-config script)"),
+    (dict(RECORD, AppliedMode="static"), "Compatibility mode (static proxy)"),
+    (RECORD, "static proxy (record from v1.1.7)"),
+    ({"ProxyEnable": 1, "ProxyServer": "corp:8080", "Complete": 1},
+     "static proxy (legacy record, no footprint)"),
+])
+def test_record_mode(tool, record, expected):
+    assert tool.record_mode(record) == expected
 
 
 # ── Rendering ────────────────────────────────────────────────────────────────
@@ -157,3 +195,19 @@ def test_render_summarizes_other_processes(tool):
     assert "Code.exe" not in text
     assert "(2 other processes mention sniper; --json lists them)" in text
     assert 'Proxy           "127.0.0.1:8881"' in text
+
+
+def test_render_marks_the_safe_mode_script_and_the_record_mode(tool):
+    state = {
+        "live": PAC_LIVE, "record": PAC_RECORD, "runonce": {},
+        "winhttp_ie_config": {"auto_detect": True, "auto_config_url": PAC_URL,
+                              "proxy": None, "proxy_bypass": None},
+        "processes": [], "verdict": HARMLESS,
+    }
+    text = tool.render(state)
+    assert ('AutoConfigURL   "%s"  (SNIper safe-mode script)' % PAC_URL) in text
+    assert "  Mode: safe mode (auto-config script)" in text
+    assert text.endswith("Verdict: " + HARMLESS)
+    # Another tool's setup script gets no such label.
+    state["live"] = dict(CLEAN_LIVE, AutoConfigURL="http://corp/p.pac")
+    assert "SNIper safe-mode script" not in tool.render(state)

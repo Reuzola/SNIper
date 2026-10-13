@@ -1,5 +1,6 @@
 """Tk App window: theme palette, fonts, tooltips, hover buttons, DPI
-awareness, the window/tray wiring and the opt-in "Remember settings" row.
+awareness, the window/tray wiring, the "Compatibility mode" switch and the
+opt-in "Remember settings" row.
 The platform flag, icon path, proxy server, tray icon, session-end watcher,
 friendly formatter and the user settings (defaults, limits and their registry
 store) come from their dedicated modules.
@@ -150,6 +151,15 @@ TOOLTIPS = {
         "Default: off. The log stays concise and user-friendly.\n"
         "Enable when troubleshooting a specific issue — output becomes very detailed."
     ),
+    "compat_mode": (
+        "Use a fixed system proxy instead of SNIper's safe auto-config script.\n\n"
+        "Default: off (safe mode). In safe mode, if SNIper closes unexpectedly,\n"
+        "crashes, or the PC loses power, apps simply connect directly, so your\n"
+        "internet never breaks.\n"
+        "Turn this on only if an app you need doesn't go through SNIper in safe\n"
+        "mode. Such apps are then covered, but after an unexpected exit they can\n"
+        "lose internet until SNIper restores the settings."
+    ),
     "remember": (
         "Keep these settings for the next time you open SNIper.\n\n"
         "Default: off. Ticking saves them right away, and again whenever you\n"
@@ -291,11 +301,11 @@ class App(tk.Tk):
         # screen can show, and lower the minimum size to match so it cannot
         # override the clamp.
         # Both heights were tuned for the original four settings rows, so they
-        # grow by each row added since ("Remember settings") to keep the log's
-        # room. Rows are measured, as their tallest widget plus 4px pady above
-        # and below, because they scale with DPI; widgets know their requested
-        # size as soon as they exist, so this still runs before the window
-        # first shows.
+        # grow by each row added since ("Compatibility mode" and "Remember
+        # settings": every row from the fifth on) to keep the log's room. Rows
+        # are measured, as their tallest widget plus 4px pady above and below,
+        # because they scale with DPI; widgets know their requested size as
+        # soon as they exist, so this still runs before the window first shows.
         added_rows = [w.master for w in self._rows[4:]]
         extra = sum(max(c.winfo_reqheight() for c in row.winfo_children()) + 8
                     for row in added_rows)
@@ -417,14 +427,18 @@ class App(tk.Tk):
         self._frag_var     = tk.IntVar(value=initial["fragment"])
         self._nodoh_var    = tk.BooleanVar(value=initial["no_doh"])
         self._verbose_var  = tk.BooleanVar(value=initial["verbose"])
+        self._compat_var   = tk.BooleanVar(value=initial["compat_mode"])
         self._remember_var = tk.BooleanVar(value=stored is not None)
 
+        # Every row is in self._rows, so Start disables them all while a
+        # session runs (the mode can only change between sessions).
         cfg = [
-            ("port",     "Port",              self._port_var,     "int"),
-            ("fragment", "Fragment size",     self._frag_var,     "int"),
-            ("no_doh",   "Disable DoH",       self._nodoh_var,    "bool"),
-            ("verbose",  "Verbose logging",   self._verbose_var,  "bool"),
-            ("remember", "Remember settings", self._remember_var, "bool"),
+            ("port",        "Port",               self._port_var,     "int"),
+            ("fragment",    "Fragment size",      self._frag_var,     "int"),
+            ("no_doh",      "Disable DoH",        self._nodoh_var,    "bool"),
+            ("verbose",     "Verbose logging",    self._verbose_var,  "bool"),
+            ("compat_mode", "Compatibility mode", self._compat_var,   "bool"),
+            ("remember",    "Remember settings",  self._remember_var, "bool"),
         ]
         self._rows = []
         for i, (key, label, var, kind) in enumerate(cfg, start=1):
@@ -570,7 +584,8 @@ class App(tk.Tk):
             self._save_settings()
 
         try:
-            self.proxy.start(port, frag, not self._nodoh_var.get())
+            self.proxy.start(port, frag, not self._nodoh_var.get(),
+                             compat=self._compat_var.get())
         except OSError as e:
             self._append_friendly("ERROR", f"Could not start proxy: {e}")
             return
@@ -618,10 +633,11 @@ class App(tk.Tk):
         reads "inf" as a float that int() cannot convert.
         """
         values = {}
-        for name, var in (("port",     self._port_var),
-                          ("fragment", self._frag_var),
-                          ("no_doh",   self._nodoh_var),
-                          ("verbose",  self._verbose_var)):
+        for name, var in (("port",        self._port_var),
+                          ("fragment",    self._frag_var),
+                          ("no_doh",      self._nodoh_var),
+                          ("verbose",     self._verbose_var),
+                          ("compat_mode", self._compat_var)):
             try:
                 values[name] = var.get()
             except (tk.TclError, ValueError, OverflowError):

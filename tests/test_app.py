@@ -113,7 +113,8 @@ def test_non_ui_modules_import_on_a_headless_host():
         import sniper.compat
         assert not sniper.compat.IS_WINDOWS
         for name in ("app", "server", "sessionwatch", "winproxy", "settings",
-                     "tray", "proxy", "dns", "logformat", "config", "resources"):
+                     "tray", "proxy", "pac", "dns", "logformat", "config",
+                     "resources"):
             __import__("sniper." + name)
         from sniper.sessionwatch import SessionEndWatcher
         w = SessionEndWatcher(None, None)

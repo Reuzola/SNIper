@@ -1,6 +1,11 @@
 """ProxyServer thread: the accept loop, concurrency cap, and start/stop that
 toggles the Windows system proxy.
 
+A session runs in safe mode by default: the system proxy names a PAC script
+this server serves itself on its own port (see sniper.pac), so a dead SNIper
+means direct internet rather than none. Compatibility mode points the system
+proxy at the port directly instead, as v1.1.7 did.
+
 Whatever ends a session, the system proxy is put back through the one restore
 mechanism, winproxy.proxy_restore(): Stop and window close call stop(), which
 always restores; an accept loop that dies on its own fails safe (closes the
@@ -18,7 +23,8 @@ import time
 
 from sniper.compat import IS_WINDOWS
 from sniper.config import MAX_CONNECTIONS
-from sniper.proxy import handle_client
+from sniper.pac import build_pac, new_pac_path
+from sniper.proxy import ServeConfig, handle_client
 from sniper.winproxy import (
     proxy_enable, proxy_restore, recover_orphaned_proxy, _proxy_gpo_locked,
 )
@@ -49,6 +55,13 @@ _TRANSIENT_ERRNO = frozenset(
 # accepts nothing.
 _TRANSIENT_FAILURE_BUDGET = 30.0
 _TRANSIENT_BACKOFF = 0.05   # seconds between retries during such a run
+
+# Backpressure: at the connection cap the loop stops accepting and lets new
+# clients wait in the kernel backlog until a handler finishes. It re-checks
+# the stop event every _SLOT_WAIT seconds while it waits, and says so in the
+# log at most once every _LIMIT_WARNING_INTERVAL seconds.
+_SLOT_WAIT = 1.0
+_LIMIT_WARNING_INTERVAL = 30.0
 
 # How long a session-end hook waits for _sys_lock before going ahead anyway.
 # The lock is only ever held for a few registry operations; the bound just
@@ -81,6 +94,10 @@ class ProxyServer:
         self.log_q    = queue.Queue()
         self.port     = None
         self.addr     = None
+        # This session's PAC script URL in safe mode, None in Compatibility
+        # mode; and what the session serves besides proxying (a ServeConfig).
+        self.pac_url  = None
+        self._serve   = None
         # Serializes every change to the system proxy made on behalf of this
         # server (apply, restore, and the flags below) across the UI, accept
         # and session-watcher threads, so a re-apply can never land after the
@@ -116,7 +133,10 @@ class ProxyServer:
                 "A previous unclean exit was detected, but the proxy had since "
                 "been changed manually — your change was left in place."))
 
-    def start(self, port, frag, use_doh):
+    def start(self, port, frag, use_doh, compat=False):
+        """Bind 127.0.0.1:port (0 picks a free port), start serving, then
+        point the system proxy at it: through this session's PAC script in
+        safe mode, or directly with compat=True (Compatibility mode)."""
         with self._lock:
             if self._thread and self._thread.is_alive():
                 return
@@ -136,12 +156,23 @@ class ProxyServer:
                 # The port really bound: the requested one, or the one the OS
                 # picked for port 0. This is what clients get pointed at.
                 port = sock.getsockname()[1]
+                if compat:
+                    serve = ServeConfig(port, None, b"")
+                else:
+                    # A new random script path every session: each session's
+                    # URL is unique, so clients notice the change at once and
+                    # the restore can tell exactly whether the URL is ours.
+                    serve = ServeConfig(port, new_pac_path(),
+                                        build_pac(port).encode("ascii"))
             except Exception:
                 try: sock.close()
                 except OSError: pass
                 raise
             self.port = port
             self.addr = f"127.0.0.1:{port}"
+            self._serve = serve
+            self.pac_url = (None if serve.pac_path is None
+                            else f"http://127.0.0.1:{port}{serve.pac_path}")
 
             if _proxy_gpo_locked():
                 self.log_q.put(("WARNING",
@@ -152,7 +183,8 @@ class ProxyServer:
             # A fail-safe notice from an earlier session is stale now that a
             # new one starts; the UI must not flip this one to "Stopped".
             self._unexpected_stop.clear()
-            thread = threading.Thread(target=self._run, args=(frag, use_doh),
+            thread = threading.Thread(target=self._run,
+                                      args=(frag, use_doh, self._serve),
                                       daemon=True)
             self._thread = thread
             try:
@@ -165,7 +197,8 @@ class ProxyServer:
                 raise
             self.log_q.put(("INFO",
                 f"Proxy started on 127.0.0.1:{port}  |  fragment={frag}B  "
-                f"|  DoH={'on' if use_doh else 'off'}"))
+                f"|  DoH={'on' if use_doh else 'off'}  "
+                f"|  mode={'compat' if compat else 'safe'}"))
             if old_a:
                 self.log_q.put(("WARNING",
                     "A PAC script (AutoConfigURL) was active; it has been "
@@ -188,16 +221,18 @@ class ProxyServer:
             self._applied = False
 
     def _apply_system_proxy(self):
-        """Point the Windows proxy at this session's address.
+        """Point the Windows proxy at this session: its PAC script in safe
+        mode, its address in Compatibility mode.
 
         Returns the genuine PAC URL that was temporarily disabled, or None.
         Every apply goes through here (Start, and the re-apply after a
-        cancelled sign-out) so they are all serialized with the restores.
+        cancelled sign-out, with the same mode and URL) so they are all
+        serialized with the restores.
         """
         with self._sys_lock:
             # Records the genuine baseline durably before overwriting the live
             # values; returns the genuine PAC (or None).
-            old_a = proxy_enable(self.addr)
+            old_a = proxy_enable(self.addr, pac_url=self.pac_url)
             self._applied = True
             return old_a
 
@@ -284,32 +319,53 @@ class ProxyServer:
             pass
 
     # ── Accept loop ──────────────────────────────────────────────────────────
-    def _run(self, frag, use_doh):
+    def _run(self, frag, use_doh, serve=None):
         sock = self._sock
         # Cap concurrent handler threads so a connection burst can't exhaust
-        # the OS thread limit and crash the accept loop; over the cap the
-        # client is refused and simply retries once a slot frees.
+        # the OS thread limit and crash the accept loop. A slot is taken
+        # BEFORE accept(): over the cap the loop simply stops accepting and
+        # clients wait in the kernel backlog until a handler finishes.
+        # Accepting and closing them instead would be a connection-level
+        # failure, which Chromium answers in safe mode by skipping the proxy
+        # for 5 minutes and going DIRECT, so blocked sites would silently
+        # stop working.
         conn_slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
 
-        def _serve(client):
+        def _handle(client):
             try:
-                handle_client(client, use_doh, frag, self.log_q)
+                handle_client(client, use_doh, frag, self.log_q, serve=serve)
             finally:
                 conn_slots.release()
 
         # When the current run of back-to-back transient errors began; None
-        # while accept() is healthy.
+        # while accept() is healthy. Waiting for a slot never counts towards
+        # it: the loop only waits after a successful accept took the last
+        # slot (which ends any run), and every error hands its slot straight
+        # back, so a run never has to wait.
         first_transient = None
+        last_limit_warning = None
         try:
             while not self._stop.is_set():
+                if not conn_slots.acquire(blocking=False):
+                    now = time.monotonic()
+                    if (last_limit_warning is None
+                            or now - last_limit_warning >= _LIMIT_WARNING_INTERVAL):
+                        last_limit_warning = now
+                        self.log_q.put(("WARNING",
+                            f"Connection limit ({MAX_CONNECTIONS}) reached — "
+                            "new connections wait for a free slot"))
+                    if not conn_slots.acquire(timeout=_SLOT_WAIT):
+                        continue  # re-check the stop event, then wait again
                 try:
                     client, _ = sock.accept()
                 except socket.timeout:
+                    conn_slots.release()
                     # A quiet second: nothing waiting and nothing failing, so
                     # any earlier transient trouble is over.
                     first_transient = None
                     continue
                 except OSError as e:
+                    conn_slots.release()
                     if self._stop.is_set():
                         break  # stop() closed the socket: a normal end
                     if _is_transient_accept_error(e):
@@ -324,14 +380,8 @@ class ProxyServer:
                     self._fail_safe(e, sock)
                     break
                 first_transient = None
-                if not conn_slots.acquire(blocking=False):
-                    self.log_q.put(("WARNING",
-                        f"Connection limit ({MAX_CONNECTIONS}) reached — refusing a connection"))
-                    try: client.close()
-                    except OSError: pass
-                    continue
                 try:
-                    threading.Thread(target=_serve, args=(client,), daemon=True).start()
+                    threading.Thread(target=_handle, args=(client,), daemon=True).start()
                 except RuntimeError:
                     conn_slots.release()
                     try: client.close()

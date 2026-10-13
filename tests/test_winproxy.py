@@ -46,6 +46,9 @@ def test_enable_from_clean_state(fake_reg):
         "ProxyServer": ("", REG_SZ),
         "AutoConfigURLPresent": (0, REG_DWORD),
         "AppliedProxyServer": (ADDR, REG_SZ),
+        # Added with safe mode: every record now names its mode. v1.1.7
+        # records without it still read as static (test_winproxy_pac.py).
+        "AppliedMode": ("static", REG_SZ),
         "Complete": (1, REG_DWORD),
     }
     assert fake_reg.live() == (1, ADDR, ABSENT)

@@ -12,6 +12,7 @@ import ctypes
 import re
 import time
 import uuid
+from collections import namedtuple
 
 from sniper.compat import IS_WINDOWS, winreg
 
@@ -236,3 +237,107 @@ if IS_WINDOWS:
     def set_shutdown_parameters(level, flags):
         if not _kernel32.SetProcessShutdownParameters(level, flags):
             raise ctypes.WinError(ctypes.get_last_error())
+
+    # ── WinHTTP: what Windows itself makes of a proxy configuration ─────────
+    # Read-only queries. WinHttpGetProxyForUrl is handed the script URL
+    # explicitly, so it never consults the user's settings at all.
+    WINHTTP_ACCESS_TYPE_NO_PROXY = 1
+    WINHTTP_ACCESS_TYPE_NAMED_PROXY = 3
+    WINHTTP_AUTOPROXY_CONFIG_URL = 0x2
+    WINHTTP_AUTOPROXY_RUN_INPROCESS = 0x00010000
+    ERROR_WINHTTP_BAD_AUTO_PROXY_SCRIPT = 12166
+    ERROR_WINHTTP_UNABLE_TO_DOWNLOAD_SCRIPT = 12167
+
+    class _AutoProxyOptions(ctypes.Structure):
+        _fields_ = [("dwFlags", wintypes.DWORD),
+                    ("dwAutoDetectFlags", wintypes.DWORD),
+                    ("lpszAutoConfigUrl", wintypes.LPCWSTR),
+                    ("lpvReserved", ctypes.c_void_p),
+                    ("dwReserved", wintypes.DWORD),
+                    ("fAutoLogonIfChallenged", wintypes.BOOL)]
+
+    # The strings below are allocated by WinHTTP and freed with GlobalFree,
+    # so they are read as raw pointers.
+    class _ProxyInfo(ctypes.Structure):
+        _fields_ = [("dwAccessType", wintypes.DWORD),
+                    ("lpszProxy", ctypes.c_void_p),
+                    ("lpszProxyBypass", ctypes.c_void_p)]
+
+    class _IEProxyConfig(ctypes.Structure):
+        _fields_ = [("fAutoDetect", wintypes.BOOL),
+                    ("lpszAutoConfigUrl", ctypes.c_void_p),
+                    ("lpszProxy", ctypes.c_void_p),
+                    ("lpszProxyBypass", ctypes.c_void_p)]
+
+    _winhttp = ctypes.WinDLL("winhttp", use_last_error=True)
+    _winhttp.WinHttpOpen.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.LPCWSTR,
+                                     wintypes.LPCWSTR, wintypes.DWORD]
+    _winhttp.WinHttpOpen.restype = ctypes.c_void_p  # HINTERNET
+    _winhttp.WinHttpCloseHandle.argtypes = [ctypes.c_void_p]
+    _winhttp.WinHttpCloseHandle.restype = wintypes.BOOL
+    _winhttp.WinHttpGetProxyForUrl.argtypes = [
+        ctypes.c_void_p, wintypes.LPCWSTR, ctypes.POINTER(_AutoProxyOptions),
+        ctypes.POINTER(_ProxyInfo)]
+    _winhttp.WinHttpGetProxyForUrl.restype = wintypes.BOOL
+    _winhttp.WinHttpGetIEProxyConfigForCurrentUser.argtypes = [
+        ctypes.POINTER(_IEProxyConfig)]
+    _winhttp.WinHttpGetIEProxyConfigForCurrentUser.restype = wintypes.BOOL
+    _kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+    _kernel32.GlobalFree.restype = ctypes.c_void_p
+
+    def _take_string(ptr):
+        if not ptr:
+            return None
+        try:
+            return ctypes.wstring_at(ptr)
+        finally:
+            _kernel32.GlobalFree(ptr)
+
+    class WinHttpResult(namedtuple("WinHttpResult", "ok error access_type proxy bypass")):
+        """One WinHttpGetProxyForUrl answer; error is its GetLastError()."""
+        __slots__ = ()
+
+        @property
+        def direct(self):
+            return self.ok and (self.access_type == WINHTTP_ACCESS_TYPE_NO_PROXY
+                                or not self.proxy)
+
+        def names_proxy(self, addr):
+            return (self.ok and self.access_type == WINHTTP_ACCESS_TYPE_NAMED_PROXY
+                    and addr in (self.proxy or ""))
+
+    def winhttp_proxy_for_url(url, pac_url, in_process=False):
+        """Ask WinHTTP's PAC engine which proxy url should use under the
+        script at pac_url. Out of process (WinHTTP's autoproxy service, as
+        most apps run it) unless in_process."""
+        session = _winhttp.WinHttpOpen("SNIper-pytest", WINHTTP_ACCESS_TYPE_NO_PROXY,
+                                       None, None, 0)
+        if not session:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            options = _AutoProxyOptions()
+            options.dwFlags = WINHTTP_AUTOPROXY_CONFIG_URL
+            if in_process:
+                options.dwFlags |= WINHTTP_AUTOPROXY_RUN_INPROCESS
+            options.lpszAutoConfigUrl = pac_url
+            options.fAutoLogonIfChallenged = False
+            info = _ProxyInfo()
+            if not _winhttp.WinHttpGetProxyForUrl(session, url, ctypes.byref(options),
+                                                  ctypes.byref(info)):
+                return WinHttpResult(False, ctypes.get_last_error(), None, None, None)
+            return WinHttpResult(True, 0, info.dwAccessType,
+                                 _take_string(info.lpszProxy),
+                                 _take_string(info.lpszProxyBypass))
+        finally:
+            _winhttp.WinHttpCloseHandle(session)
+
+    def winhttp_ie_config():
+        """What WinHTTP reports as the current user's proxy configuration:
+        {auto_detect, auto_config_url, proxy, proxy_bypass}. Read-only."""
+        config = _IEProxyConfig()
+        if not _winhttp.WinHttpGetIEProxyConfigForCurrentUser(ctypes.byref(config)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return {"auto_detect": bool(config.fAutoDetect),
+                "auto_config_url": _take_string(config.lpszAutoConfigUrl),
+                "proxy": _take_string(config.lpszProxy),
+                "proxy_bypass": _take_string(config.lpszProxyBypass)}

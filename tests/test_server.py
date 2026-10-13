@@ -1,5 +1,6 @@
 """Tests for sniper.server.ProxyServer: the accept loop's error handling and
-fail-safe, the idempotent stop(), and the session-end hooks.
+fail-safe, the idempotent stop(), the session-end hooks, safe vs.
+Compatibility mode (the PAC script it serves) and connection backpressure.
 
 winproxy is never reached: proxy_enable / proxy_restore are replaced by a
 recorder, so nothing here can touch any registry. Real sockets on 127.0.0.1
@@ -8,16 +9,20 @@ are used where the point is what a client actually experiences.
 from __future__ import annotations
 
 import errno
+import re
 import socket
 import threading
 import time
 import types
+import urllib.error
+import urllib.request
 
 import pytest
 
 import sniper.server as server_mod
 from helpers import wait_until
 from sniper.compat import IS_WINDOWS
+from sniper.pac import build_pac
 from sniper.server import ProxyServer, _is_transient_accept_error
 
 ERROR_LINE = ("ERROR", "Accept error — proxy stopped unexpectedly.")
@@ -25,6 +30,8 @@ STOPPED_LINE = ("INFO", "Proxy stopped. Windows proxy restored.")
 KEPT_LINE = ("INFO", "Proxy server stopped; your manual proxy change was left in place.")
 RESTORED_AFTER_LINE = ("INFO", "Windows proxy restored after the unexpected stop.")
 CANCELLED_LINE = ("INFO", "Sign-out was cancelled — system proxy re-applied.")
+LIMIT_LINE = ("WARNING", "Connection limit (%d) reached — new connections wait for a free slot")
+PAC_URL_RX = r"^http://127\.0\.0\.1:%d/sniper-[0-9a-f]{16}\.pac$"
 
 TRANSIENT_WSA = [10004, 10024, 10035, 10053, 10054, 10055]
 TRANSIENT_POSIX = ["EINTR", "EMFILE", "ENFILE", "ENOBUFS", "ECONNABORTED",
@@ -39,6 +46,7 @@ class WinproxyRecorder:
 
     def __init__(self):
         self.ops = []
+        self.pac_urls = []   # the pac_url of each enable, in order
         self.lock = threading.Lock()
         self.restore_result = None
         self.restore_exc = None
@@ -49,8 +57,10 @@ class WinproxyRecorder:
         with self.lock:
             self.ops.append(op)
 
-    def enable(self, addr):
+    def enable(self, addr, pac_url=None):
         self._log("enable", addr)
+        with self.lock:
+            self.pac_urls.append(pac_url)
         if self.enable_hook:
             self.enable_hook(addr)
         if self.enable_exc:
@@ -76,9 +86,11 @@ class WinproxyRecorder:
 class FakeClient:
     def __init__(self):
         self.closed = False
+        self.close_count = 0
 
     def close(self):
         self.closed = True
+        self.close_count += 1
 
 
 CLIENT = "client"   # script item: accept() returns a new FakeClient
@@ -98,6 +110,7 @@ class ScriptedListener:
         self.script = iter(script)
         self.closed = 0
         self.accepts = 0
+        self.clients = []
 
     def accept(self):
         self.accepts += 1
@@ -112,7 +125,9 @@ class ScriptedListener:
         if isinstance(item, BaseException):
             raise item
         assert item == CLIENT
-        return FakeClient(), ("127.0.0.1", 50000)
+        client = FakeClient()
+        self.clients.append(client)
+        return client, ("127.0.0.1", 50000)
 
     def close(self):
         self.closed += 1
@@ -143,15 +158,23 @@ def wp(monkeypatch):
 @pytest.fixture
 def srv(wp, monkeypatch):
     handled = []
+    serves = []
 
-    def fake_handle_client(client, use_doh, frag, log_q):
+    def fake_handle_client(client, use_doh, frag, log_q, serve=None):
         handled.append(client)
+        serves.append(serve)
+        if s.gate is not None:  # lets a test keep its handlers busy
+            s.gate.wait(10)
         client.close()
 
     monkeypatch.setattr(server_mod, "handle_client", fake_handle_client)
     s = ProxyServer()
     s.handled = handled
+    s.serves = serves
+    s.gate = None
     yield s
+    if s.gate is not None:
+        s.gate.set()
     # Close any real port a test left open, with the recorder back to normal.
     wp.restore_exc = wp.enable_exc = wp.enable_hook = None
     s.stop()
@@ -447,7 +470,7 @@ def test_start_on_port_zero_uses_the_real_port(srv, wp):
     wait_until(lambda: len(srv.handled) == 1)
     lines = drain(srv.log_q)
     assert ("INFO", "Proxy started on 127.0.0.1:%d  |  fragment=2B  |  DoH=off"
-            % srv.port) in lines
+            "  |  mode=safe" % srv.port) in lines
 
 
 def test_start_twice_is_ignored(srv, wp):
@@ -714,3 +737,319 @@ def test_stop_and_session_ending_concurrently(srv, wp):
         srv.session_end_cancelled()  # nothing left to re-apply
         assert wp.ops[-1] == ("restore",)
     assert errors == []
+
+
+# ── Safe mode and Compatibility mode ─────────────────────────────────────────
+@pytest.fixture
+def live_srv(wp):
+    """A ProxyServer with the real connection handler (winproxy is still the
+    recorder), for what a client on a real socket gets."""
+    s = ProxyServer()
+    yield s
+    wp.restore_exc = wp.enable_exc = wp.enable_hook = None
+    s.stop()
+
+
+def fetch(url, timeout=10):
+    """GET url directly, never through a proxy from the environment."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(url, timeout=timeout) as r:
+        return r.status, r.headers, r.read()
+
+
+def fetch_status(url):
+    try:
+        return fetch(url)[0]
+    except urllib.error.HTTPError as e:
+        e.close()
+        return e.code
+
+
+def recv_all(sock):
+    data = b""
+    while True:
+        chunk = sock.recv(65536)
+        if not chunk:
+            return data
+        data += chunk
+
+
+def started_line(port, frag=2, doh="off", mode="safe"):
+    return ("INFO", "Proxy started on 127.0.0.1:%d  |  fragment=%dB  |  DoH=%s"
+            "  |  mode=%s" % (port, frag, doh, mode))
+
+
+def limit_line(n):
+    return (LIMIT_LINE[0], LIMIT_LINE[1] % n)
+
+
+def test_safe_mode_applies_and_serves_its_pac_script(live_srv, wp):
+    live_srv.start(0, 2, False)
+    port = live_srv.port
+    assert wp.enables == [live_srv.addr]
+    url = wp.pac_urls[0]
+    assert re.match(PAC_URL_RX % port, url), url
+    assert live_srv.pac_url == url
+    status, headers, body = fetch(url)
+    assert status == 200
+    assert headers["Content-Type"] == "application/x-ns-proxy-autoconfig"
+    assert body.decode("ascii") == build_pac(port)
+    lines = drain(live_srv.log_q)
+    # The fetch is no connection: only the start line is above DEBUG.
+    assert [line for line in lines if line[0] != "DEBUG"] == [started_line(port)]
+
+
+@pytest.mark.parametrize("compat, text", [(False, "safe mode"),
+                                          (True, "compatibility mode")])
+def test_start_line_reads_well_in_the_friendly_log(srv, wp, compat, text):
+    from sniper.logformat import friendly_format
+    srv.start(0, 2, True, compat=compat)
+    line = [entry for entry in drain(srv.log_q) if entry[1].startswith("Proxy started")]
+    assert friendly_format(*line[0]) == (
+        "OK", "Started — listening on port %d  ·  fragment 2B  ·  secure DNS  ·  %s"
+        % (srv.port, text))
+
+
+def test_safe_mode_answers_other_paths_with_404(live_srv, wp):
+    live_srv.start(0, 2, False)
+    base = "http://127.0.0.1:%d" % live_srv.port
+    assert fetch_status(base + "/sniper-0000000000000000.pac") == 404
+    assert fetch_status(base + "/") == 404
+
+
+def test_compat_mode_applies_the_static_proxy_and_serves_no_script(live_srv, wp):
+    live_srv.start(0, 2, True, compat=True)
+    port = live_srv.port
+    assert wp.enables == [live_srv.addr]
+    assert wp.pac_urls == [None]
+    assert live_srv.pac_url is None
+    assert live_srv._serve.pac_path is None
+    assert fetch_status("http://127.0.0.1:%d/sniper-0123456789abcdef.pac" % port) == 404
+    assert started_line(port, doh="on", mode="compat") in drain(live_srv.log_q)
+
+
+def test_every_session_gets_a_new_script_url(live_srv, wp):
+    live_srv.start(0, 2, False)
+    first, port = live_srv.pac_url, live_srv.port
+    assert fetch_status(first) == 200
+    live_srv.stop()
+    live_srv.start(port, 2, False)  # same port, right after the PAC fetch
+    second = live_srv.pac_url
+    assert second != first
+    assert wp.pac_urls == [first, second]
+    # The old session's script went with it.
+    assert fetch_status(first) == 404
+    assert fetch_status(second) == 200
+
+
+def test_start_that_fails_to_build_the_script_closes_the_port(srv, wp, monkeypatch):
+    import sniper.pac
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+
+    def broken(port):
+        raise ValueError("no script")
+
+    monkeypatch.setattr(server_mod, "build_pac", broken)
+    with pytest.raises(ValueError):
+        srv.start(port, 2, False)
+    assert wp.enables == []
+    assert not srv.has_session and srv._sock is None
+    monkeypatch.setattr(server_mod, "build_pac", sniper.pac.build_pac)
+    srv.start(port, 2, False)  # nothing left holding the port
+    assert srv.running and srv.port == port
+
+
+def test_switching_modes_between_sessions(srv, wp):
+    srv.start(0, 2, False, compat=True)
+    srv.stop()
+    srv.start(0, 2, False)
+    assert wp.pac_urls[0] is None
+    assert re.match(PAC_URL_RX % srv.port, wp.pac_urls[1])
+    srv.stop()
+    srv.start(0, 2, False, compat=True)
+    assert srv.pac_url is None and wp.pac_urls[2] is None
+
+
+def test_handlers_get_the_sessions_serve_config(srv, wp):
+    srv.start(0, 2, False)
+    socket.create_connection(("127.0.0.1", srv.port), timeout=5).close()
+    wait_until(lambda: srv.serves)
+    serve = srv.serves[0]
+    assert serve is srv._serve
+    assert serve.listen_port == srv.port
+    assert srv.pac_url.endswith(serve.pac_path)
+    assert serve.pac_body == build_pac(srv.port).encode("ascii")
+
+
+@pytest.mark.parametrize("compat", [False, True])
+def test_cancelled_sign_out_reapplies_the_same_mode_and_url(srv, wp, compat):
+    srv.start(0, 2, False, compat=compat)
+    url = srv.pac_url
+    srv.session_ending()
+    srv.session_end_cancelled()
+    assert wp.enables == [srv.addr, srv.addr]
+    assert wp.pac_urls == [url, url]
+    assert (url is None) == compat
+
+
+# ── Backpressure ─────────────────────────────────────────────────────────────
+def start_loop(s, script):
+    """Like run_loop, but leaves the loop running."""
+    listener = ScriptedListener(s, script)
+    s._sock = listener
+    t = threading.Thread(target=s._run, args=(2, False), daemon=True)
+    s._thread = t
+    t.start()
+    return listener, t
+
+
+def test_at_the_limit_the_loop_stops_accepting(srv, wp, monkeypatch):
+    # Nobody is accepted and closed: while every slot is busy, accept() is
+    # not even called, so waiting clients stay in the kernel backlog.
+    monkeypatch.setattr(server_mod, "MAX_CONNECTIONS", 1)
+    monkeypatch.setattr(server_mod, "_SLOT_WAIT", 0.02)
+    srv.gate = threading.Event()
+    listener, t = start_loop(srv, [CLIENT, CLIENT])
+    seen = []
+    wait_until(lambda: seen.extend(drain(srv.log_q)) or limit_line(1) in seen)
+    # The loop now waits; give it many slot-wait rounds to misbehave in.
+    deadline = time.monotonic() + 0.3
+    while time.monotonic() < deadline:
+        assert listener.accepts == 1
+        time.sleep(0.02)
+    srv.gate.set()
+    t.join(10)
+    assert not t.is_alive()
+    assert len(srv.handled) == 2 and listener.accepts == 3
+    # Each client was closed once, by its handler, never by the loop.
+    assert [c.close_count for c in listener.clients] == [1, 1]
+    seen.extend(drain(srv.log_q))
+    assert seen.count(limit_line(1)) == 1  # many rounds, one line
+    assert not any("refusing" in msg for _, msg in seen)
+
+
+def test_limit_warning_repeats_only_after_the_interval(srv, wp, monkeypatch):
+    monkeypatch.setattr(server_mod, "MAX_CONNECTIONS", 1)
+    monkeypatch.setattr(server_mod, "_SLOT_WAIT", 0.01)
+    monkeypatch.setattr(server_mod, "_LIMIT_WARNING_INTERVAL", 0.1)
+    srv.gate = threading.Event()
+    seen = []
+    start = time.monotonic()
+    listener, t = start_loop(srv, [CLIENT, CLIENT])
+    wait_until(lambda: seen.extend(drain(srv.log_q)) or seen.count(limit_line(1)) >= 3)
+    srv.gate.set()
+    t.join(10)
+    elapsed = time.monotonic() - start
+    seen.extend(drain(srv.log_q))
+    # Repeated while the limit lasts, but never more than once per interval.
+    assert 3 <= seen.count(limit_line(1)) <= elapsed / 0.1 + 1
+
+
+@pytest.mark.parametrize("error", [socket.timeout("timed out"),
+                                   ConnectionResetError(10054, "reset")], ids=repr)
+def test_a_failed_accept_gives_its_slot_back(srv, wp, monkeypatch, error):
+    # With one slot, a leaked one would stall the loop for good.
+    monkeypatch.setattr(server_mod, "MAX_CONNECTIONS", 1)
+    listener = run_loop(srv, [error] * 5 + [CLIENT, error, CLIENT])
+    wait_until(lambda: len(srv.handled) == 2)
+    assert listener.accepts == 9
+    assert wp.restores == 0
+
+
+def test_a_handler_that_cannot_start_gives_its_slot_back(srv, wp, monkeypatch):
+    class NoThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(server_mod, "MAX_CONNECTIONS", 1)
+    # server's own view of the threading module, with only Thread replaced.
+    fake_threading = types.SimpleNamespace(**{
+        name: getattr(threading, name) for name in dir(threading)
+        if not name.startswith("__")})
+    fake_threading.Thread = NoThread
+    monkeypatch.setattr(server_mod, "threading", fake_threading)
+    listener = run_loop(srv, [CLIENT, CLIENT, CLIENT])
+    assert listener.accepts == 4
+    assert [c.close_count for c in listener.clients] == [1, 1, 1]
+    assert srv.handled == []
+    assert wp.restores == 0
+
+
+def test_waiting_for_a_slot_does_not_count_towards_the_error_budget(srv, wp, monkeypatch):
+    monkeypatch.setattr(server_mod, "MAX_CONNECTIONS", 1)
+    monkeypatch.setattr(server_mod, "_TRANSIENT_FAILURE_BUDGET", 0.2)
+    monkeypatch.setattr(server_mod, "_SLOT_WAIT", 0.02)
+    srv.gate = threading.Event()
+    reset = ConnectionResetError(10054, "reset")
+
+    def hold_then_client():
+        # The first client's handler keeps the only slot for longer than the
+        # whole budget, so the loop waits that long before its next accept.
+        threading.Timer(0.5, srv.gate.set).start()
+        return CLIENT
+
+    listener = run_loop(srv, [reset, hold_then_client, reset, reset, CLIENT])
+    wait_until(lambda: len(srv.handled) == 2)
+    assert listener.closed == 0
+    assert wp.restores == 0
+    assert srv.take_unexpected_stop() is False
+
+
+@pytest.mark.slow
+def test_over_the_limit_clients_wait_instead_of_being_reset(live_srv, wp, monkeypatch):
+    monkeypatch.setattr(server_mod, "MAX_CONNECTIONS", 2)
+    live_srv.start(0, 2, False)
+    port, path = live_srv.port, live_srv._serve.pac_path
+    seen = []
+    idle = [socket.create_connection(("127.0.0.1", port), timeout=5) for _ in range(2)]
+    third = None
+    try:
+        # Both slots belong to handlers waiting for a request that never
+        # comes, so the loop has stopped accepting.
+        wait_until(lambda: seen.extend(drain(live_srv.log_q)) or limit_line(2) in seen)
+        third = socket.create_connection(("127.0.0.1", port), timeout=5)  # backlog
+        third.sendall(b"GET " + path.encode("ascii") + b" HTTP/1.1\r\nHost: x\r\n\r\n")
+        third.settimeout(1.5)
+        # No reply, and no RST (ConnectionResetError) or EOF (b"") either.
+        with pytest.raises(socket.timeout):
+            third.recv(1)
+        idle[0].close()  # its handler ends and frees a slot
+        third.settimeout(5)
+        start = time.monotonic()
+        data = recv_all(third)
+        assert time.monotonic() - start < 5
+        assert data.startswith(b"HTTP/1.1 200 OK\r\n")
+        assert data.endswith(build_pac(port).encode("ascii"))
+    finally:
+        for s in idle + [third]:
+            if s is not None:
+                s.close()
+    seen.extend(drain(live_srv.log_q))
+    assert seen.count(limit_line(2)) == 1
+    assert not any("refusing" in msg for _, msg in seen)
+
+
+@pytest.mark.slow
+def test_stop_while_waiting_for_a_slot(live_srv, wp, monkeypatch):
+    monkeypatch.setattr(server_mod, "MAX_CONNECTIONS", 1)
+    live_srv.start(0, 2, False)
+    accept_thread = live_srv._thread
+    seen = []
+    idle = socket.create_connection(("127.0.0.1", live_srv.port), timeout=5)
+    try:
+        wait_until(lambda: seen.extend(drain(live_srv.log_q)) or limit_line(1) in seen)
+        start = time.monotonic()
+        live_srv.stop()
+        # The loop notices the stop within one slot wait, well inside
+        # stop()'s 3 s join.
+        assert time.monotonic() - start < 2.5
+        assert not accept_thread.is_alive()
+        assert wp.restores == 1
+    finally:
+        idle.close()

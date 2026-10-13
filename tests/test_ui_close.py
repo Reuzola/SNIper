@@ -1,4 +1,5 @@
-"""Tests for the App's close paths, unexpected-stop handling and log cap.
+"""Tests for the App's close paths, unexpected-stop handling, log cap and
+the "Compatibility mode" row.
 
 The real App window is built, but ProxyServer, TrayIcon, SessionEndWatcher,
 the settings store and atexit.register are replaced by fakes, so nothing here
@@ -30,8 +31,8 @@ class FakeProxy:
     def recover(self):
         self.recovered += 1
 
-    def start(self, port, frag, use_doh):
-        self.starts.append((port, frag, use_doh))
+    def start(self, port, frag, use_doh, compat=False):
+        self.starts.append((port, frag, use_doh, compat))
         self.running = self.has_session = True
 
     def stop(self):
@@ -90,33 +91,51 @@ def tk_usable():
 
 
 @pytest.fixture
-def app(tk_usable, monkeypatch):
+def make_app(tk_usable, monkeypatch):
+    """Build an App on fakes; stored is what load_settings reports (None:
+    nothing stored, so Remember settings is off)."""
     import atexit
 
     import sniper.ui as ui
-    monkeypatch.setattr(ui, "ProxyServer", FakeProxy)
-    monkeypatch.setattr(ui, "TrayIcon", FakeTray)
-    monkeypatch.setattr(ui, "SessionEndWatcher", FakeWatcher)
-    monkeypatch.setattr(ui, "load_settings", lambda: None)
-    monkeypatch.setattr(ui, "save_settings", _must_not_be_called)
-    monkeypatch.setattr(ui, "clear_settings", _must_not_be_called)
-    registered = []
-    monkeypatch.setattr(atexit, "register", registered.append)
+    apps = []
 
-    a = ui.App()
-    a.atexit_registered = registered
-    a.destroyed = 0
-    real_destroy = a.destroy
+    def make(stored=None, save_settings=_must_not_be_called):
+        monkeypatch.setattr(ui, "ProxyServer", FakeProxy)
+        monkeypatch.setattr(ui, "TrayIcon", FakeTray)
+        monkeypatch.setattr(ui, "SessionEndWatcher", FakeWatcher)
+        monkeypatch.setattr(ui, "load_settings", lambda: stored)
+        monkeypatch.setattr(ui, "save_settings", save_settings)
+        monkeypatch.setattr(ui, "clear_settings", _must_not_be_called)
+        registered = []
+        monkeypatch.setattr(atexit, "register", registered.append)
 
-    def destroy():
-        a.destroyed += 1
-        real_destroy()
+        a = ui.App()
+        a.atexit_registered = registered
+        a.destroyed = 0
+        real_destroy = a.destroy
 
-    a.destroy = destroy
-    a.withdraw()
-    yield a
-    if not a.destroyed:
-        a.destroy()
+        def destroy():
+            a.destroyed += 1
+            # Drop this App's pending after() callbacks (its _poll_log tick),
+            # or a later test's update() runs them against a dead window.
+            for after_id in a.tk.splitlist(a.tk.call("after", "info")):
+                a.after_cancel(after_id)
+            real_destroy()
+
+        a.destroy = destroy
+        a.withdraw()
+        apps.append(a)
+        return a
+
+    yield make
+    for a in apps:
+        if not a.destroyed:
+            a.destroy()
+
+
+@pytest.fixture
+def app(make_app):
+    return make_app()
 
 
 def log_lines(a):
@@ -261,3 +280,86 @@ def test_poll_log_keeps_polling_after_an_error(app, monkeypatch):
         app._poll_log()
     assert scheduled == [(120, app._poll_log)]
 
+
+
+# ── Compatibility mode ───────────────────────────────────────────────────────
+def row_label(row):
+    """The text label of one settings row (not its "?" tooltip badge)."""
+    import tkinter as tk
+    return [c.cget("text") for c in row.winfo_children()
+            if isinstance(c, tk.Label) and c.cget("text") != "?"][0]
+
+
+def test_compat_row_sits_between_verbose_and_remember(app):
+    assert [row_label(w.master) for w in app._rows] == [
+        "Port", "Fragment size", "Disable DoH", "Verbose logging",
+        "Compatibility mode", "Remember settings"]
+    assert app._rows[4].cget("variable") == str(app._compat_var)
+    assert app._compat_var.get() is False  # safe mode by default
+
+
+def test_compat_tooltip():
+    import sniper.ui as ui
+    text = ui.TOOLTIPS["compat_mode"]
+    assert text.startswith(
+        "Use a fixed system proxy instead of SNIper's safe auto-config script.\n\n")
+    assert "Default: off (safe mode)." in text
+    assert "your\ninternet never breaks." in text
+    assert text.endswith("lose internet until SNIper restores the settings.")
+
+
+@pytest.mark.parametrize("compat", [False, True])
+def test_compat_value_reaches_start(app, compat):
+    app._compat_var.set(compat)
+    app._start()
+    assert app.proxy.starts == [(8881, 2, True, compat)]
+
+
+def test_compat_row_is_disabled_while_running(app):
+    compat_box = app._rows[4]
+    app._start()
+    assert str(compat_box.cget("state")) == "disabled"
+    app._after_stop()
+    assert str(compat_box.cget("state")) == "normal"
+
+
+def test_screen_settings_include_compat_mode(app):
+    app._compat_var.set(True)
+    assert app._screen_settings() == {"port": 8881, "fragment": 2, "no_doh": False,
+                                      "verbose": False, "compat_mode": True}
+
+
+def test_stored_compat_mode_ticks_the_box_and_is_saved_on_start(make_app):
+    from sniper.settings import default_settings
+    stored = dict(default_settings(), compat_mode=True)
+    saved = []
+    a = make_app(stored=stored, save_settings=lambda v: saved.append(v) or True)
+    assert a._compat_var.get() is True
+    a._start()
+    assert a.proxy.starts[-1][3] is True
+    assert saved and saved[-1]["compat_mode"] is True
+
+
+def test_window_height_pays_for_both_added_rows(app):
+    # The 640 px height was tuned for the original four rows. With the two
+    # rows added since, the log must still get exactly the room it had then.
+    added = [w.master for w in app._rows[4:]]
+    assert [row_label(r) for r in added] == ["Compatibility mode", "Remember settings"]
+    extra = sum(max(c.winfo_reqheight() for c in r.winfo_children()) + 8 for r in added)
+    sh = app.winfo_screenheight()
+    win_h = min(640 + extra, sh - 100)
+    assert app.minsize()[1] == min(540 + extra, win_h)
+    app.attributes("-alpha", 0.0)  # mapped for real geometry, but invisible
+    app.deiconify()
+    app.update()
+    assert app.winfo_height() == win_h
+    if 640 + extra > sh - 100:
+        return  # a small screen clamps the window; the clamp is checked above
+    log_now = app._log.winfo_height()
+    # The original layout: only the four first rows, in a 640 px window.
+    for row in added:
+        row.grid_remove()
+    app.geometry("%dx640" % app.winfo_width())
+    app.update()
+    assert app.winfo_height() == 640
+    assert log_now == app._log.winfo_height() > 1

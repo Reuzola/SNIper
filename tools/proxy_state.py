@@ -3,19 +3,25 @@
 SNIper responsible for it?
 
 Prints the live per-user proxy settings, what Windows reports to apps, the
-SNIper restore record, SNIper's RunOnce values and any SNIper processes, then
-a one-line verdict:
+SNIper restore record (and the mode it was written for), SNIper's RunOnce
+values and any SNIper processes, then a one-line verdict:
 
   CLEAN          no restore record and no SNIper-style proxy in the live
                  settings (whether or not SNIper is open)
   SNIPER ACTIVE  a record or a SNIper-style proxy, and SNIper is running
+  STRANDED (harmless: fail-open PAC)
+                 SNIper's safe-mode script URL is left over and no SNIper
+                 process runs; apps fall back to a direct connection, and the
+                 next launch of SNIper removes it
   STRANDED       a record or a SNIper-style proxy, but no SNIper process
   UNKNOWN        a record or a SNIper-style proxy, and the process list could
                  not be read
 
-A SNIper-style proxy is what SNIper applies: ProxyEnable=1 with ProxyServer
-127.0.0.1:<port>. Another tool on a loopback port looks the same; the record
-section tells them apart.
+A SNIper-style proxy is what SNIper applies: in Compatibility mode
+ProxyEnable=1 with ProxyServer 127.0.0.1:<port>, in safe mode an
+AutoConfigURL of the form http://127.0.0.1:<port>/sniper-<16 hex>.pac.
+Another tool on a loopback port looks like the first; the record section tells
+them apart.
 
 It never writes anything: registry keys are opened for reading only, and the
 only other calls are WinHttpGetIEProxyConfigForCurrentUser and a PowerShell
@@ -55,8 +61,12 @@ _CREATE_NO_WINDOW = 0x08000000
 # What SNIper itself looks like: the built EXE, or the package run from source.
 _SNIPER_NAME = re.compile(r"^sniper.*\.exe$", re.IGNORECASE)
 _SNIPER_CMD  = re.compile(r"run_sniper\.py|(^|\s)-m\s+sniper(\s|$)", re.IGNORECASE)
-# The static proxy SNIper applies.
+# The static proxy SNIper applies (Compatibility mode)...
 _SNIPER_PROXY = re.compile(r"^127\.0\.0\.1:\d+$")
+# ...and its one-off safe-mode script URL.
+_SNIPER_PAC = re.compile(r"^http://127\.0\.0\.1:\d+/sniper-[0-9a-f]{16}\.pac$")
+
+VERDICT_HARMLESS = "STRANDED (harmless: fail-open PAC)"
 
 
 # ── Registry (read only) ─────────────────────────────────────────────────────
@@ -189,17 +199,42 @@ def list_processes():
 
 # ── Verdict ──────────────────────────────────────────────────────────────────
 def sniper_style_proxy(live):
+    """SNIper's Compatibility-mode footprint: its static proxy is enabled."""
     return (live.get("ProxyEnable") == 1
             and bool(_SNIPER_PROXY.match(str(live.get("ProxyServer") or ""))))
 
 
+def sniper_pac(live):
+    """SNIper's safe-mode footprint: its script URL is the setup script."""
+    return bool(_SNIPER_PAC.match(str(live.get("AutoConfigURL") or "")))
+
+
+def record_mode(record):
+    """What the restore record says SNIper applied, in words, or None."""
+    if record is None:
+        return None
+    if record.get("AppliedMode") == "pac":
+        return "safe mode (auto-config script)"
+    if record.get("AppliedMode") == "static":
+        return "Compatibility mode (static proxy)"
+    if "AppliedProxyServer" in record:
+        return "static proxy (record from v1.1.7)"
+    return "static proxy (legacy record, no footprint)"
+
+
 def verdict(live, record, processes):
-    if record is None and not sniper_style_proxy(live):
+    static = sniper_style_proxy(live)
+    pac = sniper_pac(live)
+    if record is None and not static and not pac:
         return "CLEAN"
     if processes is None:
         return "UNKNOWN"
     if any(p["is_sniper"] for p in processes):
         return "SNIPER ACTIVE"
+    if pac and not static:
+        # A dead script URL is harmless: it can't be fetched, so apps go
+        # direct. Not so if SNIper's static proxy is enabled as well.
+        return VERDICT_HARMLESS
     return "STRANDED"
 
 
@@ -230,7 +265,10 @@ def render(state):
     out = ["SNIper proxy state (read-only)", "",
            "Live Internet Settings (HKCU)"]
     for name in LIVE_VALUES:
-        out.append("  %-15s %s" % (name, _show(state["live"][name])))
+        line = "  %-15s %s" % (name, _show(state["live"][name]))
+        if name == "AutoConfigURL" and sniper_pac(state["live"]):
+            line += "  (SNIper safe-mode script)"
+        out.append(line)
 
     out += ["", "What Windows reports to apps (WinHTTP, current user)"]
     cfg = state["winhttp_ie_config"]
@@ -249,6 +287,7 @@ def render(state):
     else:
         for name in sorted(state["record"]):
             out.append("  %-21s %s" % (name, _show(state["record"][name])))
+        out.append("  Mode: %s" % record_mode(state["record"]))
         if state["record"].get("Complete") != 1:
             out.append("  (incomplete: never acted on)")
 

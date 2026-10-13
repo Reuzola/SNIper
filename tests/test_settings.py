@@ -26,7 +26,8 @@ SETTINGS = r"Software\SNIper\Settings"
 PARENT   = r"Software\SNIper"
 RESTORE  = r"Software\SNIper\ProxyRestore"
 
-STORED = {"port": 9123, "fragment": 7, "no_doh": True, "verbose": True}
+STORED = {"port": 9123, "fragment": 7, "no_doh": True, "verbose": True,
+          "compat_mode": True}
 
 
 @pytest.fixture
@@ -46,7 +47,8 @@ def reg(monkeypatch):
 # ── Defaults, limits and sanitizing ──────────────────────────────────────────
 def test_defaults():
     assert settings.default_settings() == {
-        "port": 8881, "fragment": 2, "no_doh": False, "verbose": False}
+        "port": 8881, "fragment": 2, "no_doh": False, "verbose": False,
+        "compat_mode": False}  # safe mode
     assert (settings.PORT_MIN, settings.PORT_MAX) == (1, 65535)
     assert (settings.FRAGMENT_MIN, settings.FRAGMENT_MAX) == (1, 512)
     for name, value in settings.default_settings().items():
@@ -79,6 +81,8 @@ def test_storage_location():
     ("no_doh", 1, True), ("no_doh", 0, False),
     ("verbose", 2, None), ("verbose", -1, None), ("verbose", "1", None),
     ("verbose", 1.0, None), ("verbose", None, None),
+    ("compat_mode", True, True), ("compat_mode", 0, False), ("compat_mode", 1, True),
+    ("compat_mode", 2, None), ("compat_mode", "1", None), ("compat_mode", None, None),
 ])
 def test_sanitize(name, value, expected):
     got = settings.sanitize(name, value)
@@ -103,6 +107,7 @@ def test_load_stored_values(reg):
     reg.put(SETTINGS, "FragmentSize", 7)
     reg.put(SETTINGS, "DisableDoH", 1)
     reg.put(SETTINGS, "VerboseLogging", 1)
+    reg.put(SETTINGS, "CompatibilityMode", 1)
     assert settings.load_settings() == STORED
 
 
@@ -110,10 +115,11 @@ def test_load_checks_each_value_on_its_own(reg):
     reg.put(SETTINGS, "Port", "9123", REG_SZ)  # wrong type
     reg.put(SETTINGS, "FragmentSize", 513)     # out of range
     reg.put(SETTINGS, "DisableDoH", 1)         # valid
-    # VerboseLogging is missing.
+    # VerboseLogging and CompatibilityMode are missing.
     reg.put(SETTINGS, "Theme", 3)              # unknown: ignored
     assert settings.load_settings() == {
-        "port": 8881, "fragment": 2, "no_doh": True, "verbose": False}
+        "port": 8881, "fragment": 2, "no_doh": True, "verbose": False,
+        "compat_mode": False}
 
 
 @pytest.mark.parametrize("value_name, data, kind, name, expected", [
@@ -131,12 +137,32 @@ def test_load_checks_each_value_on_its_own(reg):
     ("DisableDoH", 2, REG_DWORD, "no_doh", False),
     ("VerboseLogging", 1, REG_DWORD, "verbose", True),
     ("VerboseLogging", "1", REG_SZ, "verbose", False),
+    ("CompatibilityMode", 1, REG_DWORD, "compat_mode", True),
+    ("CompatibilityMode", 0, REG_DWORD, "compat_mode", False),
+    ("CompatibilityMode", 2, REG_DWORD, "compat_mode", False),
+    ("CompatibilityMode", "1", REG_SZ, "compat_mode", False),
 ])
 def test_load_one_value(reg, value_name, data, kind, name, expected):
     reg.put(SETTINGS, value_name, data, kind)
     want = settings.default_settings()
     want[name] = expected
     assert settings.load_settings() == want
+
+
+def test_settings_stored_by_v117_load_as_safe_mode(reg):
+    # v1.1.7 stored exactly these four values and no CompatibilityMode.
+    reg.put(SETTINGS, "Port", 9123)
+    reg.put(SETTINGS, "FragmentSize", 7)
+    reg.put(SETTINGS, "DisableDoH", 1)
+    reg.put(SETTINGS, "VerboseLogging", 1)
+    assert settings.load_settings() == {
+        "port": 9123, "fragment": 7, "no_doh": True, "verbose": True,
+        "compat_mode": False}
+
+
+def test_compat_mode_value_name():
+    # The on-disk name: renaming it would silently drop what users stored.
+    assert settings._FIELDS["compat_mode"].value_name == "CompatibilityMode"
 
 
 # ── Saving ───────────────────────────────────────────────────────────────────
@@ -148,31 +174,38 @@ def test_round_trip(reg):
     assert reg.value(SETTINGS, "FragmentSize") == (7, REG_DWORD)
     assert reg.value(SETTINGS, "DisableDoH") == (1, REG_DWORD)
     assert reg.value(SETTINGS, "VerboseLogging") == (1, REG_DWORD)
+    assert reg.value(SETTINGS, "CompatibilityMode") == (1, REG_DWORD)
 
     defaults = settings.default_settings()
     assert settings.save_settings(defaults) is True
     assert settings.load_settings() == defaults
     assert reg.value(SETTINGS, "DisableDoH") == (0, REG_DWORD)
+    assert reg.value(SETTINGS, "CompatibilityMode") == (0, REG_DWORD)
 
 
 def test_save_keeps_stored_value_of_an_invalid_field(reg):
     settings.save_settings(STORED)
     # Port holds text (the UI passes None) and Fragment is out of range: both
     # keep what was stored, while the valid switches are still saved.
-    on_screen = {"port": None, "fragment": 999, "no_doh": False, "verbose": False}
+    on_screen = {"port": None, "fragment": 999, "no_doh": False, "verbose": False,
+                 "compat_mode": False}
     assert settings.save_settings(on_screen) is True
     assert settings.load_settings() == {
-        "port": 9123, "fragment": 7, "no_doh": False, "verbose": False}
+        "port": 9123, "fragment": 7, "no_doh": False, "verbose": False,
+        "compat_mode": False}
 
 
 def test_save_never_writes_an_invalid_value(reg):
-    on_screen = {"port": "abc", "fragment": 0, "no_doh": True}  # verbose missing
+    on_screen = {"port": "abc", "fragment": 0, "no_doh": True,  # verbose missing
+                 "compat_mode": 2}                                # out of range
     assert settings.save_settings(on_screen) is True
     assert reg.value(SETTINGS, "Port") is None
     assert reg.value(SETTINGS, "FragmentSize") is None
     assert reg.value(SETTINGS, "VerboseLogging") is None
+    assert reg.value(SETTINGS, "CompatibilityMode") is None
     assert settings.load_settings() == {
-        "port": 8881, "fragment": 2, "no_doh": True, "verbose": False}
+        "port": 8881, "fragment": 2, "no_doh": True, "verbose": False,
+        "compat_mode": False}
 
 
 # ── Clearing ─────────────────────────────────────────────────────────────────
@@ -293,7 +326,8 @@ def test_real_registry_round_trip(monkeypatch):
     monkeypatch.setattr(settings, "SETTINGS_KEY", key)
     try:
         assert settings.load_settings() is None
-        wanted = {"port": 9123, "fragment": 7, "no_doh": True, "verbose": False}
+        wanted = {"port": 9123, "fragment": 7, "no_doh": True, "verbose": False,
+                  "compat_mode": True}
         assert settings.save_settings(wanted) is True
         assert settings.load_settings() == wanted
 
@@ -301,6 +335,7 @@ def test_real_registry_round_trip(monkeypatch):
         try:
             assert winreg.QueryValueEx(k, "Port") == (9123, winreg.REG_DWORD)
             assert winreg.QueryValueEx(k, "DisableDoH") == (1, winreg.REG_DWORD)
+            assert winreg.QueryValueEx(k, "CompatibilityMode") == (1, winreg.REG_DWORD)
         finally:
             winreg.CloseKey(k)
 

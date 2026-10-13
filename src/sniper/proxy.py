@@ -1,18 +1,40 @@
 """Per-connection handling: connect to the remote, fragment the ClientHello,
 relay bytes, and parse the HTTP/CONNECT request line.
 
-Logic is unchanged from the original embedded proxy core; only the platform
-flag and shared constants now come from sniper.compat / sniper.config, and
-name resolution from sniper.dns.
+Requests addressed to SNIper itself are answered here and never proxied. An
+origin-form request (the URL is a bare path) is one made TO SNIper, not
+through it: the safe-mode PAC script is served from its one-off path and
+anything else gets a 404. A proxy request aimed back at SNIper's own port is
+refused with 508 instead of connecting SNIper to itself.
+
+The proxying logic is unchanged from the original embedded proxy core; only
+the platform flag and shared constants now come from sniper.compat /
+sniper.config, and name resolution from sniper.dns.
 """
 from __future__ import annotations
 
 import socket
 import threading
+from collections import namedtuple
 
 from sniper.compat import IS_WINDOWS
 from sniper.config import BUFFER, CONNECT_TIMEOUT, _HOP_BY_HOP
 from sniper.dns import resolve_doh
+from sniper.pac import PAC_CONTENT_TYPE
+
+# What one session serves besides proxying: the port it listens on (for the
+# self-loop guard) and, in safe mode, the PAC script's one-off path and its
+# body as ASCII bytes. pac_path is None in Compatibility mode, where every
+# request to SNIper itself gets a 404.
+ServeConfig = namedtuple("ServeConfig", "listen_port pac_path pac_body")
+
+# Target names that reach SNIper's own listening socket on 127.0.0.1.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+
+_NOT_FOUND = (b"HTTP/1.1 404 Not Found\r\n"
+              b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+_LOOP_DETECTED = (b"HTTP/1.1 508 Loop Detected\r\n"
+                  b"Content-Length: 0\r\nConnection: close\r\n\r\n")
 
 
 def _enable_keepalive(sock):
@@ -169,16 +191,25 @@ def _split_host_port(authority, default_port):
         return None
 
 
-def handle_http(client, method, url, headers, use_doh, log_q):
+def _http_target(url):
+    """(host, port, path) of an absolute-form request URL such as
+    'http://host:port/path', or None if its port is malformed."""
     s = url[7:] if url.startswith("http://") else url
     ps = s.find("/")
     hp   = s[:ps] if ps != -1 else s
     path = s[ps:] if ps != -1 else "/"
     parsed = _split_host_port(hp, 80)
     if parsed is None:
+        return None
+    return parsed[0], parsed[1], path
+
+
+def handle_http(client, method, url, headers, use_doh, log_q):
+    target = _http_target(url)
+    if target is None:
         log_q.put(("ERROR", f"Bad port in URL: {url[:80]}"))
         return
-    host, port = parsed
+    host, port, path = target
 
     remote = None
     try:
@@ -207,7 +238,44 @@ def handle_http(client, method, url, headers, use_doh, log_q):
             except OSError: pass
 
 
-def handle_client(client, use_doh, frag, log_q):
+def _serve_local(client, method, url, serve, log_q):
+    """Answer an origin-form request, one made to SNIper itself: the PAC
+    script for GET/HEAD on this session's script path (the query string is
+    ignored), 404 for anything else. Logged at DEBUG only, so a client
+    fetching the script never shows up as a connection in the friendly log."""
+    path = url.split("?", 1)[0]
+    pac_path = serve.pac_path if serve is not None else None
+    if pac_path is not None and path == pac_path and method in ("GET", "HEAD"):
+        body = serve.pac_body
+        head = ("HTTP/1.1 200 OK\r\n"
+                f"Content-Type: {PAC_CONTENT_TYPE}\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Cache-Control: no-store, max-age=0\r\n"
+                "Connection: close\r\n\r\n").encode("ascii")
+        client.sendall(head + body if method == "GET" else head)
+        log_q.put(("DEBUG", f"PAC script served ({method})"))
+    else:
+        client.sendall(_NOT_FOUND)
+        log_q.put(("DEBUG", f"Not found: {method} {url[:80]}"))
+
+
+def _is_own_port(host, port, serve):
+    """True if host:port is SNIper's own listening socket. Proxying such a
+    request would only connect SNIper to itself, eating a connection slot
+    per hop. Other loopback ports are proxied as usual."""
+    return (serve is not None and port == serve.listen_port
+            and host.lower() in _LOOPBACK_HOSTS)
+
+
+def _refuse_loop(client, log_q):
+    log_q.put(("WARNING", "Refused a request to SNIper's own port (loop)."))
+    try: client.sendall(_LOOP_DETECTED)
+    except OSError: pass
+
+
+def handle_client(client, use_doh, frag, log_q, serve=None):
+    """Serve one client connection. serve is the session's ServeConfig; with
+    None nothing is served locally and no port counts as SNIper's own."""
     try:
         raw = b""
         while b"\r\n\r\n" not in raw:
@@ -221,14 +289,25 @@ def handle_client(client, use_doh, frag, log_q):
         if len(parts) < 2: return
         method, url = parts[0], parts[1]
         rh = b"\r\n".join(lines[1:]) + b"\r\n\r\n"
-        if method.upper() == "CONNECT":
+        if url.startswith("/"):
+            # Origin-form: a request to SNIper, never one to proxy. (Passed
+            # on, it would try to resolve an empty host.)
+            _serve_local(client, method, url, serve, log_q)
+        elif method.upper() == "CONNECT":
             parsed = _split_host_port(url, 443)
             if parsed is None:
                 return
             host, port = parsed
+            if _is_own_port(host, port, serve):
+                _refuse_loop(client, log_q)
+                return
             log_q.put(("INFO", f"CONNECT  {host}:{port}"))
             handle_connect(client, host, port, use_doh, frag, log_q)
         else:
+            target = _http_target(url)
+            if target is not None and _is_own_port(target[0], target[1], serve):
+                _refuse_loop(client, log_q)
+                return
             log_q.put(("INFO", f"{method}  {url[:80]}"))
             handle_http(client, method, url, rh + body, use_doh, log_q)
     except Exception as e:
