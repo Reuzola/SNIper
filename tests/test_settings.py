@@ -1,10 +1,10 @@
 """Unit tests for sniper.settings, the store behind "Remember settings".
 
-Everything runs headless on any OS, without tkinter and against FakeWinreg,
-a small in-memory stand-in for the winreg calls the module makes, patched in
-with monkeypatch. The one exception is the Windows-only round trip at the
-end, which uses a throwaway key (never the real HKCU\\Software\\SNIper) and
-always removes it.
+Everything runs headless on any OS, without tkinter and against FakeWinreg
+(tests/fakewinreg.py), a small in-memory stand-in for the winreg calls the
+module makes, patched in with monkeypatch. The one exception is the
+Windows-only round trip at the end, which uses a throwaway key (never the real
+HKCU\\Software\\SNIper) and always removes it.
 """
 from __future__ import annotations
 
@@ -20,126 +20,13 @@ import sniper.settings as settings
 import sniper.winproxy as winproxy
 from sniper.compat import IS_WINDOWS
 
+from fakewinreg import REG_BINARY, REG_DWORD, REG_QWORD, REG_SZ, FakeWinreg
+
 SETTINGS = r"Software\SNIper\Settings"
 PARENT   = r"Software\SNIper"
 RESTORE  = r"Software\SNIper\ProxyRestore"
 
-# Same numbers as the real winreg constants.
-HKCU = 0x80000001
-REG_SZ, REG_BINARY, REG_DWORD, REG_QWORD = 1, 3, 4, 11
-
 STORED = {"port": 9123, "fragment": 7, "no_doh": True, "verbose": True}
-
-
-class _Handle:
-    def __init__(self, path):
-        self.path = path
-        self.closed = False
-
-
-class FakeWinreg:
-    """In-memory stand-in for the winreg calls sniper.settings makes.
-
-    keys maps each lower-cased key path (registry names are case-insensitive)
-    to {lower-cased value name: (data, type)}. As with the real API, a missing
-    key or value raises FileNotFoundError, DeleteKey refuses a key that still
-    has subkeys, and a REG_DWORD write takes only an unsigned 32-bit int. Only
-    HKEY_CURRENT_USER exists, so reaching outside it fails the test.
-
-    calls records (function, key path) for every API call so a test can check
-    what was touched; a function named in fail raises PermissionError, as on
-    an access-denied key; open counts handles not yet closed.
-    """
-
-    def __init__(self):
-        # The constants sniper.settings reads off winreg.
-        self.HKEY_CURRENT_USER = HKCU
-        self.REG_DWORD = REG_DWORD
-        self.keys = {}
-        self.calls = []
-        self.fail = set()
-        self.open = 0
-
-    # ── Helpers for the tests themselves (not recorded in calls) ────────────
-    def put(self, path, name=None, data=None, kind=REG_DWORD):
-        """Create path and its parents; also store a value if name is given."""
-        parts = path.lower().split("\\")
-        for i in range(1, len(parts) + 1):
-            self.keys.setdefault("\\".join(parts[:i]), {})
-        if name is not None:
-            self.keys[path.lower()][name.lower()] = (data, kind)
-
-    def exists(self, path):
-        return path.lower() in self.keys
-
-    def value(self, path, name):
-        return self.keys[path.lower()].get(name.lower())
-
-    # ── Internals ───────────────────────────────────────────────────────────
-    def _call(self, func, path):
-        self.calls.append((func, path))
-        if func in self.fail:
-            raise PermissionError(13, "Access is denied")
-
-    def _key(self, func, root, sub_key):
-        assert root == self.HKEY_CURRENT_USER, "settings must stay in HKCU"
-        path = sub_key.lower()
-        self._call(func, path)
-        return path
-
-    def _children(self, path):
-        prefix = path + "\\"
-        return [k for k in self.keys
-                if k.startswith(prefix) and "\\" not in k[len(prefix):]]
-
-    def _missing(self):
-        return FileNotFoundError(2, "The system cannot find the file specified")
-
-    def _handle(self, path):
-        self.open += 1
-        return _Handle(path)
-
-    # ── The winreg API ──────────────────────────────────────────────────────
-    def OpenKey(self, root, sub_key, reserved=0, access=0x20019):
-        path = self._key("OpenKey", root, sub_key)
-        if path not in self.keys:
-            raise self._missing()
-        return self._handle(path)
-
-    def CreateKey(self, root, sub_key):
-        path = self._key("CreateKey", root, sub_key)
-        self.put(path)
-        return self._handle(path)
-
-    def CloseKey(self, hkey):
-        assert not hkey.closed, "key closed twice"
-        hkey.closed = True
-        self.open -= 1
-
-    def QueryValueEx(self, hkey, name):
-        self._call("QueryValueEx", hkey.path)
-        try:
-            return self.keys[hkey.path][name.lower()]
-        except KeyError:
-            raise self._missing()
-
-    def SetValueEx(self, hkey, name, reserved, kind, data):
-        self._call("SetValueEx", hkey.path)
-        if kind == REG_DWORD:
-            assert type(data) is int and 0 <= data <= 0xFFFFFFFF, data
-        self.keys[hkey.path][name.lower()] = (data, kind)
-
-    def QueryInfoKey(self, hkey):
-        self._call("QueryInfoKey", hkey.path)
-        return len(self._children(hkey.path)), len(self.keys[hkey.path]), 0
-
-    def DeleteKey(self, root, sub_key):
-        path = self._key("DeleteKey", root, sub_key)
-        if path not in self.keys:
-            raise self._missing()
-        if self._children(path):
-            raise PermissionError(13, "Access is denied")
-        del self.keys[path]
 
 
 @pytest.fixture
@@ -150,6 +37,10 @@ def reg(monkeypatch):
     monkeypatch.setattr(settings, "IS_WINDOWS", True)
     yield fake
     assert fake.open == 0, "a registry key was left open"
+    # The shared fake can also read HKLM (for winproxy's Group Policy check);
+    # settings must stay in HKCU entirely.
+    hklm = [c for c in fake.calls if c[1].startswith("hklm\\")]
+    assert not hklm, "settings must stay in HKCU"
 
 
 # ── Defaults, limits and sanitizing ──────────────────────────────────────────
