@@ -1,9 +1,13 @@
 """Tk App window: theme palette, fonts, tooltips, hover buttons, DPI
 awareness, the window/tray wiring and the opt-in "Remember settings" row.
-The platform flag, icon path, proxy server, tray icon, friendly formatter
-and the user settings (defaults, limits and their registry store) come from
-their dedicated modules; the rest of the logic is unchanged from the
-embedded original.
+The platform flag, icon path, proxy server, tray icon, session-end watcher,
+friendly formatter and the user settings (defaults, limits and their registry
+store) come from their dedicated modules.
+
+Every way out restores the system proxy: closing the window always calls
+stop(), an accept loop that failed safe flips the UI to "Stopped", and the
+session-end watcher covers Windows sign-out and shutdown. The activity log is
+capped so a SNIper left in the tray for days stays responsive.
 """
 from __future__ import annotations
 
@@ -18,6 +22,7 @@ import atexit
 from sniper.compat import IS_WINDOWS
 from sniper.resources import ICON_PATH
 from sniper.server import ProxyServer
+from sniper.sessionwatch import SessionEndWatcher
 from sniper.tray import TrayIcon
 from sniper.logformat import friendly_format
 from sniper.settings import (
@@ -93,6 +98,12 @@ FONT_TINY  = ("Segoe UI", 8)
 # Tk root exists — see App.__init__. These values are placeholders.
 FONT_MONO  = ("Cascadia Mono", 9)
 FONT_LOG   = ("Cascadia Mono", 9)
+
+# Activity log limits. A SNIper left running in the tray for days must stay
+# responsive: one poll handles at most this many queued messages (the rest
+# wait for the next tick), and the panel keeps only the newest lines.
+_LOG_DRAIN_PER_TICK = 500
+_LOG_MAX_LINES      = 2000
 
 
 def _resolve_mono_font():
@@ -251,11 +262,23 @@ class App(tk.Tk):
         # Start is not required. Any recovery line queued here surfaces once
         # _poll_log() starts draining the queue below.
         self.proxy.recover()
+        # Windows sign-out / restart / shutdown: a hidden window on its own
+        # thread restores the system proxy synchronously before Windows ends
+        # the process, also while SNIper sits in the tray.
+        self._session_watch = SessionEndWatcher(
+            on_ending=self.proxy.session_ending,
+            on_cancelled=self.proxy.session_end_cancelled,
+        )
+        try:
+            self._session_watch.start()
+        except Exception:
+            pass
         self._tray = TrayIcon(
             on_show=self._tray_show,
             on_toggle=self._tray_toggle,
             on_exit=self._tray_exit,
-            is_running=lambda: self.proxy.running,
+            # The menu label must match what Toggle will do (see _toggle).
+            is_running=lambda: self.proxy.has_session,
             tk_after=self.after,
             tooltip="SNIper",
         )
@@ -293,8 +316,8 @@ class App(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         atexit.register(self._ensure_stop)
-        if IS_WINDOWS:
-            self._install_console_handler()
+        # No console control handler: Windows never sends logoff/shutdown
+        # console events to a process that loaded user32; sessionwatch does.
 
         self._tray.start()
 
@@ -341,25 +364,6 @@ class App(tk.Tk):
                         gripcount=0, relief="flat")
         style.map("Modern.Vertical.TScrollbar",
                   background=[("active", C["surface2"])])
-
-    # ── Console handler (preserve restore-on-kill behaviour) ─────────────────
-    def _install_console_handler(self):
-        def handler(event):
-            try:
-                if self.proxy.running:
-                    self.proxy.stop()
-            except Exception:
-                pass
-            return False
-        self._console_handler_routine = ctypes.WINFUNCTYPE(
-            ctypes.c_bool, ctypes.c_uint
-        )(handler)
-        try:
-            ctypes.windll.kernel32.SetConsoleCtrlHandler(
-                self._console_handler_routine, True
-            )
-        except Exception:
-            pass
 
     # ── Layout ───────────────────────────────────────────────────────────────
     def _build(self):
@@ -535,7 +539,9 @@ class App(tk.Tk):
 
     # ── Toggle proxy ─────────────────────────────────────────────────────────
     def _toggle(self):
-        if self.proxy.running:
+        # A session counts even if its accept thread has died: Stop is what
+        # ends it and restores the proxy. Starting instead would fail to bind.
+        if self.proxy.has_session:
             self._btn.config(state="disabled")
             threading.Thread(target=self._do_stop, daemon=True).start()
         else:
@@ -659,20 +665,39 @@ class App(tk.Tk):
 
     # ── Log helpers ──────────────────────────────────────────────────────────
     def _poll_log(self):
-        verbose = self._verbose_var.get()
         try:
-            while True:
-                level, msg = self.proxy.log_q.get_nowait()
+            # The accept loop died and failed safe on its own thread; this is
+            # where the UI learns of it and shows the session as stopped.
+            if self.proxy.take_unexpected_stop():
+                self._after_stop()
+            verbose = self._verbose_var.get()
+            for _ in range(_LOG_DRAIN_PER_TICK):
+                try:
+                    level, msg = self.proxy.log_q.get_nowait()
+                except queue.Empty:
+                    break
                 if verbose:
                     self._append_raw(level, msg)
                 else:
                     formatted = friendly_format(level, msg)
-                    if formatted is None:
-                        continue
-                    self._append_friendly(*formatted)
-        except queue.Empty:
-            pass
-        self.after(120, self._poll_log)
+                    if formatted is not None:
+                        self._append_friendly(*formatted)
+            self._trim_log()
+        finally:
+            # Keep polling even if one tick failed: this loop is also how an
+            # unexpected stop reaches the UI.
+            self.after(120, self._poll_log)
+
+    def _trim_log(self):
+        """Keep only the newest _LOG_MAX_LINES lines in the log panel."""
+        # Every entry ends with a newline, so "end-1c" sits on the empty line
+        # after the last entry: its line number is the line count plus one.
+        lines = int(self._log.index("end-1c").split(".")[0]) - 1
+        excess = lines - _LOG_MAX_LINES
+        if excess > 0:
+            self._log.config(state="normal")
+            self._log.delete("1.0", f"{excess + 1}.0")
+            self._log.config(state="disabled")
 
     def _append_raw(self, level, msg):
         ts = time.strftime("%H:%M:%S")
@@ -699,16 +724,24 @@ class App(tk.Tk):
         self._log.config(state="disabled")
 
     # ── Shutdown ─────────────────────────────────────────────────────────────
-    def _ensure_stop(self):
+    def _stop_session_watch(self):
         try:
-            if self.proxy.running:
-                self.proxy.stop()
+            self._session_watch.stop()
+        except Exception:
+            pass
+
+    def _ensure_stop(self):
+        # Last chance at interpreter exit. Restore whatever the UI or the
+        # server believe: stop() is idempotent and a no-op without a record.
+        try:
+            self.proxy.stop()
         except Exception:
             pass
         try:
             self._tray.stop()
         except Exception:
             pass
+        self._stop_session_watch()
 
     def _on_close(self):
         # The window close button and tray Quit both end here: save remembered
@@ -716,11 +749,21 @@ class App(tk.Tk):
         # problem can never hold up the exit.
         if self._remember_var.get():
             self._save_settings(quiet=True)
-        if self.proxy.running:
+        if self.proxy.has_session:
             self._btn.config(state="disabled")
             threading.Thread(target=self._shutdown_and_close, daemon=True).start()
         else:
-            self._tray.stop()
+            # No session, yet still restore: it is cheap, and it covers a
+            # record a failed earlier restore left behind.
+            try:
+                self.proxy.stop()
+            except Exception:
+                pass
+            try:
+                self._tray.stop()
+            except Exception:
+                pass
+            self._stop_session_watch()
             self.destroy()
 
     def _shutdown_and_close(self):
@@ -735,4 +778,5 @@ class App(tk.Tk):
             self._tray.stop()
         except Exception:
             pass
+        self._stop_session_watch()
         self.destroy()

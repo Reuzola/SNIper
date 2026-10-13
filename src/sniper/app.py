@@ -1,17 +1,26 @@
-"""Top-level bootstrap: the session-local single-instance guard and main().
-Logic unchanged from the embedded original; the platform flag comes from
-sniper.compat and the window from sniper.ui.
+"""Top-level bootstrap: the session-local single-instance guard, the shutdown
+priority, and main(). The window (sniper.ui, and with it tkinter) is imported
+only inside main(), so this module imports on a host without tkinter.
 """
 from __future__ import annotations
 
 import ctypes
 
 from sniper.compat import IS_WINDOWS
-from sniper.ui import App
 
-# user32 handle for the "already running" message box below.
+# user32 for the "already running" message box, kernel32 for the shutdown
+# priority below.
 if IS_WINDOWS:
+    from ctypes import wintypes
+
     _user32 = ctypes.windll.user32
+    _kernel32 = ctypes.windll.kernel32
+    _kernel32.SetProcessShutdownParameters.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    _kernel32.SetProcessShutdownParameters.restype  = wintypes.BOOL
+
+# Highest level an application may use (0x300-0x3FF is the "first to shut
+# down" application range; 0x400+ is reserved for the system).
+_SHUTDOWN_LEVEL = 0x3FF
 
 
 # ── Single-instance guard ─────────────────────────────────────────────────────
@@ -46,6 +55,22 @@ def _acquire_single_instance():
     return True
 
 
+def _raise_shutdown_priority():
+    """Ask Windows to send SNIper its session-end messages early.
+
+    Windows notifies processes from the highest shutdown level down. Going
+    early means the system proxy is restored before some other, hung app can
+    make the user pick "Shut down anyway", after which nobody is asked any
+    more. Best effort: a failure changes nothing else.
+    """
+    if not IS_WINDOWS:
+        return
+    try:
+        _kernel32.SetProcessShutdownParameters(_SHUTDOWN_LEVEL, 0)
+    except Exception:
+        pass
+
+
 def main():
     if not _acquire_single_instance():
         if IS_WINDOWS:
@@ -57,5 +82,7 @@ def main():
                 0x40,  # MB_OK | MB_ICONINFORMATION
             )
         raise SystemExit(0)
+    _raise_shutdown_priority()
+    from sniper.ui import App
     app = App()
     app.mainloop()
