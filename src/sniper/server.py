@@ -11,11 +11,14 @@ mechanism, winproxy.proxy_restore(): Stop and window close call stop(), which
 always restores; an accept loop that dies on its own fails safe (closes the
 port, restores, tells the UI); and Windows sign-out / restart / shutdown is
 handled by session_ending(), which the session watcher calls synchronously
-before Windows terminates the process.
+before Windows terminates the process. For what no code in this process can
+catch (a Task Manager kill, a crash), every apply also starts a guardian, a
+separate process that restores the moment this one dies (sniper.guardian).
 """
 from __future__ import annotations
 
 import errno
+import secrets
 import socket
 import threading
 import queue
@@ -23,10 +26,12 @@ import time
 
 from sniper.compat import IS_WINDOWS
 from sniper.config import MAX_CONNECTIONS
+from sniper.guardian import spawn_guardian
 from sniper.pac import build_pac, new_pac_path
 from sniper.proxy import ServeConfig, handle_client
 from sniper.winproxy import (
-    proxy_enable, proxy_restore, recover_orphaned_proxy, _proxy_gpo_locked,
+    current_session_id, proxy_enable, proxy_restore, recover_orphaned_proxy,
+    _proxy_gpo_locked,
 )
 
 # accept() errors that are about one incoming connection or a momentary
@@ -70,6 +75,8 @@ _SESSION_LOCK_TIMEOUT = 5.0
 
 _MSG_STOPPED = "Proxy stopped. Windows proxy restored."
 _MSG_KEPT = "Proxy server stopped; your manual proxy change was left in place."
+_MSG_NO_GUARD = ("Safety guard could not be started; your proxy settings will "
+                 "still be restored when SNIper closes or starts again.")
 
 
 def _err_code(exc):
@@ -98,6 +105,9 @@ class ProxyServer:
         # mode; and what the session serves besides proxying (a ServeConfig).
         self.pac_url  = None
         self._serve   = None
+        # The SessionId of the last apply: the record and the guardian that
+        # watches it carry the same one.
+        self.session_id = None
         # Serializes every change to the system proxy made on behalf of this
         # server (apply, restore, and the flags below) across the UI, accept
         # and session-watcher threads, so a re-apply can never land after the
@@ -132,6 +142,10 @@ class ProxyServer:
             self.log_q.put(("INFO",
                 "A previous unclean exit was detected, but the proxy had since "
                 "been changed manually — your change was left in place."))
+        elif result == "already":
+            self.log_q.put(("INFO",
+                "A previous unclean exit was detected; your proxy settings "
+                "were already back to normal."))
 
     def start(self, port, frag, use_doh, compat=False):
         """Bind 127.0.0.1:port (0 picks a free port), start serving, then
@@ -227,14 +241,33 @@ class ProxyServer:
         Returns the genuine PAC URL that was temporarily disabled, or None.
         Every apply goes through here (Start, and the re-apply after a
         cancelled sign-out, with the same mode and URL) so they are all
-        serialized with the restores.
+        serialized with the restores. Each one is a new session with its own
+        guardian: the previous guardian left when the record it watched was
+        cleared.
         """
         with self._sys_lock:
+            self.session_id = secrets.token_hex(8)
             # Records the genuine baseline durably before overwriting the live
             # values; returns the genuine PAC (or None).
-            old_a = proxy_enable(self.addr, pac_url=self.pac_url)
+            old_a = proxy_enable(self.addr, pac_url=self.pac_url,
+                                 session_id=self.session_id)
             self._applied = True
+            self._start_guardian()
             return old_a
+
+    def _start_guardian(self):
+        """Start the safety guard for this session, but only if the proxy
+        really was applied: the record names this session (not policy-locked,
+        no failed write). Never raises: the guard is the second line of
+        defense and must never stop a Start or a re-apply."""
+        try:
+            if current_session_id() != self.session_id:
+                return
+            started = spawn_guardian(self.session_id)
+        except Exception:
+            started = False
+        if not started:
+            self.log_q.put(("WARNING", _MSG_NO_GUARD))
 
     def stop(self):
         """End the session, if there is one, and always restore the system
@@ -261,7 +294,7 @@ class ProxyServer:
             self._suspended_for_session_end = False
         if result == "kept":
             self.log_q.put(("INFO", _MSG_KEPT))
-        elif thread is not None or result == "restored":
+        elif thread is not None or result in ("restored", "already"):
             self.log_q.put(("INFO", _MSG_STOPPED))
 
     # ── Windows session end ──────────────────────────────────────────────────

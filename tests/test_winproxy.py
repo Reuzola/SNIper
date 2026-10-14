@@ -11,14 +11,18 @@ from __future__ import annotations
 import pytest
 
 import sniper.winproxy as winproxy
-from fakewinreg import (ABSENT, IE_KEY, REG_DWORD, REG_SZ, RESTORE_KEY,
+from fakewinreg import (ABSENT, IE_KEY, REG_DWORD, REG_QWORD, REG_SZ, RESTORE_KEY,
                         SETTINGS_KEY, SNIPER_KEY)
 
 ADDR = "127.0.0.1:8881"
 ADDR2 = "127.0.0.1:9999"
 CORP_PAC = "http://corp/proxy.pac"
+SID = "0123456789abcdef"
 IE = IE_KEY.lower()
 REC = RESTORE_KEY.lower()
+# Added with the guardian: who applied the record. test_winproxy_owner.py
+# covers them; here they are only split off from the v1.1.7 values.
+OWNER_VALUES = ("OwnerPid", "OwnerCreateTime", "SessionId")
 
 
 def _writes(fake, path=None, start=0):
@@ -41,7 +45,10 @@ def _legacy_record(fake, enable, server, pac=ABSENT, complete=True):
 # ── 1. Enable from a clean state ─────────────────────────────────────────────
 def test_enable_from_clean_state(fake_reg):
     assert winproxy.proxy_enable(ADDR) is None
-    assert fake_reg.record(types=True) == {
+    rec = fake_reg.record(types=True)
+    owner = {name: rec.pop(name) for name in OWNER_VALUES}
+    assert [kind for _, kind in owner.values()] == [REG_DWORD, REG_QWORD, REG_SZ]
+    assert rec == {
         "ProxyEnable": (0, REG_DWORD),
         "ProxyServer": ("", REG_SZ),
         "AutoConfigURLPresent": (0, REG_DWORD),
@@ -207,11 +214,14 @@ def test_restore_without_a_record_does_nothing(fake_reg):
 
 # ── 8. Re-enable while a complete record exists ──────────────────────────────
 def test_reenable_same_address_writes_no_record(fake_reg):
+    # The same session re-applying the same address. (Without a session id
+    # every apply is a new session, and the record names the newest one; see
+    # test_winproxy_owner.py.)
     fake_reg.set_live(1, "corp:8080", ABSENT)
-    winproxy.proxy_enable(ADDR)
+    winproxy.proxy_enable(ADDR, session_id=SID)
     record = fake_reg.record()
     mark = len(fake_reg.ops)
-    assert winproxy.proxy_enable(ADDR) is None
+    assert winproxy.proxy_enable(ADDR, session_id=SID) is None
     assert fake_reg.record() == record
     assert _writes(fake_reg, REC, mark) == []
     assert fake_reg.live() == (1, ADDR, ABSENT)
@@ -279,13 +289,16 @@ def test_live_apply_failure_leaves_a_committed_record(fake_reg):
     assert fake_reg.record()["Complete"] == 1
     assert fake_reg.live() == (0, "", ABSENT)
     fake_reg.fail.clear()
-    # Live values were never changed, so they aren't the footprint: "kept".
-    assert winproxy.proxy_restore() == "kept"
+    # Live values were never changed, so they aren't the footprint; they are
+    # still the genuine ones: "already", and nothing is written.
+    mark = len(fake_reg.ops)
+    assert winproxy.proxy_restore() == "already"
+    assert _writes(fake_reg, IE, mark) == []
     assert fake_reg.live() == (0, "", ABSENT)
     assert fake_reg.record() is None
 
 
-def test_record_delete_failure_reports_restored_then_kept(fake_reg):
+def test_record_delete_failure_reports_restored_then_already(fake_reg):
     winproxy.proxy_enable(ADDR)
     fake_reg.fail.add("DeleteKey")
     assert winproxy.proxy_restore() == "restored"
@@ -294,7 +307,7 @@ def test_record_delete_failure_reports_restored_then_kept(fake_reg):
     fake_reg.fail.clear()
     mark = len(fake_reg.ops)
     # Next time the live values are genuine, not the footprint.
-    assert winproxy.proxy_restore() == "kept"
+    assert winproxy.proxy_restore() == "already"
     assert _writes(fake_reg, IE, mark) == []
     assert fake_reg.record() is None
 

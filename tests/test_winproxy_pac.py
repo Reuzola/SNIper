@@ -11,16 +11,21 @@ from __future__ import annotations
 
 import pytest
 
+import sniper.procutil as procutil
 import sniper.winproxy as winproxy
-from fakewinreg import ABSENT, IE_KEY, REG_DWORD, REG_SZ, RESTORE_KEY, SNIPER_KEY
+from fakewinreg import (ABSENT, IE_KEY, REG_DWORD, REG_QWORD, REG_SZ, RESTORE_KEY,
+                        SNIPER_KEY)
 
 ADDR = "127.0.0.1:8881"
 ADDR2 = "127.0.0.1:9999"
 URL = "http://127.0.0.1:8881/sniper-0123456789abcdef.pac"
 URL2 = "http://127.0.0.1:9999/sniper-fedcba9876543210.pac"
 CORP_PAC = "http://corp/p.pac"
+SID = "0123456789abcdef"
 IE = IE_KEY.lower()
 REC = RESTORE_KEY.lower()
+# Who applied the record (test_winproxy_owner.py covers them).
+OWNER_VALUES = ("OwnerPid", "OwnerCreateTime", "SessionId")
 
 
 def writes(fake, path=None, start=0):
@@ -46,7 +51,10 @@ def v117_record(fake, enable, server, pac=ABSENT, applied=ADDR):
 def test_enable_from_clean_state(fake_reg):
     assert winproxy.proxy_enable(ADDR, pac_url=URL) is None
     assert fake_reg.live() == (0, "", URL)
-    assert fake_reg.record(types=True) == {
+    rec = fake_reg.record(types=True)
+    owner = {name: rec.pop(name) for name in OWNER_VALUES}
+    assert [kind for _, kind in owner.values()] == [REG_DWORD, REG_QWORD, REG_SZ]
+    assert rec == {
         "ProxyEnable": (0, REG_DWORD),
         "ProxyServer": ("", REG_SZ),
         "AutoConfigURLPresent": (0, REG_DWORD),
@@ -129,9 +137,10 @@ def test_live_apply_failure_leaves_a_committed_record_that_backs_off(fake_reg):
     assert fake_reg.record()["Complete"] == 1
     assert fake_reg.live() == (0, "", ABSENT)
     fake_reg.fail.clear()
-    # Our URL never landed, so nothing of SNIper's is live: "kept", no writes.
+    # Our URL never landed, so nothing of SNIper's is live, and the live
+    # values are still the genuine ones: "already", no writes.
     mark = len(fake_reg.ops)
-    assert winproxy.proxy_restore() == "kept"
+    assert winproxy.proxy_restore() == "already"
     assert writes(fake_reg, IE, mark) == []
     assert fake_reg.record() is None
 
@@ -139,10 +148,10 @@ def test_live_apply_failure_leaves_a_committed_record_that_backs_off(fake_reg):
 # ── Re-enable while a record exists ──────────────────────────────────────────
 def test_reenable_same_session_writes_no_record(fake_reg):
     fake_reg.set_live(1, "corp:8080", ABSENT)
-    winproxy.proxy_enable(ADDR, pac_url=URL)
+    winproxy.proxy_enable(ADDR, pac_url=URL, session_id=SID)
     record = fake_reg.record()
     mark = len(fake_reg.ops)
-    assert winproxy.proxy_enable(ADDR, pac_url=URL) is None
+    assert winproxy.proxy_enable(ADDR, pac_url=URL, session_id=SID) is None
     assert writes(fake_reg, REC, mark) == []
     assert fake_reg.record() == record
     assert fake_reg.live() == (0, "corp:8080", URL)
@@ -178,14 +187,14 @@ def test_restore_untouched_deletes_the_url_and_writes_the_flag(fake_reg):
 
 @pytest.mark.parametrize("genuine, changed", [
     ((0, "", ABSENT), (0, "", "http://user/x.pac")),          # replaced
-    ((0, "", ABSENT), (0, "", ABSENT)),                       # deleted
     ((0, "", ABSENT), (0, "", "")),                           # emptied
     ((0, "", ABSENT), (0, "", URL2)),                         # another session's URL
     ((0, "", ABSENT), (0, "", URL.upper())),                  # not byte-identical
-    ((0, "", CORP_PAC), (0, "", CORP_PAC)),                   # user put theirs back
     ((1, "corp:8080", ABSENT), (1, "other:3128", "http://user/x.pac")),
-], ids=["replaced", "deleted", "emptied", "other-session", "case", "user-restored",
-        "everything-changed"])
+    ((0, "", CORP_PAC), (0, "", ABSENT)),                     # theirs deleted, not put back
+    ((1, "corp:8080", ABSENT), (1, "other:3128", ABSENT)),    # URL gone, server changed
+], ids=["replaced", "emptied", "other-session", "case", "everything-changed",
+        "genuine-pac-deleted", "server-changed"])
 def test_user_took_the_url_so_everything_is_kept(fake_reg, genuine, changed):
     fake_reg.set_live(*genuine)
     winproxy.proxy_enable(ADDR, pac_url=URL)
@@ -194,6 +203,25 @@ def test_user_took_the_url_so_everything_is_kept(fake_reg, genuine, changed):
     mark = len(fake_reg.ops)
     assert winproxy.proxy_restore() == "kept"
     assert fake_reg.live() == changed
+    assert writes(fake_reg, IE, mark) == []
+    assert fake_reg.refresh_calls == []
+    assert fake_reg.record() is None
+
+
+@pytest.mark.parametrize("genuine", [
+    (0, "", ABSENT),                 # our URL deleted: nothing was genuine
+    (0, "", CORP_PAC),               # the user put their own script back
+    (1, "corp:8080", ABSENT),        # flag and URL both back (another restore)
+    (0, "corp:8080", ""),            # a genuinely empty AutoConfigURL value
+], ids=["deleted", "user-restored", "restored-elsewhere", "empty-pac"])
+def test_url_gone_and_genuine_values_back_is_already(fake_reg, genuine):
+    fake_reg.set_live(*genuine)
+    winproxy.proxy_enable(ADDR, pac_url=URL)
+    fake_reg.set_live(*genuine)  # someone else undid safe mode exactly
+    fake_reg.refresh_calls.clear()
+    mark = len(fake_reg.ops)
+    assert winproxy.proxy_restore() == "already"
+    assert fake_reg.live() == genuine
     assert writes(fake_reg, IE, mark) == []
     assert fake_reg.refresh_calls == []
     assert fake_reg.record() is None
@@ -282,16 +310,21 @@ def test_recover_after_enable_without_stop(fake_reg):
     assert winproxy.recover_orphaned_proxy() is None  # and nothing left
 
 
-def test_pac_record_without_its_url_never_writes(fake_reg):
+@pytest.mark.parametrize("live, expected", [
+    ((0, "", ABSENT), "already"),  # would equal "no URL" if compared blindly
+    ((0, "", URL), "kept"),        # even our URL can't be proven ours
+])
+def test_pac_record_without_its_url_never_writes(fake_reg, live, expected):
     # A complete PAC record missing AppliedAutoConfigURL can't name our URL,
     # so nothing live is provably ours.
     winproxy.proxy_enable(ADDR, pac_url=URL)
     k = fake_reg.keys[REC]
     del k["appliedautoconfigurl"]
-    fake_reg.set_live(0, "", ABSENT)  # would equal "no URL" if compared blindly
+    fake_reg.set_live(*live)
     mark = len(fake_reg.ops)
-    assert winproxy.proxy_restore() == "kept"
+    assert winproxy.proxy_restore() == expected
     assert writes(fake_reg, IE, mark) == []
+    assert fake_reg.live() == live
 
 
 def test_unknown_mode_reads_as_static(fake_reg):
@@ -304,10 +337,12 @@ def test_unknown_mode_reads_as_static(fake_reg):
 
 def test_baseline_shape(fake_reg):
     fake_reg.set_live(1, "corp:8080", CORP_PAC)
-    winproxy.proxy_enable(ADDR, pac_url=URL)
+    winproxy.proxy_enable(ADDR, pac_url=URL, session_id=SID)
+    pid, created = procutil.process_identity()
     assert winproxy._read_baseline() == winproxy.Baseline(
         enable=1, server="corp:8080", pac_present=True, pac=CORP_PAC,
-        applied_server=ADDR, applied_mode="pac", applied_pac_url=URL)
+        applied_server=ADDR, applied_mode="pac", applied_pac_url=URL,
+        owner_pid=pid, owner_create_time=created, session_id=SID)
     winproxy.proxy_restore()
     winproxy.proxy_enable(ADDR)
     assert winproxy._read_baseline().applied_mode == "static"

@@ -218,3 +218,54 @@ def test_guard_snapshot_tells_absent_from_empty():
     finally:
         box.destroy()
     assert conftest._read_tree(box.root) is None
+
+
+# ── Step 3: sandbox handover, state lock and guardian spawns ─────────────────
+@windows_only
+@pytest.mark.windows_integration
+def test_registry_sandbox_isolates_the_mutex_and_hands_over_env(registry_sandbox):
+    box = registry_sandbox
+    assert winproxy._STATE_MUTEX_NAME == box.mutex_name
+    assert box.mutex_name == "SNIper_proxy_state_" + box.root[-32:]
+    assert winproxy._SANDBOXED is True and winproxy._SANDBOX_ROOT == box.root
+    assert box.env == {"SNIPER_REGISTRY_SANDBOX": box.root}
+    assert winproxy._sandbox_root(box.root) == box.root  # a subprocess honors it
+    assert box.selftest_key == box.root + r"\SelfTest"
+    assert box.selftest() is None
+
+
+def test_fake_reg_state_lock_refuses_reentry(fake_reg):
+    with winproxy._state_lock() as acquired:
+        assert acquired is True and fake_reg.locked
+        with pytest.raises(AssertionError, match="re-entered"):
+            with winproxy._state_lock():
+                pass
+    assert not fake_reg.locked
+    assert len(fake_reg.lock_spans) == 1
+
+
+def test_fake_qword_must_be_an_unsigned_64_bit_int():
+    fake = FakeWinreg()
+    k = fake.CreateKey(HKCU, RESTORE_KEY)
+    try:
+        fake.SetValueEx(k, "OwnerCreateTime", 0, 11, 2 ** 64 - 1)
+        for bad in (-1, 2 ** 64, "1"):
+            with pytest.raises(AssertionError):
+                fake.SetValueEx(k, "OwnerCreateTime", 0, 11, bad)
+    finally:
+        fake.CloseKey(k)
+
+
+def test_guardian_spawns_are_recorded_by_default(guardian_spawns):
+    import sniper.server as server
+    assert server.spawn_guardian is guardian_spawns
+    assert server.spawn_guardian("0123456789abcdef") is True
+    assert guardian_spawns.calls == ["0123456789abcdef"]
+
+
+@pytest.mark.real_guardian
+def test_the_real_guardian_marker_keeps_the_real_spawn(guardian_spawns):
+    import sniper.guardian as guardian
+    import sniper.server as server
+    assert guardian_spawns is None
+    assert server.spawn_guardian is guardian.spawn_guardian

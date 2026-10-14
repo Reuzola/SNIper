@@ -9,7 +9,9 @@ real key.
 from __future__ import annotations
 
 import ctypes
+import json
 import re
+import subprocess
 import time
 import uuid
 from collections import namedtuple
@@ -112,6 +114,13 @@ class RegistrySandbox:
         self.sniper_key = self.root + r"\SNIper"
         self.restore_key = self.sniper_key + r"\ProxyRestore"
         self.settings_key = self.sniper_key + r"\Settings"
+        # Where the self-test owner (guardian --selftest-owner) reports in.
+        self.selftest_key = self.root + r"\SelfTest"
+        # The state mutex winproxy uses for this sandbox, in this process
+        # (the fixture patches it) and in a subprocess given env.
+        self.mutex_name = "SNIper_proxy_state_" + self.root.rsplit("-", 1)[1]
+        # Hand this to a subprocess so its winproxy uses the sandbox too.
+        self.env = {"SNIPER_REGISTRY_SANDBOX": self.root}
 
     def create(self):
         winreg.CloseKey(winreg.CreateKey(winreg.HKEY_CURRENT_USER, self.root))
@@ -166,6 +175,10 @@ class RegistrySandbox:
 
     def record(self):
         return self._values(self.restore_key)
+
+    def selftest(self):
+        """What the self-test owner reported, or None before it started."""
+        return self._values(self.selftest_key)
 
 
 # ── Win32 helpers for tests ──────────────────────────────────────────────────
@@ -341,3 +354,46 @@ if IS_WINDOWS:
                 "auto_config_url": _take_string(config.lpszAutoConfigUrl),
                 "proxy": _take_string(config.lpszProxy),
                 "proxy_bypass": _take_string(config.lpszProxyBypass)}
+
+
+# ── Processes (guardian tests) ───────────────────────────────────────────────
+# The PowerShell CIM query tools/proxy_state.py uses, narrowed with a WQL
+# filter: command lines are what tell a guardian of one session from another.
+_PS_PROCESSES = (
+    "[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
+    "Get-CimInstance Win32_Process -Filter \"CommandLine LIKE '%{fragment}%'\" | "
+    "Select ProcessId,CommandLine | ConvertTo-Json")
+_CREATE_NO_WINDOW = 0x08000000
+
+
+def processes_with(fragment):
+    """[(pid, command line)] of every process whose command line contains
+    fragment (which must hold no WQL wildcard: % _ [ or a quote)."""
+    if re.search(r"[%_\['\"]", fragment):
+        raise ValueError("not a plain command-line fragment: %r" % (fragment,))
+    out = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+         _PS_PROCESSES.format(fragment=fragment)],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=60, creationflags=_CREATE_NO_WINDOW)
+    if out.returncode != 0:
+        raise OSError("process query failed: %r" % (out.stderr,))
+    text = out.stdout.decode("utf-8", "replace").strip().lstrip("\ufeff")
+    found = json.loads(text) if text else []
+    if isinstance(found, dict):
+        found = [found]
+    return [(p["ProcessId"], p.get("CommandLine") or "") for p in found]
+
+
+def guard_processes(session_id, mode="--guard"):
+    """PIDs of the guardian (or, with mode="--spawn-guard", the intermediate)
+    processes of one session, matched on their exact argument layout."""
+    rx = re.compile(r"(?:^|\s)%s\s+\d+\s+\d+\s+%s(?:\s|$)" % (re.escape(mode), session_id))
+    return sorted(pid for pid, cmd in processes_with(session_id) if rx.search(cmd))
+
+
+def taskkill(pid, tree=False):
+    """taskkill /F (/T) /PID pid: always by PID, never by image name."""
+    args = ["taskkill", "/F"] + (["/T"] if tree else []) + ["/PID", str(pid)]
+    return subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, timeout=60)

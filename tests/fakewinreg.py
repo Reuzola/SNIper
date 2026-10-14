@@ -7,7 +7,8 @@ registry. It mimics the parts of the real API the code relies on:
 - registry names are case-insensitive: keys and value names are matched
   lower-cased, while each value's spelling is kept for record();
 - a missing key or value raises FileNotFoundError, DeleteKey refuses a key that
-  still has subkeys, and a REG_DWORD write takes only an unsigned 32-bit int;
+  still has subkeys, and a REG_DWORD (REG_QWORD) write takes only an unsigned
+  32-bit (64-bit) int;
 - a handle can only do what it was opened for: OpenKey defaults to KEY_READ,
   CreateKey opens with full access, so writing through a read handle (or
   reading through a write-only one) fails the test instead of passing quietly
@@ -207,6 +208,8 @@ class FakeWinreg:
         self._call("SetValueEx", hkey.path)
         if kind == REG_DWORD:
             assert type(data) is int and 0 <= data <= 0xFFFFFFFF, data
+        elif kind == REG_QWORD:
+            assert type(data) is int and 0 <= data <= 0xFFFFFFFFFFFFFFFF, data
         self.ops.append(("SetValueEx", hkey.path, name))
         self.keys[hkey.path][name.lower()] = (data, kind)
         self._names[(id(self.keys), hkey.path, name.lower())] = name

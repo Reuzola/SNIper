@@ -40,39 +40,51 @@ TRANSIENT_POSIX = ["EINTR", "EMFILE", "ENFILE", "ENOBUFS", "ECONNABORTED",
 
 # ── Recorders and fakes ──────────────────────────────────────────────────────
 class WinproxyRecorder:
-    """Stands in for proxy_enable / proxy_restore and records each call in
-    order. "enable-done" marks when an enable returned, so tests can tell
-    whether a restore landed before or after an apply finished."""
+    """Stands in for proxy_enable / proxy_restore / current_session_id and
+    records each call in order. "enable-done" marks when an enable returned,
+    so tests can tell whether a restore landed before or after an apply
+    finished. A finished enable makes its session the record's, unless
+    writes_record is False (as when Group Policy locks the proxy)."""
 
     def __init__(self):
         self.ops = []
-        self.pac_urls = []   # the pac_url of each enable, in order
+        self.pac_urls = []      # the pac_url of each enable, in order
+        self.session_ids = []   # the session_id of each enable, in order
         self.lock = threading.Lock()
         self.restore_result = None
         self.restore_exc = None
         self.enable_exc = None
         self.enable_hook = None
+        self.writes_record = True
+        self.current = None     # the session the record names, or None
 
     def _log(self, *op):
         with self.lock:
             self.ops.append(op)
 
-    def enable(self, addr, pac_url=None):
+    def enable(self, addr, pac_url=None, session_id=None):
         self._log("enable", addr)
         with self.lock:
             self.pac_urls.append(pac_url)
+            self.session_ids.append(session_id)
         if self.enable_hook:
             self.enable_hook(addr)
         if self.enable_exc:
             raise self.enable_exc
+        if self.writes_record:
+            self.current = session_id
         self._log("enable-done", addr)
         return None
 
-    def restore(self):
+    def restore(self, session_id=None):
         self._log("restore")
         if self.restore_exc:
             raise self.restore_exc
+        self.current = None
         return self.restore_result
+
+    def current_session_id(self):
+        return self.current
 
     @property
     def enables(self):
@@ -150,6 +162,7 @@ def wp(monkeypatch):
     monkeypatch.setattr(server_mod, "proxy_enable", rec.enable)
     monkeypatch.setattr(server_mod, "proxy_restore", rec.restore)
     monkeypatch.setattr(server_mod, "recover_orphaned_proxy", rec.restore)
+    monkeypatch.setattr(server_mod, "current_session_id", rec.current_session_id)
     monkeypatch.setattr(server_mod, "_proxy_gpo_locked", lambda: False)
     monkeypatch.setattr(server_mod, "_TRANSIENT_BACKOFF", 0.001)
     return rec
@@ -1053,3 +1066,119 @@ def test_stop_while_waiting_for_a_slot(live_srv, wp, monkeypatch):
         assert wp.restores == 1
     finally:
         idle.close()
+
+
+# ── Sessions and the guardian ────────────────────────────────────────────────
+NO_GUARD_LINE = ("WARNING", "Safety guard could not be started; your proxy settings "
+                 "will still be restored when SNIper closes or starts again.")
+ALREADY_LINE = ("INFO", "A previous unclean exit was detected; your proxy settings "
+                "were already back to normal.")
+
+
+@pytest.mark.parametrize("compat", [False, True])
+def test_start_guards_its_session(srv, wp, guardian_spawns, compat):
+    srv.start(0, 2, False, compat=compat)
+    sid = srv.session_id
+    assert re.fullmatch(r"[0-9a-f]{16}", sid)
+    assert wp.session_ids == [sid]          # the record names this session...
+    assert guardian_spawns.calls == [sid]   # ...and so does its guardian
+    assert NO_GUARD_LINE not in drain(srv.log_q)
+
+
+def test_the_guardian_starts_only_after_the_apply_finished(srv, wp, guardian_spawns,
+                                                           monkeypatch):
+    def spawn(session_id):
+        wp._log("spawn", session_id)
+        return True
+    monkeypatch.setattr(server_mod, "spawn_guardian", spawn)
+    srv.start(0, 2, False)
+    assert [op[0] for op in wp.ops] == ["enable", "enable-done", "spawn"]
+
+
+def test_every_session_gets_a_new_id_and_guardian(srv, wp, guardian_spawns):
+    srv.start(0, 2, False)
+    first = srv.session_id
+    srv.stop()
+    srv.start(0, 2, False)
+    second = srv.session_id
+    assert first != second
+    assert guardian_spawns.calls == [first, second]
+    assert wp.session_ids == [first, second]
+
+
+@pytest.mark.parametrize("compat", [False, True])
+def test_cancelled_sign_out_starts_a_new_session_and_guardian(srv, wp, guardian_spawns,
+                                                              compat):
+    # The old guardian left when session_ending() cleared its record.
+    srv.start(0, 2, False, compat=compat)
+    first = srv.session_id
+    srv.session_ending()
+    assert wp.current is None
+    srv.session_end_cancelled()
+    second = srv.session_id
+    assert second != first
+    assert wp.session_ids == [first, second]
+    assert guardian_spawns.calls == [first, second]
+
+
+def test_no_guardian_when_the_record_is_not_this_sessions(srv, wp, guardian_spawns):
+    # Group Policy locked, or the record write failed: nothing to guard, and
+    # nothing to warn about either.
+    wp.writes_record = False
+    srv.start(0, 2, False)
+    assert guardian_spawns.calls == []
+    assert NO_GUARD_LINE not in drain(srv.log_q)
+    assert srv.running
+
+
+def test_a_guardian_that_cannot_start_is_a_warning_only(srv, wp, guardian_spawns):
+    guardian_spawns.result = False
+    srv.start(0, 2, False)
+    assert srv.running and srv.has_session
+    lines = drain(srv.log_q)
+    assert lines.count(NO_GUARD_LINE) == 1
+    assert wp.restores == 0  # the session stays applied
+
+
+@pytest.mark.parametrize("broken", ["spawn", "current_session_id"])
+def test_a_failing_guard_never_fails_the_start(srv, wp, monkeypatch, broken):
+    def boom(*args):
+        raise RuntimeError("exploded")
+    monkeypatch.setattr(server_mod, "spawn_guardian" if broken == "spawn"
+                        else "current_session_id", boom)
+    srv.start(0, 2, False)
+    assert srv.running
+    assert NO_GUARD_LINE in drain(srv.log_q)
+    assert wp.restores == 0
+
+
+def test_a_guardian_failure_in_the_cancelled_path_never_raises(srv, wp, guardian_spawns):
+    srv.start(0, 2, False)
+    srv.session_ending()
+    guardian_spawns.result = False
+    drain(srv.log_q)
+    srv.session_end_cancelled()
+    lines = drain(srv.log_q)
+    assert NO_GUARD_LINE in lines and CANCELLED_LINE in lines
+
+
+def test_recover_reports_already(srv, wp):
+    wp.restore_result = "already"
+    srv.recover()
+    assert drain(srv.log_q) == [ALREADY_LINE]
+
+
+@pytest.mark.parametrize("session", [False, True])
+def test_stop_treats_already_like_restored(srv, wp, session):
+    if session:
+        srv.start(0, 2, False)
+        drain(srv.log_q)
+    wp.restore_result = "already"
+    srv.stop()
+    assert drain(srv.log_q) == [STOPPED_LINE]
+
+
+def test_new_lines_read_well_in_the_friendly_log():
+    from sniper.logformat import friendly_format
+    for line in (NO_GUARD_LINE, ALREADY_LINE):
+        assert friendly_format(*line) == line

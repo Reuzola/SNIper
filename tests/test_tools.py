@@ -19,9 +19,12 @@ from sniper.compat import IS_WINDOWS
 
 _TOOL = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                       "..", "tools", "proxy_state.py"))
-KEYS = {"live", "winhttp_ie_config", "record", "runonce", "processes", "verdict"}
+KEYS = {"live", "winhttp_ie_config", "record", "owner", "guardians", "runonce",
+        "processes", "verdict"}
 HARMLESS = "STRANDED (harmless: fail-open PAC)"
-VERDICTS = {"CLEAN", "SNIPER ACTIVE", "STRANDED", HARMLESS, "UNKNOWN"}
+GUARDED = "SNIPER ACTIVE (guarded)"
+UNGUARDED = "SNIPER ACTIVE (no guardian)"
+VERDICTS = {"CLEAN", GUARDED, UNGUARDED, "STRANDED", HARMLESS, "UNKNOWN"}
 
 
 @pytest.fixture(scope="module")
@@ -101,7 +104,8 @@ OTHER_PROC = {"pid": 2, "name": "Code.exe", "command_line": r"C:\SNIper", "is_sn
     (CLEAN_LIVE, None, [], "CLEAN"),
     (CLEAN_LIVE, None, None, "CLEAN"),            # nothing to explain
     (CLEAN_LIVE, None, [SNIPER_PROC], "CLEAN"),   # open but stopped
-    (SNIPER_LIVE, RECORD, [SNIPER_PROC, OTHER_PROC], "SNIPER ACTIVE"),
+    # A v1.1.7-style record has no session, so nothing can be guarding it.
+    (SNIPER_LIVE, RECORD, [SNIPER_PROC, OTHER_PROC], UNGUARDED),
     (SNIPER_LIVE, RECORD, [OTHER_PROC], "STRANDED"),
     (SNIPER_LIVE, None, [], "STRANDED"),          # footprint without a record
     (CLEAN_LIVE, RECORD, [], "STRANDED"),         # record without a footprint
@@ -109,7 +113,7 @@ OTHER_PROC = {"pid": 2, "name": "Code.exe", "command_line": r"C:\SNIper", "is_sn
     (dict(SNIPER_LIVE, ProxyServer="corp:8080"), None, [], "CLEAN"),
     (dict(SNIPER_LIVE, ProxyServer="127.0.0.1:x"), None, [], "CLEAN"),
     # Safe mode: the script URL is the footprint.
-    (PAC_LIVE, PAC_RECORD, [SNIPER_PROC], "SNIPER ACTIVE"),
+    (PAC_LIVE, PAC_RECORD, [SNIPER_PROC], UNGUARDED),
     (PAC_LIVE, PAC_RECORD, [OTHER_PROC], HARMLESS),
     (PAC_LIVE, None, [], HARMLESS),               # footprint without a record
     (PAC_LIVE, PAC_RECORD, None, "UNKNOWN"),
@@ -211,3 +215,109 @@ def test_render_marks_the_safe_mode_script_and_the_record_mode(tool):
     # Another tool's setup script gets no such label.
     state["live"] = dict(CLEAN_LIVE, AutoConfigURL="http://corp/p.pac")
     assert "SNIper safe-mode script" not in tool.render(state)
+
+
+# ── Owner and guardian (Step 3) ──────────────────────────────────────────────
+SID = "0123456789abcdef"
+OWNED_RECORD = dict(PAC_RECORD, OwnerPid=4242, OwnerCreateTime=133700000000000000,
+                    SessionId=SID)
+APP_SRC = {"pid": 4242, "name": "python.exe", "is_sniper": True,
+           "command_line": r"python C:\SNIper\src\run_sniper.py"}
+GUARD = {"pid": 77, "name": "python.exe", "is_sniper": True,
+         "command_line": "python.exe -m sniper --guard 4242 133700000000000000 " + SID}
+GUARD_EXE = {"pid": 78, "name": "SNIper_arm64.exe", "is_sniper": True,
+             "command_line": r'"C:\x\SNIper_arm64.exe" --guard 1 2 ' + SID}
+OTHER_GUARD = dict(GUARD, pid=79, command_line=GUARD["command_line"].replace(
+    SID, "fedcba9876543210"))
+SPAWNER = dict(GUARD, pid=80, command_line=GUARD["command_line"].replace(
+    "--guard", "--spawn-guard"))
+SELFTEST = {"pid": 81, "name": "python.exe", "is_sniper": True,
+            "command_line": "python -m sniper --selftest-owner safe"}
+
+
+@pytest.mark.parametrize("live, record, processes, expected", [
+    (PAC_LIVE, OWNED_RECORD, [APP_SRC, GUARD], GUARDED),
+    (PAC_LIVE, OWNED_RECORD, [SNIPER_PROC, GUARD_EXE], GUARDED),
+    (SNIPER_LIVE, dict(RECORD, SessionId=SID), [SNIPER_PROC, GUARD], GUARDED),
+    (PAC_LIVE, OWNED_RECORD, [APP_SRC], UNGUARDED),
+    (PAC_LIVE, OWNED_RECORD, [APP_SRC, OTHER_GUARD], UNGUARDED),  # another session
+    (PAC_LIVE, OWNED_RECORD, [APP_SRC, SPAWNER], UNGUARDED),      # not yet started
+    (PAC_LIVE, None, [APP_SRC, GUARD], UNGUARDED),                # nothing to guard
+    # Helpers alone are not SNIper running.
+    (PAC_LIVE, OWNED_RECORD, [GUARD], HARMLESS),                  # mid-restore
+    (SNIPER_LIVE, dict(RECORD, SessionId=SID), [GUARD, SPAWNER], "STRANDED"),
+    (PAC_LIVE, OWNED_RECORD, [SELFTEST], HARMLESS),               # a test's stand-in
+], ids=["guarded", "guarded-exe", "guarded-compat", "no-guardian", "other-session",
+        "spawner-only", "no-record", "guardian-alone", "helpers-alone", "selftest"])
+def test_verdict_with_guardians(tool, live, record, processes, expected):
+    assert tool.verdict(live, record, processes) == expected
+
+
+@pytest.mark.parametrize("proc, role", [
+    (SNIPER_PROC, "app"), (APP_SRC, "app"), (GUARD, "guardian"), (GUARD_EXE, "guardian"),
+    (SPAWNER, "spawner"), (SELFTEST, "selftest"), (OTHER_PROC, None),
+    ({"name": "python.exe", "command_line": "python -m pytest --guard 1 2 " + SID}, None),
+    ({"name": "SNIper_x64.exe", "command_line": "SNIper_x64.exe --guarded"}, "app"),
+])
+def test_process_role(tool, proc, role):
+    assert tool.process_role(proc["name"], proc["command_line"]) == role
+
+
+def test_guardians_are_matched_on_their_exact_arguments(tool):
+    lookalike = dict(GUARD, pid=90, command_line="python -m sniper --guard x y " + SID)
+    shell = {"pid": 91, "name": "bash.exe", "is_sniper": False,
+             "command_line": "bash -c 'python -m sniper --guard 1 2 %s'" % SID}
+    procs = [APP_SRC, GUARD, GUARD_EXE, OTHER_GUARD, SPAWNER, lookalike, shell]
+    assert tool.guardians(procs, SID) == [77, 78]
+    assert tool.guardians(procs, None) == []
+    assert tool.guardians(None, SID) == []
+
+
+def test_owner_info(tool, monkeypatch):
+    seen = []
+    monkeypatch.setattr(tool, "process_alive", lambda pid, ct: seen.append((pid, ct)) or True)
+    assert tool.owner_info(None) is None
+    assert tool.owner_info(RECORD) is None  # a v1.1.7 record names no owner
+    assert tool.owner_info(OWNED_RECORD) == {
+        "pid": 4242, "create_time": 133700000000000000, "session_id": SID, "alive": True}
+    assert seen == [(4242, 133700000000000000)]
+
+
+def test_render_shows_owner_guardian_and_roles(tool):
+    state = {
+        "live": PAC_LIVE, "record": OWNED_RECORD, "runonce": {},
+        "owner": {"pid": 4242, "create_time": 1, "session_id": SID, "alive": True},
+        "guardians": [77],
+        "winhttp_ie_config": {"error": "x"},
+        "processes": [APP_SRC, GUARD], "verdict": GUARDED,
+    }
+    text = tool.render(state)
+    assert "  Owner: PID 4242 (running), session %s" % SID in text
+    assert "Safety guard (guardian of session %s)\n  PID 77" % SID in text
+    assert "python.exe  [guardian]" in text
+    assert text.endswith("Verdict: " + GUARDED)
+    state.update(guardians=[], owner=dict(state["owner"], alive=False),
+                 processes=[APP_SRC], verdict=UNGUARDED)
+    text = tool.render(state)
+    assert "(not running)" in text
+    assert "Safety guard (guardian of session %s)\n  none" % SID in text
+    state.update(record=RECORD, owner=None)
+    text = tool.render(state)
+    assert "Owner: not recorded (a record from before v1.2)" in text
+    assert "Safety guard" not in text
+
+
+@pytest.mark.skipif(not IS_WINDOWS, reason="Win32 process queries")
+def test_process_alive_on_real_processes(tool):
+    import sniper.procutil as procutil
+    pid, created = procutil.process_identity()
+    assert tool.process_alive(pid, created) is True
+    assert tool.process_alive(pid, None) is True        # an older record
+    assert tool.process_alive(pid, created + 1) is False  # a PID reused
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    p.wait(30)
+    gone = p.pid
+    del p
+    assert tool.process_alive(gone, 1) is False
+    assert tool.process_alive(None, 1) is None
+    assert tool.process_alive(0, 1) is None

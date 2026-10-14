@@ -114,11 +114,19 @@ def test_non_ui_modules_import_on_a_headless_host():
         assert not sniper.compat.IS_WINDOWS
         for name in ("app", "server", "sessionwatch", "winproxy", "settings",
                      "tray", "proxy", "pac", "dns", "logformat", "config",
-                     "resources"):
+                     "resources", "guardian", "procutil"):
             __import__("sniper." + name)
         from sniper.sessionwatch import SessionEndWatcher
         w = SessionEndWatcher(None, None)
         w.start(); w.stop()
         assert not w.ok
+        # Without Windows there is nothing to guard or lock.
+        import sniper.guardian, sniper.procutil, sniper.winproxy
+        assert sniper.guardian.spawn_guardian("0123456789abcdef") is False
+        assert sniper.guardian.notify_restored() is False
+        assert sniper.procutil.open_for_wait(1, 1) is None
+        with sniper.winproxy._state_lock() as acquired:
+            assert acquired is False
+        assert sniper.winproxy.current_session_id() is None
     """)
     assert proc.returncode == 0, proc.stderr

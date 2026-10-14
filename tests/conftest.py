@@ -10,9 +10,12 @@ is guarding against.
   tests, deleted afterwards.
 - real_proxy_guard: snapshots the real proxy state when the session starts and
   fails the run if anything differs at the end. It only ever reads.
+- guardian_spawns (autouse): in-process tests never start a real guardian
+  process unless marked real_guardian.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 
@@ -39,15 +42,36 @@ def fake_reg(monkeypatch):
     on Windows: live proxy off and empty with no AutoConfigURL, Group Policy
     not locking it, and winproxy._refresh replaced by a recorder
     (fake_reg.refresh_calls holds len(fake_reg.ops) at each call, so a test
-    can check the refresh came after the writes)."""
+    can check the refresh came after the writes).
+
+    winproxy's cross-process state lock is replaced by a recorder too, so no
+    real mutex is involved: fake_reg.lock_spans holds (len(calls) at entry,
+    len(calls) at exit) per hold, fake_reg.locked tells whether it is held
+    right now, and taking it while it is held fails the test (winproxy must
+    never re-enter it)."""
     fake = FakeWinreg()
     fake.refresh_calls = []
+    fake.lock_spans = []
+    fake.locked = False
     fake.set_live(0, "", ABSENT)
     for module in (winproxy, settings):
         monkeypatch.setattr(module, "winreg", fake)
         monkeypatch.setattr(module, "IS_WINDOWS", True)
     monkeypatch.setattr(winproxy, "_refresh",
                         lambda: fake.refresh_calls.append(len(fake.ops)))
+
+    @contextlib.contextmanager
+    def state_lock():
+        assert not fake.locked, "the state lock was re-entered"
+        fake.locked = True
+        entered = len(fake.calls)
+        try:
+            yield True
+        finally:
+            fake.locked = False
+            fake.lock_spans.append((entered, len(fake.calls)))
+
+    monkeypatch.setattr(winproxy, "_state_lock", state_lock)
     yield fake
     assert fake.open == 0, "a registry key was left open"
 
@@ -59,8 +83,10 @@ def registry_sandbox(monkeypatch):
 
     winproxy's _refresh becomes a no-op (it would make every WinINet client
     reload the real settings) and the Group Policy check reports "not locked"
-    so the result doesn't depend on the machine. The whole tree is deleted
-    afterwards, also when the test fails.
+    so the result doesn't depend on the machine. winproxy's state mutex is the
+    sandbox's own, so a real SNIper never contends with the test, and winproxy
+    reports itself sandboxed exactly as in a subprocess started with box.env.
+    The whole tree is deleted afterwards, also when the test fails.
     """
     if not IS_WINDOWS:
         pytest.skip("needs the Windows registry")
@@ -70,6 +96,9 @@ def registry_sandbox(monkeypatch):
         monkeypatch.setattr(winproxy, "_IE", box.ie)
         monkeypatch.setattr(winproxy, "_SNIPER_KEY", box.sniper_key)
         monkeypatch.setattr(winproxy, "_RESTORE_KEY", box.restore_key)
+        monkeypatch.setattr(winproxy, "_STATE_MUTEX_NAME", box.mutex_name)
+        monkeypatch.setattr(winproxy, "_SANDBOXED", True)
+        monkeypatch.setattr(winproxy, "_SANDBOX_ROOT", box.root)
         monkeypatch.setattr(settings, "SETTINGS_KEY", box.settings_key)
         monkeypatch.setattr(winproxy, "_refresh", lambda: None)
         monkeypatch.setattr(winproxy, "_proxy_gpo_locked", lambda: False)
@@ -78,6 +107,33 @@ def registry_sandbox(monkeypatch):
         yield box
     finally:
         box.destroy()
+
+
+# ── No real guardian processes from in-process tests ─────────────────────────
+class GuardianSpawns:
+    """Stands in for sniper.server.spawn_guardian: records each session id
+    it was asked to guard (calls) and answers result."""
+
+    def __init__(self):
+        self.calls = []
+        self.result = True
+
+    def __call__(self, session_id):
+        self.calls.append(session_id)
+        return self.result
+
+
+@pytest.fixture(autouse=True)
+def guardian_spawns(request, monkeypatch):
+    """A ProxyServer started in a test process never starts a real guardian
+    process: spawn_guardian is a GuardianSpawns recorder, unless the test is
+    marked real_guardian (then the fixture's value is None)."""
+    if request.node.get_closest_marker("real_guardian") is not None:
+        yield None
+        return
+    spawns = GuardianSpawns()
+    monkeypatch.setattr(server, "spawn_guardian", spawns)
+    yield spawns
 
 
 # ── Session guard: the real proxy must be exactly as we found it ─────────────

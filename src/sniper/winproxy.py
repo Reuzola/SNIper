@@ -36,14 +36,30 @@ The record names the mode it was written for (AppliedMode). A record without
 it was written by v1.1.7 and is static; one without AppliedProxyServer
 predates footprints. Both are recovered exactly as before.
 
+Every record also names its owner: the process that applied it (OwnerPid and
+OwnerCreateTime, which together name one process even after Windows reuses
+the PID) and a random SessionId per apply. The guardian (sniper.guardian), a
+separate process that restores the moment SNIper dies, passes its session to
+proxy_restore() and so only ever restores the session it was started for; a
+record that belongs to a newer session is "not-ours". Launch recovery and
+SNIper's own Stop pass no session and restore whatever record there is.
+
+More than one process can now act on the record (SNIper, its guardian), so
+every read-decide-write sequence runs under a session-local named mutex.
+
 All operations stay HKCU-only (no admin), standard-library only, and guarded so
 the module still imports on a non-Windows host where winreg is None.
 """
 from __future__ import annotations
 
+import contextlib
 import ctypes
+import os
+import re
+import secrets
 from collections import namedtuple
 
+from sniper import procutil
 from sniper.compat import IS_WINDOWS, winreg
 
 _IE        = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
@@ -58,6 +74,38 @@ _IE_POLICY = r"Software\Policies\Microsoft\Windows\CurrentVersion\Internet Setti
 _SNIPER_KEY  = r"Software\SNIper"
 _RESTORE_KEY = r"Software\SNIper\ProxyRestore"
 
+# Serializes every read-decide-write of the record across processes (SNIper,
+# its guardian). Session-local like the single-instance mutex: no "Global\".
+_STATE_MUTEX_NAME = "SNIper_proxy_state"
+
+# ── Test sandbox for subprocesses ─────────────────────────────────────────────
+# Tests run the guardian and a self-test owner as real subprocesses, which no
+# monkeypatch reaches, so they name a throwaway registry tree in this variable
+# instead. It is honored only for the exact shape the test fixture creates;
+# any other value (a real key, a short id, a path with "..", an empty string)
+# is ignored entirely and the real keys are used. In a sandbox the WinINet
+# refresh and the Group Policy check are off, as in the in-process fixture,
+# and the mutex is the sandbox's own, so tests never contend with a real
+# SNIper. The settings key is not redirected: no sandboxed code path uses it.
+_SANDBOX_ENV = "SNIPER_REGISTRY_SANDBOX"
+_SANDBOX_RX = re.compile(r"Software\\SNIper-pytest-([0-9a-f]{32})")
+
+
+def _sandbox_root(value):
+    """value if it is exactly Software\\SNIper-pytest-<32 lowercase hex>,
+    else None. fullmatch, so not even a trailing newline gets through."""
+    m = _SANDBOX_RX.fullmatch(value or "")
+    return m.group(0) if m else None
+
+
+_SANDBOX_ROOT = _sandbox_root(os.environ.get(_SANDBOX_ENV))
+_SANDBOXED = _SANDBOX_ROOT is not None
+if _SANDBOXED:
+    _IE = _SANDBOX_ROOT + r"\Internet Settings"
+    _SNIPER_KEY = _SANDBOX_ROOT + r"\SNIper"
+    _RESTORE_KEY = _SNIPER_KEY + r"\ProxyRestore"
+    _STATE_MUTEX_NAME = "SNIper_proxy_state_" + _SANDBOX_RX.fullmatch(_SANDBOX_ROOT).group(1)
+
 # The AppliedMode values. Anything else in a record (a missing value, or one
 # from some future version) reads as static, whose exact footprint check then
 # decides; at worst that leaves the live proxy alone.
@@ -70,13 +118,83 @@ MODE_PAC    = "pac"
 #   applied_server        the address SNIper applied; None in a legacy record
 #   applied_mode          MODE_PAC or MODE_STATIC
 #   applied_pac_url       the script URL SNIper applied in PAC mode, else None
+#   owner_pid             the process that applied it, and its creation
+#   owner_create_time     time (FILETIME as an int); None in older records
+#   session_id            16 hex digits, new for every apply; None in older
+#                         records
 Baseline = namedtuple("Baseline", "enable server pac_present pac applied_server "
-                                  "applied_mode applied_pac_url")
+                                  "applied_mode applied_pac_url owner_pid "
+                                  "owner_create_time session_id")
 
 # WinINet options that make running clients pick up changed proxy settings.
 _INTERNET_OPTION_REFRESH          = 37
 _INTERNET_OPTION_SETTINGS_CHANGED = 39
 _internet_set_option = None  # InternetSetOptionW, bound on first use
+
+# The state mutex: how long to wait for it, and the waits' results.
+_STATE_LOCK_TIMEOUT_MS = 5000
+_WAIT_OBJECT_0  = 0x00000000
+_WAIT_ABANDONED = 0x00000080
+_mutex_api = None  # a private kernel32 with the four calls bound, on first use
+
+
+def _bind_mutex_api():
+    """kernel32 with CreateMutexW, WaitForSingleObject, ReleaseMutex and
+    CloseHandle bound to their real (pointer-sized handle) types, on a
+    private WinDLL so the bindings never leak into ctypes.windll."""
+    global _mutex_api
+    if _mutex_api is None:
+        from ctypes import wintypes
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+        k.CreateMutexW.restype = ctypes.c_void_p  # HANDLE
+        k.WaitForSingleObject.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+        k.WaitForSingleObject.restype = wintypes.DWORD
+        k.ReleaseMutex.argtypes = [ctypes.c_void_p]
+        k.ReleaseMutex.restype = wintypes.BOOL
+        k.CloseHandle.argtypes = [ctypes.c_void_p]
+        k.CloseHandle.restype = wintypes.BOOL
+        _mutex_api = k
+    return _mutex_api
+
+
+@contextlib.contextmanager
+def _state_lock():
+    """Hold the cross-process state mutex for one read-decide-write of the
+    record; yields whether it was acquired.
+
+    WAIT_ABANDONED counts as acquired: the previous holder was killed in the
+    middle of an operation, and the Complete marker keeps the record
+    consistent whatever it left behind. After _STATE_LOCK_TIMEOUT_MS, or if
+    the mutex can't be created at all, the operation goes ahead without it:
+    restoring late, or unserialized, beats not restoring. A mutex belongs to
+    the thread that took it, so it is always released on that same thread.
+    No-op off Windows.
+    """
+    k = handle = None
+    acquired = False
+    if IS_WINDOWS:
+        try:
+            k = _bind_mutex_api()
+            handle = k.CreateMutexW(None, False, _STATE_MUTEX_NAME)
+            if handle:
+                acquired = k.WaitForSingleObject(handle, _STATE_LOCK_TIMEOUT_MS) in (
+                    _WAIT_OBJECT_0, _WAIT_ABANDONED)
+        except Exception:
+            pass
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                k.ReleaseMutex(handle)
+            except Exception:
+                pass
+        if handle:
+            try:
+                k.CloseHandle(handle)
+            except Exception:
+                pass
 
 
 def _proxy_gpo_locked():
@@ -85,9 +203,10 @@ def _proxy_gpo_locked():
     When HKLM ...\\Internet Settings\\ProxySettingsPerUser is 0, Windows
     ignores the per-user (HKCU) proxy values this program writes — the write
     succeeds but has no effect. Detecting it lets us warn the user instead of
-    failing silently on a managed/corporate machine.
+    failing silently on a managed/corporate machine. Always False in a test
+    sandbox, whose keys no policy governs.
     """
-    if not IS_WINDOWS:
+    if not IS_WINDOWS or _SANDBOXED:
         return False
     try:
         k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _IE_POLICY)
@@ -117,8 +236,9 @@ def _bind_internet_set_option():
 
 def _refresh():
     """Tell running WinINet clients the proxy settings changed and have them
-    re-read them, so an apply or a restore takes effect at once."""
-    if not IS_WINDOWS:
+    re-read them, so an apply or a restore takes effect at once. Not in a
+    test sandbox: it would make every client reload the real settings."""
+    if not IS_WINDOWS or _SANDBOXED:
         return
     try:
         set_option = _bind_internet_set_option()
@@ -253,6 +373,24 @@ def _is_footprint(live, applied_server, pac_present):
     return True
 
 
+def _is_genuine(live, base):
+    """True if the live proxy already IS the genuine pre-SNIper config the
+    record holds: the same enable flag, server and PAC (an absent PAC stays
+    distinct from an empty one). Someone else put it back before us: the
+    guardian, a restore in another process, or the user by hand."""
+    live_e, live_s, live_a = live
+    try:
+        if int(live_e or 0) != int(base.enable):
+            return False
+    except (TypeError, ValueError):
+        return False
+    if (live_s or "") != (base.server or ""):
+        return False
+    if base.pac_present:
+        return live_a == (base.pac or "")
+    return live_a is None
+
+
 def _flag_set(value):
     """True unless a live ProxyEnable reads as 0. A value that can't be read
     as a number counts as set: it is not the 0 safe mode wrote, so it isn't
@@ -315,18 +453,37 @@ def _read_baseline():
                 applied_pac_url = winreg.QueryValueEx(k, "AppliedAutoConfigURL")[0]
             except OSError:
                 pass  # can't match any live URL, so the restore backs off
+        owner_pid = _query_int(k, "OwnerPid")
+        owner_create_time = _query_int(k, "OwnerCreateTime")
+        try:
+            session_id = winreg.QueryValueEx(k, "SessionId")[0]
+        except OSError:
+            session_id = None  # an older record: no session can claim it
+        if not isinstance(session_id, str):
+            session_id = None
         return Baseline(enable, server or "", bool(present), pac, applied,
-                        mode, applied_pac_url)
+                        mode, applied_pac_url, owner_pid, owner_create_time,
+                        session_id)
     finally:
         winreg.CloseKey(k)
 
 
-def _write_baseline(enable, server, pac, applied_server,
-                    applied_mode=MODE_STATIC, applied_pac_url=None):
-    """Persist the genuine baseline plus the footprint SNIper is applying. The
-    Complete marker is written LAST so an interruption mid-write leaves an
-    incomplete record that _read_baseline ignores; pac is None when no PAC
-    existed. AppliedAutoConfigURL is written in PAC mode only."""
+def _query_int(k, name):
+    """An integer value of the record, or None if it is missing or isn't
+    one (ownership values are for matching only, never worth an error)."""
+    try:
+        return int(winreg.QueryValueEx(k, name)[0])
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _write_baseline(enable, server, pac, applied_server, applied_mode,
+                    applied_pac_url, owner, session_id):
+    """Persist the genuine baseline plus the footprint SNIper is applying and
+    who applies it (owner is (pid, creation time)). The Complete marker is
+    written LAST so an interruption mid-write leaves an incomplete record
+    that _read_baseline ignores; pac is None when no PAC existed.
+    AppliedAutoConfigURL is written in PAC mode only."""
     k = winreg.CreateKey(winreg.HKEY_CURRENT_USER, _RESTORE_KEY)
     try:
         # Drop any stale marker first so a crash mid-rewrite is not acted on.
@@ -355,6 +512,11 @@ def _write_baseline(enable, server, pac, applied_server,
                 winreg.DeleteValue(k, "AppliedAutoConfigURL")
             except OSError:
                 pass
+        owner_pid, owner_create_time = owner
+        winreg.SetValueEx(k, "OwnerPid", 0, winreg.REG_DWORD, int(owner_pid))
+        winreg.SetValueEx(k, "OwnerCreateTime", 0, winreg.REG_QWORD,
+                          int(owner_create_time))
+        winreg.SetValueEx(k, "SessionId", 0, winreg.REG_SZ, session_id)
         winreg.SetValueEx(k, "Complete", 0, winreg.REG_DWORD, 1)  # commit LAST
     finally:
         winreg.CloseKey(k)
@@ -381,9 +543,9 @@ def _clear_baseline():
 
 
 # ── Restore, per mode ──────────────────────────────────────────────────────────
-def _restore(base):
+def _restore_unlocked(base):
     """Undo the footprint one complete record describes and clear the record;
-    see proxy_restore for the outcomes."""
+    see proxy_restore for the outcomes. The caller holds the state lock."""
     if base.applied_mode == MODE_PAC:
         return _restore_pac(base)
     return _restore_static(base)
@@ -413,24 +575,27 @@ def _restore_static(base):
         _clear_baseline()
         return "restored"
 
-    # The live proxy is no longer ours — the user took control. Leave it exactly
+    # The live proxy is no longer ours. Either it is already the genuine one
+    # (someone restored it first) or the user took control. Leave it exactly
     # as found and just drop the record (no false recovery on the next launch).
     _clear_baseline()
-    return "kept"
+    return "already" if _is_genuine(live, base) else "kept"
 
 
 def _restore_pac(base):
     """Safe mode: decided by our one-off script URL, then the enable flag."""
     try:
-        live_e, _live_s, live_a = _read_live()
+        live = _read_live()
     except OSError:
         return None  # keep the record for a retry, as in static mode
+    live_e, _live_s, live_a = live
 
     if not base.applied_pac_url or live_a != base.applied_pac_url:
-        # Our script was replaced or removed: the user or another tool owns the
-        # configuration now. Write nothing, just drop the record.
+        # Our script was replaced or removed: it is already back to genuine,
+        # or the user or another tool owns the configuration now. Write
+        # nothing, just drop the record.
         _clear_baseline()
-        return "kept"
+        return "already" if _is_genuine(live, base) else "kept"
 
     # Our URL is still there. It holds this session's random value, so it is
     # provably ours and always goes, replaced by the genuine PAC (or by
@@ -448,7 +613,7 @@ def _restore_pac(base):
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
-def proxy_enable(addr, pac_url=None):
+def proxy_enable(addr, pac_url=None, session_id=None):
     """Point the per-user system proxy at SNIper.
 
     With pac_url None this is Compatibility mode: the static proxy addr. With
@@ -456,15 +621,18 @@ def proxy_enable(addr, pac_url=None):
     ProxyServer left alone (addr is still recorded, for diagnostics).
 
     Records the genuine pre-SNIper configuration, plus the footprint being
-    applied, to the durable baseline FIRST, then overwrites the live values, so
+    applied and its owner (the current process and session_id, a new one if
+    None), to the durable baseline FIRST, then overwrites the live values, so
     an ungraceful termination is self-healable. Footprint-aware and idempotent:
     if a complete durable baseline for the same mode already exists it is the
     genuine one and is reused untouched (a re-apply must never capture SNIper's
-    own footprint as the baseline). A complete record from the OTHER mode is
-    restored first, as launch recovery would, so its footprint is never
-    stranded under a record that no longer describes it; if that restore
-    cannot act, its genuine values are still the only genuine ones, so they
-    are kept and the record is taken over for this mode.
+    own footprint as the baseline); only the footprint and the owner are
+    brought up to date, so the record always names the session that applied
+    it last. A complete record from the OTHER mode is restored first, as
+    launch recovery would, so its footprint is never stranded under a record
+    that no longer describes it; if that restore cannot act, its genuine
+    values are still the only genuine ones, so they are kept and the record is
+    taken over for this mode.
 
     Returns the genuine PAC URL (or None) so the caller can note that a PAC was
     temporarily disabled.
@@ -476,45 +644,53 @@ def proxy_enable(addr, pac_url=None):
         # record no baseline (nothing would need restoring) and apply nothing.
         return None
     mode = MODE_STATIC if pac_url is None else MODE_PAC
-    try:
-        existing = _read_baseline()
-        if existing is not None and existing.applied_mode != mode:
-            if _restore(existing) is not None:
-                existing = None  # restored or released: a clean state now
-        if existing is None:
-            # Clean state — the live values are the genuine baseline. (Startup
-            # recovery has already restored-or-released and cleared any orphaned
-            # footprint before we get here, so capturing the live state is
-            # correct.)
-            cur_e, cur_s, cur_a = _read_live()
-            _write_baseline(cur_e, cur_s, cur_a, addr, mode, pac_url)
-            genuine_pac = cur_a
-        else:
-            # A complete baseline already exists; it is the genuine config. Keep
-            # it untouched and re-apply idempotently, but keep the remembered
-            # footprint in step with what we actually apply now.
-            genuine_pac = existing.pac if existing.pac_present else None
-            if (existing.applied_server != addr or existing.applied_mode != mode
-                    or existing.applied_pac_url != pac_url):
-                _write_baseline(existing.enable, existing.server, genuine_pac,
-                                addr, mode, pac_url)
-        if mode == MODE_PAC:
-            _apply_live_pac(pac_url)
-        else:
-            _apply_live(addr, clear_pac=bool(genuine_pac))
-        _refresh()
-        return genuine_pac
-    except OSError:
-        # Best-effort. If the baseline write failed we never reached the live
-        # overwrite, so the genuine state is intact (an incomplete baseline is
-        # ignored on the next launch).
-        return None
+    if session_id is None:
+        session_id = secrets.token_hex(8)
+    owner = procutil.process_identity()
+    with _state_lock():
+        try:
+            existing = _read_baseline()
+            if existing is not None and existing.applied_mode != mode:
+                # Already under the lock: never re-enter proxy_restore().
+                if _restore_unlocked(existing) is not None:
+                    existing = None  # restored or released: a clean state now
+            if existing is None:
+                # Clean state — the live values are the genuine baseline. (Startup
+                # recovery has already restored-or-released and cleared any orphaned
+                # footprint before we get here, so capturing the live state is
+                # correct.)
+                cur_e, cur_s, cur_a = _read_live()
+                _write_baseline(cur_e, cur_s, cur_a, addr, mode, pac_url,
+                                owner, session_id)
+                genuine_pac = cur_a
+            else:
+                # A complete baseline already exists; it is the genuine config. Keep
+                # it untouched and re-apply idempotently, but keep the remembered
+                # footprint and owner in step with what we actually apply now.
+                genuine_pac = existing.pac if existing.pac_present else None
+                if (existing.applied_server != addr or existing.applied_mode != mode
+                        or existing.applied_pac_url != pac_url
+                        or (existing.owner_pid, existing.owner_create_time) != owner
+                        or existing.session_id != session_id):
+                    _write_baseline(existing.enable, existing.server, genuine_pac,
+                                    addr, mode, pac_url, owner, session_id)
+            if mode == MODE_PAC:
+                _apply_live_pac(pac_url)
+            else:
+                _apply_live(addr, clear_pac=bool(genuine_pac))
+            _refresh()
+            return genuine_pac
+        except OSError:
+            # Best-effort. If the baseline write failed we never reached the live
+            # overwrite, so the genuine state is intact (an incomplete baseline is
+            # ignored on the next launch).
+            return None
 
 
-def proxy_restore():
+def proxy_restore(session_id=None):
     """Undo SNIper's own proxy change and clear the durable record. This is the
-    single mechanism behind both the graceful stop path and the on-launch
-    self-heal.
+    single mechanism behind every restore: Stop, the session-end and accept-
+    loop fail-safes, the on-launch self-heal and the guardian.
 
     The genuine baseline is written back ONLY when the live proxy is still
     exactly the footprint SNIper applied. If it has diverged (the user changed
@@ -526,23 +702,45 @@ def proxy_restore():
     always replaced by the genuine PAC (or removed); if the user meanwhile
     switched on a manual proxy, that proxy stays and the result is "kept".
 
-    Returns "restored" when the genuine baseline was written back, "kept" when a
-    diverged (user-owned) live proxy was left in place, or None when there was
-    nothing to do (already clean, policy-locked, or the live state could not be
-    read/written).
+    With a session_id (the guardian's), only that session's record is acted
+    on: a record of another session, or an older one without a SessionId, is
+    left completely untouched and the result is "not-ours".
+
+    Returns "restored" when the genuine baseline was written back, "already"
+    when the live proxy was no longer the footprint but already equal to the
+    genuine values (someone restored first; nothing written), "kept" when a
+    diverged (user-owned) live proxy was left in place, "not-ours" as above,
+    or None when there was nothing to do (already clean, policy-locked, or the
+    live state could not be read/written).
     """
     if not IS_WINDOWS:
         return None
-    base = _read_baseline()
-    if base is None:
+    with _state_lock():
+        base = _read_baseline()
+        if base is None:
+            return None
+        if session_id is not None and base.session_id != session_id:
+            return "not-ours"
+        return _restore_unlocked(base)
+
+
+def current_session_id():
+    """The SessionId of the complete restore record, or None when there is
+    no complete record (or it predates sessions). Read under the state lock,
+    so a record half-way through a rewrite is never mistaken for another."""
+    if not IS_WINDOWS:
         return None
-    return _restore(base)
+    with _state_lock():
+        base = _read_baseline()
+    return None if base is None else base.session_id
 
 
 def recover_orphaned_proxy():
     """On launch, before any new session, undo a proxy change stranded by a
     prior ungraceful exit and clear its durable baseline. Returns "restored",
-    "kept", or None (clean state — no false recovery) exactly as proxy_restore.
+    "already", "kept", or None (clean state — no false recovery) exactly as
+    proxy_restore. No session is given: whoever wrote the record, it is
+    stranded now, and this is the only process left to undo it.
     """
     if not IS_WINDOWS:
         return None
