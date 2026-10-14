@@ -20,12 +20,13 @@ crash-durable: a graceful exit restores immediately, while an ungraceful one
 next launch self-heals via recover_orphaned_proxy().
 
 Both sides are footprint-aware. Capture (proxy_enable) never records SNIper's
-own leftover state as the baseline. Restore (proxy_restore, and the launch
-self-heal it backs) writes the genuine baseline back ONLY when the live proxy is
-still exactly the footprint SNIper applied, all remembered durably: in static
-mode the enable flag, the server address and the PAC-cleared state; in safe
-mode the script URL, which holds a random value per session, so it is provably
-SNIper's own. If the live proxy has diverged — the user changed it during the
+own leftover state as the baseline, and refuses outright, writing nothing, when
+a live value is one the record couldn't put back exactly. Restore
+(proxy_restore, and the launch self-heal it backs) writes the genuine baseline
+back ONLY when the live proxy is still exactly the footprint SNIper applied,
+all remembered durably: in static mode the enable flag, the server address and
+the PAC-cleared state; in safe mode the script URL, which holds a random value
+per session, so it is provably SNIper's own. If the live proxy has diverged — the user changed it during the
 session or between a crash and the next launch — SNIper treats the user as
 having taken control: it leaves the live proxy untouched and simply drops the
 durable record. SNIper only ever undoes its own change, never a manual one —
@@ -125,6 +126,13 @@ MODE_PAC    = "pac"
 Baseline = namedtuple("Baseline", "enable server pac_present pac applied_server "
                                   "applied_mode applied_pac_url owner_pid "
                                   "owner_create_time session_id")
+
+
+class UnrecordableProxyValue(ValueError):
+    """proxy_enable refused, having written nothing, because a live proxy
+    value can't be recorded so that a restore puts it back exactly. The
+    message names the value and is fit to show the user."""
+
 
 # WinINet options that make running clients pick up changed proxy settings.
 _INTERNET_OPTION_REFRESH          = 37
@@ -351,14 +359,28 @@ def _write_live_pac_genuine(enable, pac_present, pac):
         winreg.CloseKey(k)
 
 
+def _flag(value):
+    """A ProxyEnable value as the REG_DWORD number it holds, or None when it
+    can't be read as one: a REG_SZ such as "x", REG_BINARY bytes, or a number
+    outside the DWORD range. SNIper only ever writes REG_DWORDs, so None is
+    never a value of SNIper's, and never one it can write back."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if 0 <= n <= 0xFFFFFFFF else None
+
+
 def _is_footprint(live, applied_server, pac_present):
     """True if the live proxy is still EXACTLY what SNIper applied: enabled,
     pointed at the remembered server address, with the PAC in the state SNIper
     left it (emptied when there was a genuine PAC, absent otherwise). An exact
     match against what SNIper actually applied — never a guess from the loopback
-    address — so a manual change of any of these fields reads as 'not mine'."""
+    address — so a manual change of any of these fields reads as 'not mine'.
+    So does an enable flag that can't be read as a number: it isn't the 1
+    SNIper wrote, and SNIper never overwrites a value it can't interpret."""
     live_e, live_s, live_a = live
-    if int(live_e or 0) != 1:
+    if _flag(live_e) != 1:
         return False
     if (live_s or "") != applied_server:
         return False
@@ -395,10 +417,31 @@ def _flag_set(value):
     """True unless a live ProxyEnable reads as 0. A value that can't be read
     as a number counts as set: it is not the 0 safe mode wrote, so it isn't
     SNIper's to change."""
-    try:
-        return int(value) != 0
-    except (TypeError, ValueError):
-        return True
+    return _flag(value) != 0
+
+
+def _check_recordable(enable, server, pac):
+    """Raise UnrecordableProxyValue for the first live value that a record
+    can't hold as SNIper writes it back: a ProxyEnable that _flag can't read,
+    or a ProxyServer / AutoConfigURL that isn't a string (a REG_DWORD,
+    REG_BINARY bytes, a REG_MULTI_SZ list). A missing value is fine: _read_live
+    reads it as 0, "" or None, all of which a record holds."""
+    if _flag(enable) is None:
+        bad = ("ProxyEnable", enable)
+    elif server is not None and not isinstance(server, str):
+        bad = ("ProxyServer", server)
+    elif pac is not None and not isinstance(pac, str):
+        bad = ("AutoConfigURL", pac)
+    else:
+        return
+    shown = repr(bad[1])
+    if len(shown) > 40:
+        shown = shown[:37] + "..."
+    raise UnrecordableProxyValue(
+        "the Windows proxy setting %s holds %s, which SNIper can't save and "
+        "restore exactly, so it changed nothing. Re-save your proxy settings "
+        "in Windows (Settings > Network & internet > Proxy), then start again."
+        % (bad[0], shown))
 
 
 # ── Durable restore baseline ───────────────────────────────────────────────────
@@ -407,7 +450,22 @@ def _read_baseline():
     is none. applied_server is None for a legacy record written before
     footprints were tracked; applied_mode is MODE_STATIC for it and for a
     v1.1.7 record. A baseline missing its commit marker (a crash mid-write) is
-    treated as absent so a half-written record is never acted on."""
+    treated as absent so a half-written record is never acted on.
+
+    A genuine ProxyEnable that is missing, or that can't be read as a DWORD,
+    reads as 0: Windows' own default, no manual proxy. Treating such a
+    committed record as absent instead would be wrong, because Complete says
+    the live values may already be SNIper's: the footprint would be stranded,
+    and the next proxy_enable would capture it as the genuine baseline. The 0
+    goes live only where a sound record would be restored too (over SNIper's
+    own footprint, or for a legacy record), and turns the proxy off, so it
+    fails open; the garbage itself is never written anywhere.
+
+    For the same reasons a genuine ProxyServer or AutoConfigURL that isn't a
+    string reads as "": no server, no script. SNIper only ever records them
+    as REG_SZ, and a restore writes them back as REG_SZ, which takes nothing
+    but a string. AutoConfigURL keeps its present flag, so the static
+    footprint check still expects the PAC that SNIper emptied."""
     if not IS_WINDOWS:
         return None
     try:
@@ -421,12 +479,14 @@ def _read_baseline():
         except OSError:
             return None
         try:
-            enable = int(winreg.QueryValueEx(k, "ProxyEnable")[0])
+            enable = _flag(winreg.QueryValueEx(k, "ProxyEnable")[0]) or 0
         except OSError:
             enable = 0
         try:
             server = winreg.QueryValueEx(k, "ProxyServer")[0]
         except OSError:
+            server = ""
+        if not isinstance(server, str):
             server = ""
         try:
             present = winreg.QueryValueEx(k, "AutoConfigURLPresent")[0]
@@ -438,6 +498,9 @@ def _read_baseline():
                 pac = winreg.QueryValueEx(k, "AutoConfigURL")[0]
             except OSError:
                 present = 0
+            else:
+                if not isinstance(pac, str):
+                    pac = ""
         try:
             applied = winreg.QueryValueEx(k, "AppliedProxyServer")[0]
         except OSError:
@@ -634,6 +697,11 @@ def proxy_enable(addr, pac_url=None, session_id=None):
     values are still the only genuine ones, so they are kept and the record is
     taken over for this mode.
 
+    Capture refuses a live value the record can't hold exactly (see
+    _check_recordable): it raises UnrecordableProxyValue before anything is
+    written, so the proxy is left as found and no record is created. On a
+    mode switch the old record has been restored or released by then.
+
     Returns the genuine PAC URL (or None) so the caller can note that a PAC was
     temporarily disabled.
     """
@@ -660,6 +728,7 @@ def proxy_enable(addr, pac_url=None, session_id=None):
                 # footprint before we get here, so capturing the live state is
                 # correct.)
                 cur_e, cur_s, cur_a = _read_live()
+                _check_recordable(cur_e, cur_s, cur_a)
                 _write_baseline(cur_e, cur_s, cur_a, addr, mode, pac_url,
                                 owner, session_id)
                 genuine_pac = cur_a

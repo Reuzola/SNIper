@@ -24,6 +24,7 @@ from helpers import wait_until
 from sniper.compat import IS_WINDOWS
 from sniper.pac import build_pac
 from sniper.server import ProxyServer, _is_transient_accept_error
+from sniper.winproxy import UnrecordableProxyValue
 
 ERROR_LINE = ("ERROR", "Accept error — proxy stopped unexpectedly.")
 STOPPED_LINE = ("INFO", "Proxy stopped. Windows proxy restored.")
@@ -906,6 +907,18 @@ def test_cancelled_sign_out_reapplies_the_same_mode_and_url(srv, wp, compat):
     assert wp.enables == [srv.addr, srv.addr]
     assert wp.pac_urls == [url, url]
     assert (url is None) == compat
+
+
+def test_cancelled_sign_out_says_why_a_refused_reapply_did_not_happen(srv, wp):
+    srv.start(0, 2, False)
+    srv.session_ending()
+    drain(srv.log_q)
+    wp.enable_exc = UnrecordableProxyValue("ProxyEnable holds 'x'")
+    srv.session_end_cancelled()
+    assert drain(srv.log_q) == [("WARNING", "Sign-out was cancelled, but the "
+                                 "system proxy was not re-applied: ProxyEnable holds 'x'")]
+    assert srv._applied is False
+    assert srv.running  # the server itself is not stopped
 
 
 # ── Backpressure ─────────────────────────────────────────────────────────────

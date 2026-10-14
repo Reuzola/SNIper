@@ -30,8 +30,8 @@ from sniper.guardian import spawn_guardian
 from sniper.pac import build_pac, new_pac_path
 from sniper.proxy import ServeConfig, handle_client
 from sniper.winproxy import (
-    current_session_id, proxy_enable, proxy_restore, recover_orphaned_proxy,
-    _proxy_gpo_locked,
+    UnrecordableProxyValue, current_session_id, proxy_enable, proxy_restore,
+    recover_orphaned_proxy, _proxy_gpo_locked,
 )
 
 # accept() errors that are about one incoming connection or a momentary
@@ -343,7 +343,13 @@ class ProxyServer:
                 suspended = self._suspended_for_session_end
                 self._suspended_for_session_end = False
                 if suspended and self.running:
-                    self._apply_system_proxy()
+                    try:
+                        self._apply_system_proxy()
+                    except UnrecordableProxyValue as e:
+                        self.log_q.put(("WARNING",
+                            "Sign-out was cancelled, but the system proxy was "
+                            "not re-applied: %s" % (e,)))
+                        return
                     self.log_q.put(("INFO",
                         "Sign-out was cancelled — system proxy re-applied."))
             finally:

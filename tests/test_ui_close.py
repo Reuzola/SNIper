@@ -315,6 +315,17 @@ def test_compat_value_reaches_start(app, compat):
     assert app.proxy.starts == [(8881, 2, True, compat)]
 
 
+def test_start_refused_over_a_proxy_value_says_why(app, monkeypatch):
+    from sniper.winproxy import UnrecordableProxyValue
+
+    def refuse(*args, **kwargs):
+        raise UnrecordableProxyValue("ProxyEnable holds 'x'")
+    monkeypatch.setattr(app.proxy, "start", refuse)
+    app._start()
+    assert log_lines(app)[-1].endswith("Could not start proxy: ProxyEnable holds 'x'")
+    assert app._status_text.cget("text") != "Running"
+
+
 def test_compat_row_is_disabled_while_running(app):
     compat_box = app._rows[4]
     app._start()

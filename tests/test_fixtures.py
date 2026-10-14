@@ -244,6 +244,21 @@ def test_fake_reg_state_lock_refuses_reentry(fake_reg):
     assert len(fake_reg.lock_spans) == 1
 
 
+def test_fake_sz_must_be_a_str():
+    # The real SetValueEx raises ValueError for anything but a str or None
+    # (which SNIper never writes), and the code's OSError handlers would not
+    # catch it.
+    fake = FakeWinreg()
+    k = fake.CreateKey(HKCU, RESTORE_KEY)
+    try:
+        fake.SetValueEx(k, "ProxyServer", 0, REG_SZ, "")
+        for bad in (5, b"x", ["x"], None):
+            with pytest.raises(AssertionError):
+                fake.SetValueEx(k, "ProxyServer", 0, REG_SZ, bad)
+    finally:
+        fake.CloseKey(k)
+
+
 def test_fake_qword_must_be_an_unsigned_64_bit_int():
     fake = FakeWinreg()
     k = fake.CreateKey(HKCU, RESTORE_KEY)

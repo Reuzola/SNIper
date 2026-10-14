@@ -7,8 +7,10 @@ registry. It mimics the parts of the real API the code relies on:
 - registry names are case-insensitive: keys and value names are matched
   lower-cased, while each value's spelling is kept for record();
 - a missing key or value raises FileNotFoundError, DeleteKey refuses a key that
-  still has subkeys, and a REG_DWORD (REG_QWORD) write takes only an unsigned
-  32-bit (64-bit) int;
+  still has subkeys, a REG_DWORD (REG_QWORD) write takes only an unsigned
+  32-bit (64-bit) int, and a REG_SZ write only a str (the real call also
+  takes None, which SNIper never writes, and raises ValueError for anything
+  else, which an OSError handler doesn't catch);
 - a handle can only do what it was opened for: OpenKey defaults to KEY_READ,
   CreateKey opens with full access, so writing through a read handle (or
   reading through a write-only one) fails the test instead of passing quietly
@@ -27,7 +29,7 @@ from __future__ import annotations
 # Same numbers as the real winreg constants.
 HKEY_CURRENT_USER  = HKCU = 0x80000001
 HKEY_LOCAL_MACHINE = HKLM = 0x80000002
-REG_SZ, REG_BINARY, REG_DWORD, REG_QWORD = 1, 3, 4, 11
+REG_SZ, REG_BINARY, REG_DWORD, REG_MULTI_SZ, REG_QWORD = 1, 3, 4, 7, 11
 KEY_QUERY_VALUE = 0x0001
 KEY_SET_VALUE   = 0x0002
 KEY_NOTIFY      = 0x0010
@@ -210,6 +212,8 @@ class FakeWinreg:
             assert type(data) is int and 0 <= data <= 0xFFFFFFFF, data
         elif kind == REG_QWORD:
             assert type(data) is int and 0 <= data <= 0xFFFFFFFFFFFFFFFF, data
+        elif kind == REG_SZ:
+            assert type(data) is str, data
         self.ops.append(("SetValueEx", hkey.path, name))
         self.keys[hkey.path][name.lower()] = (data, kind)
         self._names[(id(self.keys), hkey.path, name.lower())] = name

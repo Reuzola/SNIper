@@ -25,6 +25,7 @@ from sniper.resources import ICON_PATH
 from sniper.server import ProxyServer
 from sniper.sessionwatch import SessionEndWatcher
 from sniper.tray import TrayIcon
+from sniper.winproxy import UnrecordableProxyValue
 from sniper.logformat import friendly_format
 from sniper.settings import (
     PORT_MIN, PORT_MAX, FRAGMENT_MIN, FRAGMENT_MAX,
@@ -586,7 +587,7 @@ class App(tk.Tk):
         try:
             self.proxy.start(port, frag, not self._nodoh_var.get(),
                              compat=self._compat_var.get())
-        except OSError as e:
+        except (OSError, UnrecordableProxyValue) as e:
             self._append_friendly("ERROR", f"Could not start proxy: {e}")
             return
         except Exception as e:
