@@ -79,7 +79,8 @@ def fake_reg(monkeypatch):
 # ── Windows integration tests: real-registry sandbox ─────────────────────────
 @pytest.fixture
 def registry_sandbox(monkeypatch):
-    """Redirect every key SNIper uses to HKCU\\Software\\SNIper-pytest-<hex>.
+    """Redirect every key SNIper uses to HKCU\\Software\\SNIper-pytest-<hex>,
+    RunOnce included (<sandbox>\\RunOnce, a plain key Windows never runs).
 
     winproxy's _refresh becomes a no-op (it would make every WinINet client
     reload the real settings) and the Group Policy check reports "not locked"
@@ -96,6 +97,7 @@ def registry_sandbox(monkeypatch):
         monkeypatch.setattr(winproxy, "_IE", box.ie)
         monkeypatch.setattr(winproxy, "_SNIPER_KEY", box.sniper_key)
         monkeypatch.setattr(winproxy, "_RESTORE_KEY", box.restore_key)
+        monkeypatch.setattr(winproxy, "_RUNONCE", box.runonce_key)
         monkeypatch.setattr(winproxy, "_STATE_MUTEX_NAME", box.mutex_name)
         monkeypatch.setattr(winproxy, "_SANDBOXED", True)
         monkeypatch.setattr(winproxy, "_SANDBOX_ROOT", box.root)
@@ -178,7 +180,8 @@ def _real_snapshot():
     return {
         # Absent and empty differ: a missing value is recorded as "<absent>".
         "live": {name: ie.get(name, "<absent>")
-                 for name in ("ProxyEnable", "ProxyServer", "AutoConfigURL")},
+                 for name in ("ProxyEnable", "ProxyServer", "AutoConfigURL",
+                              "ProxyOverride")},
         # The whole SNIper tree: the ProxyRestore record and the user's saved
         # settings alike.
         "sniper": _read_tree(_REAL_SNIPER),

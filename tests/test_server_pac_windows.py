@@ -56,14 +56,15 @@ def test_safe_mode_end_to_end(server, registry_sandbox, genuine):
     box.set_live(*genuine)
     server.start(0, 2, False)
     url = server.pac_url
-    assert box.live() == (0, genuine[1], url)  # ProxyServer untouched
+    # The script, and the manual proxy that bypasses every host.
+    assert box.live_all() == (1, server.addr, url, "*")
     record = box.record()
     assert (record["AppliedMode"], record["AppliedAutoConfigURL"], record["Complete"]) \
         == ("pac", url, 1)
     # The URL in the registry is the one being served.
     assert fetch(box.live()[2]) == build_pac(server.port).encode("ascii")
     server.stop()
-    assert box.live() == genuine
+    assert box.live_all() == genuine + (ABSENT,)
     assert box.record() is None
     assert not box.exists(box.sniper_key)
 
@@ -87,9 +88,9 @@ def test_switching_modes_between_sessions(server, registry_sandbox):
     server.start(0, 2, False, compat=True)
     server.stop()
     server.start(0, 2, False)
-    assert box.live() == (0, CORP[1], server.pac_url)
+    assert box.live_all() == (1, server.addr, server.pac_url, "*")
     server.stop()
-    assert box.live() == CORP
+    assert box.live_all() == CORP + (ABSENT,)
 
 
 @pytest.mark.parametrize("compat", [False, True], ids=["safe", "compat"])
@@ -110,7 +111,7 @@ def test_hard_kill_then_launch_recovery(registry_sandbox, monkeypatch, compat):
     del s  # and no stop()
     assert box.live() == footprint  # stranded
     assert winproxy.recover_orphaned_proxy() == "restored"
-    assert box.live() == CORP
+    assert box.live_all() == CORP + (ABSENT,)
     assert box.record() is None
 
 

@@ -1,10 +1,11 @@
 """The one test that touches the REAL system proxy. Opt-in only.
 
-It proves that Windows honors the legacy AutoConfigURL value safe mode writes:
-with a safe-mode server running against the real keys, WinHTTP must report
-SNIper's script as the user's setup script, with no manual proxy, and its PAC
-engine must route example.com through SNIper. Stop must then leave the real
-values exactly as they were, and Windows' own view of them too.
+It proves that Windows honors the legacy values safe mode writes: with a
+safe-mode server running against the real keys, WinHTTP must report SNIper's
+script as the user's setup script, next to SNIper's manual proxy with a bypass
+list of every host, and its PAC engine must route example.com through SNIper.
+Stop must then leave the real values exactly as they were, and Windows' own
+view of them too.
 
 Skipped unless SNIPER_ALLOW_REAL_PROXY_TESTS=1, and never run without the
 user's consent. The real values are snapshotted first; a finally block writes
@@ -34,7 +35,8 @@ pytestmark = [
 _IE = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 _SNIPER = r"Software\SNIper"
 _RESTORE = r"Software\SNIper\ProxyRestore"
-_NAMES = ("ProxyEnable", "ProxyServer", "AutoConfigURL")
+_RUNONCE = r"Software\Microsoft\Windows\CurrentVersion\RunOnce"
+_NAMES = ("ProxyEnable", "ProxyServer", "AutoConfigURL", "ProxyOverride")
 
 
 def _live():
@@ -100,8 +102,8 @@ def test_windows_honors_the_safe_mode_setup_script():
 
     # Nothing may stand between this test and the real keys, and nothing of
     # SNIper's may already be there to be confused with what the test does.
-    assert winproxy._IE == _IE and winproxy._RESTORE_KEY == _RESTORE, \
-        "winproxy is redirected; refusing to run"
+    assert (winproxy._IE, winproxy._RESTORE_KEY, winproxy._RUNONCE) == \
+        (_IE, _RESTORE, _RUNONCE), "winproxy is redirected; refusing to run"
     if _sniper_running():
         pytest.fail("SNIper is running; close it first", pytrace=False)
     if _exists(_RESTORE):
@@ -123,11 +125,14 @@ def test_windows_honors_the_safe_mode_setup_script():
         windows_during = winhttp_ie_config()
         print("during:", during, windows_during)
         assert during["AutoConfigURL"] == (url, winreg.REG_SZ)
-        assert during["ProxyEnable"] == (0, winreg.REG_DWORD)
-        assert during["ProxyServer"] == before["ProxyServer"]  # never touched
-        # Windows took it: SNIper's script is the setup script, no manual proxy.
+        assert during["ProxyEnable"] == (1, winreg.REG_DWORD)
+        assert during["ProxyServer"] == (server.addr, winreg.REG_SZ)
+        assert during["ProxyOverride"] == ("*", winreg.REG_SZ)
+        # Windows took it: SNIper's script is the setup script, and the manual
+        # proxy it falls back to bypasses every host.
         assert windows_during["auto_config_url"] == url
-        assert windows_during["proxy"] is None
+        assert windows_during["proxy"] == server.addr
+        assert windows_during["proxy_bypass"] == "*"
         # And its PAC engine sends traffic through SNIper.
         result = winhttp_proxy_for_url("https://example.com/",
                                        windows_during["auto_config_url"])

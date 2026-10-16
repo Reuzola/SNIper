@@ -216,7 +216,8 @@ def test_already_back_to_genuine(fake_reg, owner, genuine, pac_url):
     fake_reg.set_live(*genuine)
     winproxy.proxy_enable(ADDR, pac_url=pac_url, session_id=SID)
     assert fake_reg.live() != genuine
-    fake_reg.set_live(*genuine)  # e.g. the guardian restored first
+    # e.g. the guardian restored first (safe mode's bypass list included)
+    fake_reg.set_live(*genuine, override=ABSENT)
     fake_reg.refresh_calls.clear()
     mark = len(fake_reg.ops)
     assert winproxy.proxy_restore(session_id=SID) == "already"
@@ -234,7 +235,7 @@ def test_already_back_to_genuine(fake_reg, owner, genuine, pac_url):
 def test_almost_genuine_is_kept_not_already(fake_reg, owner, pac_url, near):
     fake_reg.set_live(1, "corp:8080", CORP_PAC)
     winproxy.proxy_enable(ADDR, pac_url=pac_url, session_id=SID)
-    fake_reg.set_live(*near)
+    fake_reg.set_live(*near, override=ABSENT)  # only the named value differs
     mark = len(fake_reg.ops)
     assert winproxy.proxy_restore() == "kept"
     assert writes(fake_reg, IE, mark) == []
@@ -265,7 +266,7 @@ def test_footprint_takes_precedence_over_already_pac(fake_reg, owner):
     # became the genuine value): footprint first, so our URL is "restored".
     fake_reg.set_live(0, "", URL)
     winproxy.proxy_enable(ADDR, pac_url=URL, session_id=SID)
-    assert fake_reg.live() == (0, "", URL)
+    assert fake_reg.live() == (1, ADDR, URL)
     mark = len(fake_reg.ops)
     assert winproxy.proxy_restore(session_id=SID) == "restored"
     assert writes(fake_reg, IE, mark)

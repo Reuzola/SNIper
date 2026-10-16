@@ -20,6 +20,8 @@ from sniper.compat import IS_WINDOWS, winreg
 
 # Same "absent value" convention as fakewinreg.ABSENT and winproxy._read_live.
 ABSENT = None
+# set_live: "leave this value as it is", as fakewinreg.KEEP.
+KEEP = object()
 
 SANDBOX_PREFIX = r"Software\SNIper-pytest-"
 _SANDBOX_RX = re.compile(r"^Software\\SNIper-pytest-[0-9a-f]{32}(\\[^\\]+)*$",
@@ -114,6 +116,8 @@ class RegistrySandbox:
         self.sniper_key = self.root + r"\SNIper"
         self.restore_key = self.sniper_key + r"\ProxyRestore"
         self.settings_key = self.sniper_key + r"\Settings"
+        # A plain key standing in for RunOnce: Windows never runs what is in it.
+        self.runonce_key = self.root + r"\RunOnce"
         # Where the self-test owner (guardian --selftest-owner) reports in.
         self.selftest_key = self.root + r"\SelfTest"
         # The state mutex winproxy uses for this sandbox, in this process
@@ -136,12 +140,17 @@ class RegistrySandbox:
         except FileNotFoundError:
             return False
 
-    def set_live(self, enable=0, server="", pac=ABSENT):
+    def set_live(self, enable=0, server="", pac=ABSENT, override=KEEP):
+        """Set the live values; ABSENT removes one. ProxyOverride is left as
+        it is unless override is given."""
         k = winreg.CreateKey(winreg.HKEY_CURRENT_USER, self.ie)
         try:
             for name, data, kind in (("ProxyEnable", enable, winreg.REG_DWORD),
                                      ("ProxyServer", server, winreg.REG_SZ),
-                                     ("AutoConfigURL", pac, winreg.REG_SZ)):
+                                     ("AutoConfigURL", pac, winreg.REG_SZ),
+                                     ("ProxyOverride", override, winreg.REG_SZ)):
+                if data is KEEP:
+                    continue
                 if data is ABSENT:
                     try:
                         winreg.DeleteValue(k, name)
@@ -169,12 +178,21 @@ class RegistrySandbox:
             winreg.CloseKey(k)
 
     def live(self):
+        return self.live_all()[:3]
+
+    def live_all(self):
+        """live() plus ProxyOverride: the four values safe mode writes."""
         vals = self._values(self.ie) or {}
         return (vals.get("ProxyEnable", ABSENT), vals.get("ProxyServer", ABSENT),
-                vals.get("AutoConfigURL", ABSENT))
+                vals.get("AutoConfigURL", ABSENT), vals.get("ProxyOverride", ABSENT))
 
     def record(self):
         return self._values(self.restore_key)
+
+    def runonce(self):
+        """{name: command} in the sandbox's RunOnce, or None if it doesn't
+        exist yet."""
+        return self._values(self.runonce_key)
 
     def selftest(self):
         """What the self-test owner reported, or None before it started."""

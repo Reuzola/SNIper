@@ -26,6 +26,7 @@ DEFAULTS = {
     "ie": r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
     "sniper": r"Software\SNIper",
     "restore": r"Software\SNIper\ProxyRestore",
+    "runonce": r"Software\Microsoft\Windows\CurrentVersion\RunOnce",
     "mutex": "SNIper_proxy_state",
     "sandboxed": False,
     "root": None,
@@ -42,7 +43,7 @@ w._internet_set_option = lambda *a: calls.append(a) or 1
 w.IS_WINDOWS = True
 w._refresh()
 state = {"ie": w._IE, "sniper": w._SNIPER_KEY, "restore": w._RESTORE_KEY,
-         "mutex": w._STATE_MUTEX_NAME, "sandboxed": w._SANDBOXED,
+         "runonce": w._RUNONCE, "mutex": w._STATE_MUTEX_NAME, "sandboxed": w._SANDBOXED,
          "root": w._SANDBOX_ROOT, "refreshed": bool(calls)}
 if w._SANDBOXED:
     w.winreg = None  # the Group Policy check must not even look
@@ -69,6 +70,7 @@ def test_a_valid_sandbox_redirects_everything():
         "ie": VALID + r"\Internet Settings",
         "sniper": VALID + r"\SNIper",
         "restore": VALID + r"\SNIper\ProxyRestore",
+        "runonce": VALID + r"\RunOnce",   # a plain key Windows never runs
         "mutex": "SNIper_proxy_state_" + HEX,
         "sandboxed": True,
         "root": VALID,
@@ -80,8 +82,9 @@ def test_a_valid_sandbox_redirects_everything():
 def test_the_layout_matches_the_registry_sandbox_fixture(registry_sandbox):
     box = registry_sandbox
     state = probe(box.root)
-    assert (state["ie"], state["sniper"], state["restore"], state["mutex"]) == \
-        (box.ie, box.sniper_key, box.restore_key, box.mutex_name)
+    assert (state["ie"], state["sniper"], state["restore"], state["runonce"],
+            state["mutex"]) == \
+        (box.ie, box.sniper_key, box.restore_key, box.runonce_key, box.mutex_name)
     assert box.env == {"SNIPER_REGISTRY_SANDBOX": box.root}
 
 

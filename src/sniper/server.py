@@ -2,9 +2,11 @@
 toggles the Windows system proxy.
 
 A session runs in safe mode by default: the system proxy names a PAC script
-this server serves itself on its own port (see sniper.pac), so a dead SNIper
-means direct internet rather than none. Compatibility mode points the system
-proxy at the port directly instead, as v1.1.7 did.
+this server serves itself on its own port (see sniper.pac), next to a manual
+proxy that bypasses every host for all but the apps that read nothing else
+(see sniper.winproxy), so a dead SNIper means direct internet rather than none.
+Compatibility mode points the system proxy at the port directly instead, as
+v1.1.7 did.
 
 Whatever ends a session, the system proxy is put back through the one restore
 mechanism, winproxy.proxy_restore(): Stop and window close call stop(), which
@@ -250,7 +252,7 @@ class ProxyServer:
             # Records the genuine baseline durably before overwriting the live
             # values; returns the genuine PAC (or None).
             old_a = proxy_enable(self.addr, pac_url=self.pac_url,
-                                 session_id=self.session_id)
+                                 session_id=self.session_id, log_q=self.log_q)
             self._applied = True
             self._start_guardian()
             return old_a

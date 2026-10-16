@@ -6,8 +6,8 @@ registry. It mimics the parts of the real API the code relies on:
 
 - registry names are case-insensitive: keys and value names are matched
   lower-cased, while each value's spelling is kept for record();
-- a missing key or value raises FileNotFoundError, DeleteKey refuses a key that
-  still has subkeys, a REG_DWORD (REG_QWORD) write takes only an unsigned
+- a missing key or value raises FileNotFoundError, EnumValue past the last
+  value raises OSError, DeleteKey refuses a key that still has subkeys, a REG_DWORD (REG_QWORD) write takes only an unsigned
   32-bit (64-bit) int, and a REG_SZ write only a str (the real call also
   takes None, which SNIper never writes, and raises ValueError for anything
   else, which an OSError handler doesn't catch);
@@ -41,12 +41,15 @@ KEY_ALL_ACCESS  = 0xF003F
 # missing AutoConfigURL as None, so live() tuples compare directly with what
 # the code under test returns, and absent stays distinct from "" (empty).
 ABSENT = None
+# set_live: "leave this value as it is".
+KEEP = object()
 
 IE_KEY      = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 IE_POLICY   = r"Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings"
 SNIPER_KEY  = r"Software\SNIper"
 RESTORE_KEY = r"Software\SNIper\ProxyRestore"
 SETTINGS_KEY = r"Software\SNIper\Settings"
+RUNONCE_KEY = r"Software\Microsoft\Windows\CurrentVersion\RunOnce"
 
 _HKLM_PREFIX = "hklm\\"
 _NO_WRITE = "SNIper must never write outside HKCU"
@@ -96,12 +99,16 @@ class FakeWinreg:
         self._put(self.hklm, IE_POLICY, "ProxySettingsPerUser",
                   0 if locked else 1, REG_DWORD)
 
-    def set_live(self, enable=0, server="", pac=ABSENT):
-        """Set the live Internet Settings values; ABSENT removes one."""
+    def set_live(self, enable=0, server="", pac=ABSENT, override=KEEP):
+        """Set the live Internet Settings values; ABSENT removes one.
+        ProxyOverride is left as it is unless override is given."""
         self.put(IE_KEY)
         for name, data, kind in (("ProxyEnable", enable, REG_DWORD),
                                  ("ProxyServer", server, REG_SZ),
-                                 ("AutoConfigURL", pac, REG_SZ)):
+                                 ("AutoConfigURL", pac, REG_SZ),
+                                 ("ProxyOverride", override, REG_SZ)):
+            if data is KEEP:
+                continue
             if data is ABSENT:
                 self.keys[IE_KEY.lower()].pop(name.lower(), None)
             else:
@@ -110,12 +117,17 @@ class FakeWinreg:
     def live(self):
         """(ProxyEnable, ProxyServer, AutoConfigURL) as stored, ABSENT for a
         missing value."""
+        return self.live_all()[:3]
+
+    def live_all(self):
+        """live() plus ProxyOverride: the four values safe mode writes."""
         vals = self.keys.get(IE_KEY.lower(), {})
 
         def get(name):
             entry = vals.get(name.lower())
             return ABSENT if entry is None else entry[0]
-        return get("ProxyEnable"), get("ProxyServer"), get("AutoConfigURL")
+        return (get("ProxyEnable"), get("ProxyServer"), get("AutoConfigURL"),
+                get("ProxyOverride"))
 
     def record(self, types=False):
         """The ProxyRestore values as {name: data} ({name: (data, kind)} with
@@ -125,6 +137,15 @@ class FakeWinreg:
             return None
         return {self._names.get((id(self.keys), path, lname), lname):
                 (entry if types else entry[0])
+                for lname, entry in self.keys[path].items()}
+
+    def runonce(self):
+        """The RunOnce values as {name: (data, kind)}, or None when the key
+        doesn't exist."""
+        path = RUNONCE_KEY.lower()
+        if path not in self.keys:
+            return None
+        return {self._names.get((id(self.keys), path, lname), lname): entry
                 for lname, entry in self.keys[path].items()}
 
     def ie_writes(self):
@@ -227,6 +248,19 @@ class FakeWinreg:
             raise self._missing()
         self.ops.append(("DeleteValue", hkey.path, name))
         del values[name.lower()]
+
+    def EnumValue(self, hkey, index):
+        """(name, data, kind) of the index-th value, in the order the values
+        were created, with the name's own spelling. Past the last value it
+        raises OSError, as the real call does (ERROR_NO_MORE_ITEMS)."""
+        self._check_open(hkey, KEY_QUERY_VALUE, "EnumValue")
+        self._call("EnumValue", hkey.path)
+        store, path = self._store(hkey), self._local(hkey)
+        items = list(store[path].items())
+        if not 0 <= index < len(items):
+            raise OSError(259, "No more data is available")
+        lname, (data, kind) = items[index]
+        return self._names.get((id(store), path, lname), lname), data, kind
 
     def QueryInfoKey(self, hkey):
         self._check_open(hkey, KEY_QUERY_VALUE, "QueryInfoKey")

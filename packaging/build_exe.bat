@@ -106,13 +106,18 @@ echo Interpreter  : %PY%  ^(python machine = %ARCH%^)
 echo Target EXE   : %APPNAME%.exe
 echo.
 
-rem ---- Ensure PyInstaller is available -------------------------------------
-%PY% -m PyInstaller --version >nul 2>&1
+rem ---- Ensure PyInstaller 6.9 or later 6.x is available -------------------
+rem  The safety guard relies on PYINSTALLER_RESET_ENVIRONMENT: a guardian
+rem  started by a frozen SNIper must unpack to its own _MEI directory, not
+rem  reuse SNIper's, which is deleted the moment SNIper dies. PyInstaller
+rem  documents that meaning from 6.9 on, so an older 6.x is not enough. The
+rem  major version stays pinned too: a future 7.x could change CLI flags or
+rem  hooks and break this build without warning. A missing or out-of-range
+rem  PyInstaller is installed into the range.
+%PY% -c "import sys,PyInstaller as P;v=tuple(int(x) for x in P.__version__.split('.')[:2]);sys.exit(0 if (6,9)<=v<(7,0) else 1)" >nul 2>&1
 if errorlevel 1 (
-    echo PyInstaller not found - installing ...
-    rem  Pin the major version: a future PyInstaller 7.x could change CLI
-    rem  flags or hooks and break this build without warning.
-    %PY% -m pip install "pyinstaller>=6.0,<7.0"
+    echo PyInstaller 6.9 or later 6.x not found - installing ...
+    %PY% -m pip install "pyinstaller>=6.9,<7.0"
     if errorlevel 1 (
         echo [ERROR] PyInstaller installation failed.
         goto :fail

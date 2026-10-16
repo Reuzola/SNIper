@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.2.0 - 2026-10-16
+
+Whatever happens to SNIper, your internet keeps working, without you doing anything.
+
+- **Your internet never breaks because of SNIper.** SNIper now points Windows at a small setup script, and its fixed proxy lets every site go direct when SNIper isn't there. If SNIper is closed unexpectedly, crashes, the PC loses power, or the app is deleted, apps simply connect directly. You no longer need to open SNIper again to get your internet back.
+- **A notification when something went wrong.** If SNIper is ended from Task Manager or crashes, a small safety guard puts your proxy settings back at once and tells you: "SNIper closed unexpectedly. Your internet settings were restored automatically."
+- **Windows shutdown, restart and sign-out are handled.** Even when SNIper is hidden in the tray, your settings are restored before Windows closes it, so your internet works the next time you sign in.
+- **Discord keeps working.** The Discord desktop app goes through SNIper in the default mode too, with no setting to change. As before, restart Discord if it was already open when you pressed Start. If the PC loses power while SNIper runs, open SNIper once before Discord to put your settings back.
+- **New "Compatibility mode" setting.** For apps that still don't go through SNIper in the default mode. Turn this on to give them a fixed proxy as before. It is off by default. In this mode, if the PC loses power while SNIper runs, your settings are restored at your next sign-in.
+- **No more stuck "Running" after the proxy stops by itself.** If the proxy stops unexpectedly, SNIper now restores your settings, shows Stopped, and Start works again right away. Before, the window could keep saying Running while your settings pointed at a proxy that no longer answered.
+- **Long sessions stay responsive.** The activity log keeps the latest 2,000 lines, so SNIper stays quick even after days in the tray.
+
+Your saved settings carry over, and settings left behind by an earlier version are still restored on the first launch.
+
+---
+
 ## v1.1.7 - 2026-10-03
 
 SNIper can now remember your settings between launches, as suggested in [#1](https://github.com/Reuzola/SNIper/issues/1).

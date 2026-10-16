@@ -1,12 +1,13 @@
 """The proxy auto-config (PAC) script behind safe mode.
 
-In safe mode the Windows proxy is not pointed at SNIper directly. It names a
-PAC script that SNIper serves itself, and the script answers
-"PROXY 127.0.0.1:<port>; DIRECT". While SNIper runs, traffic goes through it.
-Once SNIper is gone, nothing has to run for the internet to keep working: a
-client that already loaded the script finds the proxy refusing connections and
-falls back to the trailing DIRECT, and a client that (re)fetches the script
-cannot download it, which for a non-mandatory PAC also means DIRECT.
+In safe mode the Windows proxy names a PAC script that SNIper serves itself,
+and the script answers "PROXY 127.0.0.1:<port>; DIRECT". While SNIper runs,
+traffic goes through it. Once SNIper is gone, nothing has to run for the
+internet to keep working: a client that already loaded the script finds the
+proxy refusing connections and falls back to the trailing DIRECT, and a client
+that (re)fetches the script cannot download it and falls back to the manual
+proxy safe mode sets next to it, whose bypass list ("*") sends every host
+DIRECT (see sniper.winproxy).
 
 Every session gets a new random script path, so each session's URL is unique:
 clients notice the change at once, and the restore can tell exactly whether

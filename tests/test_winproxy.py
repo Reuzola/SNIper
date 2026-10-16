@@ -518,8 +518,9 @@ def test_mode_switch_refuses_after_the_old_record_backs_off(fake_reg, first, the
         assert fake_reg.live() == ("x", ADDR, ABSENT)
         assert _writes(fake_reg, IE, mark) == []
     else:
-        # Safe: our one-off script URL went, as it always does; nothing else.
-        assert fake_reg.live() == ("x", "", ABSENT)
+        # Safe: our one-off script URL went, as it always does; the manual
+        # proxy, whose flag the user changed, stays as found.
+        assert fake_reg.live_all() == ("x", ADDR, ABSENT, "*")
         assert _writes(fake_reg, IE, mark) == [("DeleteValue", IE, "AutoConfigURL")]
     assert winproxy.proxy_restore() is None
 
@@ -547,11 +548,10 @@ def test_unwritable_recorded_server_reads_as_empty(fake_reg, pac_url, data, reg_
     fake_reg.put(RESTORE_KEY, "ProxyServer", data, reg_type)
     assert winproxy._read_baseline().server == ""
     assert winproxy.proxy_restore() == "restored"
-    # Static mode writes the "" back as a real REG_SZ; safe mode never
-    # touched ProxyServer, so the user's own stays.
-    server = "" if pac_url is None else "corp:8080"
-    assert fake_reg.value(IE_KEY, "ProxyServer") == (server, REG_SZ)
-    assert fake_reg.live() == (0, server, ABSENT)
+    # Both modes wrote SNIper's address there, so both write the "" back as a
+    # real REG_SZ.
+    assert fake_reg.value(IE_KEY, "ProxyServer") == ("", REG_SZ)
+    assert fake_reg.live() == (0, "", ABSENT)
     assert fake_reg.record() is None
 
 

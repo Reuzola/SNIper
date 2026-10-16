@@ -51,6 +51,7 @@ class WinproxyRecorder:
         self.ops = []
         self.pac_urls = []      # the pac_url of each enable, in order
         self.session_ids = []   # the session_id of each enable, in order
+        self.log_qs = []        # the log_q of each enable, in order
         self.lock = threading.Lock()
         self.restore_result = None
         self.restore_exc = None
@@ -63,11 +64,12 @@ class WinproxyRecorder:
         with self.lock:
             self.ops.append(op)
 
-    def enable(self, addr, pac_url=None, session_id=None):
+    def enable(self, addr, pac_url=None, session_id=None, log_q=None):
         self._log("enable", addr)
         with self.lock:
             self.pac_urls.append(pac_url)
             self.session_ids.append(session_id)
+            self.log_qs.append(log_q)
         if self.enable_hook:
             self.enable_hook(addr)
         if self.enable_exc:
@@ -1195,3 +1197,15 @@ def test_new_lines_read_well_in_the_friendly_log():
     from sniper.logformat import friendly_format
     for line in (NO_GUARD_LINE, ALREADY_LINE):
         assert friendly_format(*line) == line
+
+
+# ── The RunOnce safety net's notes (Step 4) ──────────────────────────────────
+@pytest.mark.parametrize("compat", [False, True])
+def test_every_apply_hands_winproxy_the_log(srv, wp, compat):
+    # winproxy says through this queue which genuine values the sign-in
+    # safety net had to leave out: Start and the cancelled-sign-out re-apply.
+    srv.start(0, 2, False, compat=compat)
+    srv.session_ending()
+    srv.session_end_cancelled()
+    assert len(wp.log_qs) == 2
+    assert all(q is srv.log_q for q in wp.log_qs)

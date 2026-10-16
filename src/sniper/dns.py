@@ -17,6 +17,7 @@ import struct
 import random
 from collections import OrderedDict
 
+from sniper import __version__
 from sniper.config import (
     DOH_SERVERS,
     PLAIN_DNS_SERVERS,
@@ -37,6 +38,10 @@ def _is_ip(h):
         except (OSError, ValueError):
             pass
     return False
+
+# Sent with every DoH request. Built from the package version, so a release
+# never ships an old version number here.
+_DOH_USER_AGENT = "Mozilla/5.0 SNIper/" + __version__
 
 _doh_ssl_ctx = ssl.create_default_context()
 try:
@@ -671,7 +676,7 @@ def _doh_lookup(hostname, qtype_name, qtype_num, log_q, deadline=None):
                 server_ip, f"{path}?dns={b64}",
                 headers={
                     "Accept":     "application/dns-message",
-                    "User-Agent": "Mozilla/5.0 SNIper/1.1.7",
+                    "User-Agent": _DOH_USER_AGENT,
                 },
                 timeout=timeout,
             )

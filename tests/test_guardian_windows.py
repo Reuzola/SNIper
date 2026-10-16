@@ -34,6 +34,8 @@ if IS_WINDOWS:
 
 _SRC = os.path.dirname(os.path.dirname(os.path.abspath(winproxy.__file__)))
 GENUINE = (0, "", ABSENT)
+# The same with ProxyOverride, which safe mode writes too.
+GENUINE_ALL = GENUINE + (ABSENT,)
 RESTORE_TIMEOUT = 15
 # The graceful case stops on its own after this many seconds. Long enough for
 # the (about 1 s) process query to find the guardian first, so its exit code
@@ -135,9 +137,17 @@ def test_hard_kill_restores_within_seconds(run, registry_sandbox, mode):
     box = registry_sandbox
     owner, info = run.start_owner(mode)
     if mode == "safe":
-        assert box.live()[:2] == (0, "") and box.live()[2].startswith(pac_url(info["Port"]))
+        e, s, a, o = box.live_all()
+        assert (e, s, o) == (1, "127.0.0.1:%d" % info["Port"], "*")
+        assert a.startswith(pac_url(info["Port"]))
+        assert not box.runonce()  # safe mode never writes the sign-in net
     else:
         assert box.live() == (1, "127.0.0.1:%d" % info["Port"], ABSENT)
+        # The owner's winproxy wrote the sign-in net into the sandbox (the
+        # environment redirects RunOnce too), aimed at the sandbox's key.
+        net = box.runonce()
+        assert set(net) == {"SNIperRestoreProxyEnable", "SNIperRestoreProxyServer"}
+        assert all(('"HKCU\\%s"' % box.ie) in command for command in net.values())
     assert box.record()["SessionId"] == info["SessionId"]
     _, handle = run.guardian(info["SessionId"])
     run.assert_watching(handle, box.live())
@@ -145,9 +155,10 @@ def test_hard_kill_restores_within_seconds(run, registry_sandbox, mode):
     owner.kill()  # TerminateProcess: no code of the owner's runs any more
     assert run.exit_code(handle) == 10
     print("%s: restored %.3f s after the kill" % (mode, time.perf_counter() - killed))
-    assert box.live() == GENUINE
+    assert box.live_all() == GENUINE_ALL
     assert box.record() is None
     assert not box.exists(box.sniper_key)
+    assert not box.runonce()  # the guardian's clear took the net with it
 
 
 # ── 3. Graceful stop ─────────────────────────────────────────────────────────
@@ -161,7 +172,7 @@ def test_graceful_stop_lets_the_guardian_leave_quietly(run, registry_sandbox, mo
     assert owner.wait(GRACEFUL_STOP_AFTER + 30) == 0
     assert box.selftest().get("Stopped") == 1
     assert run.exit_code(handle, timeout=10) == 0
-    assert box.live() == GENUINE
+    assert box.live_all() == GENUINE_ALL
     assert box.record() is None
 
 
@@ -180,7 +191,12 @@ def test_a_user_change_is_kept(run, registry_sandbox, mode):
     run.assert_watching(handle, user)
     owner.kill()
     assert run.exit_code(handle) == 11
-    assert box.live() == user
+    if mode == "safe":
+        # Their script stays; SNIper's manual proxy, which they left alone,
+        # goes back.
+        assert box.live_all() == (0, "", user[2], ABSENT)
+    else:
+        assert box.live() == user
     assert box.record() is None
 
 
@@ -222,14 +238,14 @@ def test_owner_already_dead_when_the_guardian_starts(run, registry_sandbox, monk
     winproxy.proxy_enable("127.0.0.1:1", pac_url=url, session_id=sid)
     monkeypatch.undo()  # only the record was meant to name the dead child
     assert box.record()["OwnerPid"] == identity[0]
-    assert box.live() == (0, "", url)
+    assert box.live_all() == (1, "127.0.0.1:1", url, "*")
     run.sessions.add(sid)
     guard = subprocess.run([sys.executable, "-m", "sniper", "--guard", str(identity[0]),
                             str(identity[1]), sid], env=run.env, timeout=60,
                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                            stderr=subprocess.PIPE)
     assert guard.returncode == 10, guard.stderr
-    assert box.live() == GENUINE
+    assert box.live_all() == GENUINE_ALL
     assert box.record() is None
 
 
@@ -303,7 +319,7 @@ def test_stop_and_start_cycles_leave_no_guardian_behind(run, registry_sandbox, l
         run.assert_watching(handle, box.live())
         live_owner.stop()
         assert run.exit_code(handle, timeout=10) == 0
-        assert box.live() == GENUINE
+        assert box.live_all() == GENUINE_ALL
         assert not guard_processes(sid)
 
 
@@ -315,7 +331,7 @@ def test_cancelled_sign_out_hands_over_to_a_new_guardian(run, registry_sandbox,
     _, first_handle = run.guardian(first)
     live_owner.session_ending()        # WM_QUERYENDSESSION: restored
     assert run.exit_code(first_handle, timeout=10) == 0
-    assert box.live() == GENUINE
+    assert box.live_all() == GENUINE_ALL
     live_owner.session_end_cancelled()  # WM_ENDSESSION(FALSE): re-applied
     second = live_owner.session_id
     assert second != first
@@ -323,7 +339,7 @@ def test_cancelled_sign_out_hands_over_to_a_new_guardian(run, registry_sandbox,
     run.assert_watching(second_handle, box.live())
     live_owner.stop()
     assert run.exit_code(second_handle, timeout=10) == 0
-    assert box.live() == GENUINE
+    assert box.live_all() == GENUINE_ALL
 
 
 # ── 7. Tree kill ─────────────────────────────────────────────────────────────
@@ -340,7 +356,7 @@ def test_the_guardian_survives_a_tree_kill(run, registry_sandbox):
     assert result.returncode == 0, result.stderr
     owner.wait(30)
     assert run.exit_code(handle) == 10
-    assert box.live() == GENUINE
+    assert box.live_all() == GENUINE_ALL
     assert box.record() is None
 
 
@@ -358,6 +374,9 @@ def test_with_the_guardian_killed_first_launch_recovery_restores(run, registry_s
     owner.wait(30)
     assert box.live() == footprint     # stranded: nobody is left to restore
     assert box.record() == record
+    # ...except the sign-in net (test_runonce_windows.py runs it for real).
+    assert set(box.runonce()) == {"SNIperRestoreProxyEnable", "SNIperRestoreProxyServer"}
     assert winproxy.recover_orphaned_proxy() == "restored"
-    assert box.live() == GENUINE
+    assert box.live_all() == GENUINE_ALL
     assert box.record() is None
+    assert not box.runonce()

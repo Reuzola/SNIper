@@ -24,7 +24,8 @@ KEYS = {"live", "winhttp_ie_config", "record", "owner", "guardians", "runonce",
 HARMLESS = "STRANDED (harmless: fail-open PAC)"
 GUARDED = "SNIPER ACTIVE (guarded)"
 UNGUARDED = "SNIPER ACTIVE (no guardian)"
-VERDICTS = {"CLEAN", GUARDED, UNGUARDED, "STRANDED", HARMLESS, "UNKNOWN"}
+STALE = "CLEAN (stale record — removed on next launch)"
+VERDICTS = {"CLEAN", STALE, GUARDED, UNGUARDED, "STRANDED", HARMLESS, "UNKNOWN"}
 
 
 @pytest.fixture(scope="module")
@@ -96,6 +97,10 @@ RECORD = {"ProxyEnable": 0, "ProxyServer": "", "AutoConfigURLPresent": 0,
 PAC_URL = "http://127.0.0.1:8881/sniper-0123456789abcdef.pac"
 PAC_LIVE = dict(CLEAN_LIVE, ProxyServer="", AutoConfigURL=PAC_URL)
 PAC_RECORD = dict(RECORD, AppliedMode="pac", AppliedAutoConfigURL=PAC_URL)
+# Safe mode as it is now: the script next to a manual proxy bypassing every host.
+SAFE_LIVE = dict(PAC_LIVE, ProxyEnable=1, ProxyServer="127.0.0.1:8881",
+                 ProxyOverride="*")
+SAFE_RECORD = dict(PAC_RECORD, ProxyOverridePresent=0, AppliedManualProxy=1)
 SNIPER_PROC = {"pid": 1, "name": "SNIper_x64.exe", "command_line": "x", "is_sniper": True}
 OTHER_PROC = {"pid": 2, "name": "Code.exe", "command_line": r"C:\SNIper", "is_sniper": False}
 
@@ -120,9 +125,19 @@ OTHER_PROC = {"pid": 2, "name": "Code.exe", "command_line": r"C:\SNIper", "is_sn
     (CLEAN_LIVE, PAC_RECORD, [], "STRANDED"),     # record without a footprint
     # A manual proxy of the user's own is what a dead script falls back to.
     (dict(PAC_LIVE, ProxyEnable=1, ProxyServer="corp:8080"), None, [], HARMLESS),
-    # SNIper's static proxy is enabled too: that one is not harmless.
+    # SNIper's static proxy is enabled too: that one is not harmless...
     (dict(PAC_LIVE, ProxyEnable=1, ProxyServer="127.0.0.1:8881"), PAC_RECORD, [],
      "STRANDED"),
+    (dict(PAC_LIVE, ProxyEnable=1, ProxyServer="127.0.0.1:8881",
+          ProxyOverride="<local>"), PAC_RECORD, [], "STRANDED"),
+    # ...unless it bypasses every host, as safe mode's own manual proxy does.
+    (SAFE_LIVE, SAFE_RECORD, [OTHER_PROC], HARMLESS),
+    (SAFE_LIVE, None, [], HARMLESS),
+    (SAFE_LIVE, SAFE_RECORD, [SNIPER_PROC], UNGUARDED),
+    # The bypass list alone is no footprint at all.
+    (dict(CLEAN_LIVE, ProxyOverride="*"), None, [], "CLEAN"),
+    # Without the script, SNIper's static proxy is what apps use: stranded.
+    (dict(SAFE_LIVE, AutoConfigURL=None), None, [], "STRANDED"),
     # Setup scripts that are not SNIper's.
     (dict(CLEAN_LIVE, AutoConfigURL="http://127.0.0.1:8881/proxy.pac"), None, [], "CLEAN"),
     (dict(CLEAN_LIVE, AutoConfigURL="http://127.0.0.1:8881/sniper-0123.pac"), None, [],
@@ -158,6 +173,7 @@ def test_is_sniper_process(tool, name, cmd, expected):
 @pytest.mark.parametrize("record, expected", [
     (None, None),
     (PAC_RECORD, "safe mode (auto-config script)"),
+    (SAFE_RECORD, "safe mode (auto-config script + manual proxy bypassing every host)"),
     (dict(RECORD, AppliedMode="static"), "Compatibility mode (static proxy)"),
     (RECORD, "static proxy (record from v1.1.7)"),
     ({"ProxyEnable": 1, "ProxyServer": "corp:8080", "Complete": 1},
@@ -215,6 +231,21 @@ def test_render_marks_the_safe_mode_script_and_the_record_mode(tool):
     # Another tool's setup script gets no such label.
     state["live"] = dict(CLEAN_LIVE, AutoConfigURL="http://corp/p.pac")
     assert "SNIper safe-mode script" not in tool.render(state)
+
+
+def test_render_marks_the_bypass_all_list(tool):
+    state = {
+        "live": SAFE_LIVE, "record": SAFE_RECORD, "runonce": {},
+        "winhttp_ie_config": {"auto_detect": False, "auto_config_url": PAC_URL,
+                              "proxy": "127.0.0.1:8881", "proxy_bypass": "*"},
+        "processes": [], "verdict": HARMLESS,
+    }
+    text = tool.render(state)
+    assert 'ProxyOverride   "*"  (bypasses every host)' in text
+    assert ("  Mode: safe mode (auto-config script + manual proxy bypassing "
+            "every host)") in text
+    state["live"] = dict(SAFE_LIVE, ProxyOverride="<local>")
+    assert "bypasses every host)" not in tool.render(state).split("Mode:")[0]
 
 
 # ── Owner and guardian (Step 3) ──────────────────────────────────────────────
@@ -305,6 +336,113 @@ def test_render_shows_owner_guardian_and_roles(tool):
     text = tool.render(state)
     assert "Owner: not recorded (a record from before v1.2)" in text
     assert "Safety guard" not in text
+
+
+# ── A stale record (Step 4) ──────────────────────────────────────────────────
+# What the sign-in safety net leaves after it ran: a complete static record
+# whose genuine values are live again, and no SNIper anywhere.
+GENUINE_LIVE = {"ProxyEnable": 1, "ProxyServer": "corp:8080", "ProxyOverride": None,
+                "AutoConfigURL": "http://corp/p.pac"}
+STALE_RECORD = dict(OWNED_RECORD, AppliedMode="static", ProxyEnable=1,
+                    ProxyServer="corp:8080", AutoConfigURLPresent=1,
+                    AutoConfigURL="http://corp/p.pac")
+del STALE_RECORD["AppliedAutoConfigURL"]
+
+
+@pytest.mark.parametrize("live, record, processes, expected", [
+    (GENUINE_LIVE, STALE_RECORD, [], STALE),
+    (GENUINE_LIVE, STALE_RECORD, [OTHER_PROC, GUARD], STALE),      # helpers aren't SNIper
+    (CLEAN_LIVE, dict(RECORD, ProxyServer="127.0.0.1:8881"), [], STALE),   # v1.1.7
+    (dict(CLEAN_LIVE, ProxyEnable=None), RECORD, [], "STRANDED"),   # "" vs 127.0.0.1:8881
+    (dict(CLEAN_LIVE, ProxyServer="", ProxyEnable=None), RECORD, [], STALE),  # absent = 0
+    ({"ProxyEnable": 0, "ProxyServer": "", "ProxyOverride": None, "AutoConfigURL": None},
+     {"ProxyEnable": 0, "ProxyServer": "", "Complete": 1}, [], STALE),       # legacy
+    (dict(PAC_LIVE, AutoConfigURL=None), PAC_RECORD, [], STALE),    # safe mode, URL gone
+    # Not stale: SNIper runs, the record is incomplete, the state is unknown,
+    # or the live values differ from the genuine ones in any way.
+    (GENUINE_LIVE, STALE_RECORD, [SNIPER_PROC], UNGUARDED),
+    (GENUINE_LIVE, dict(STALE_RECORD, Complete=0), [], "STRANDED"),
+    (GENUINE_LIVE, {k: v for k, v in STALE_RECORD.items() if k != "Complete"}, [],
+     "STRANDED"),
+    (GENUINE_LIVE, STALE_RECORD, None, "UNKNOWN"),
+    (dict(GENUINE_LIVE, AutoConfigURL=""), STALE_RECORD, [], "STRANDED"),
+    (dict(GENUINE_LIVE, AutoConfigURL=None), STALE_RECORD, [], "STRANDED"),
+    (dict(GENUINE_LIVE, ProxyEnable=0), STALE_RECORD, [], "STRANDED"),
+    (dict(GENUINE_LIVE, ProxyEnable="x"), STALE_RECORD, [], "STRANDED"),
+    (dict(GENUINE_LIVE, ProxyServer="corp:8081"), STALE_RECORD, [], "STRANDED"),
+    (dict(GENUINE_LIVE, AutoConfigURL="http://corp/other.pac"), STALE_RECORD, [],
+     "STRANDED"),
+    (dict(CLEAN_LIVE, ProxyServer="", AutoConfigURL=""), dict(RECORD, ProxyServer=""), [],
+     "STRANDED"),                                                   # empty is not absent
+    # Garbage in the record reads as winproxy reads it: 0, "" and no script.
+    (dict(CLEAN_LIVE, ProxyServer=""), dict(RECORD, ProxyEnable="zz", ProxyServer=5), [],
+     STALE),
+    (dict(CLEAN_LIVE, ProxyServer=""), dict(RECORD, ProxyServer="", AutoConfigURLPresent=1),
+     [], STALE),                                                    # present, but no URL
+], ids=["static", "with-helpers", "v117", "v117-differs", "absent-enable", "legacy",
+        "safe-mode", "sniper-runs", "incomplete", "no-complete", "unknown",
+        "empty-vs-genuine-pac", "absent-vs-genuine-pac", "enable-differs",
+        "unreadable-enable", "server-differs", "pac-differs", "empty-vs-absent",
+        "garbage-record", "present-flag-without-url"])
+def test_a_record_the_live_settings_already_match_is_stale(tool, live, record,
+                                                           processes, expected):
+    assert tool.verdict(live, record, processes) == expected
+
+
+# A safe-mode record with the manual proxy also holds the genuine bypass list,
+# which winproxy's "already" check compares too.
+BACK_LIVE = dict(CLEAN_LIVE, ProxyServer="")   # SAFE_RECORD's genuine values
+
+
+@pytest.mark.parametrize("live, record, expected", [
+    (BACK_LIVE, SAFE_RECORD, STALE),
+    (dict(BACK_LIVE, ProxyOverride="<local>"),
+     dict(SAFE_RECORD, ProxyOverridePresent=1, ProxyOverride="<local>"), STALE),
+    (dict(BACK_LIVE, ProxyOverride=""),
+     dict(SAFE_RECORD, ProxyOverridePresent=1, ProxyOverride=7), STALE),   # garbage = ""
+    (BACK_LIVE, dict(SAFE_RECORD, ProxyOverridePresent=1), STALE),     # present, no value
+    # Not stale: SNIper's "*" is still there, or the genuine list isn't back.
+    (dict(BACK_LIVE, ProxyOverride="*"), SAFE_RECORD, "STRANDED"),
+    (BACK_LIVE, dict(SAFE_RECORD, ProxyOverridePresent=1, ProxyOverride="<local>"),
+     "STRANDED"),
+    (dict(BACK_LIVE, ProxyOverride=""), SAFE_RECORD, "STRANDED"),      # empty is not absent
+    # Only safe mode writes the list, so only a safe-mode record is judged by it.
+    (dict(GENUINE_LIVE, ProxyOverride="*"), dict(STALE_RECORD, ProxyOverridePresent=0),
+     STALE),
+], ids=["absent", "recorded", "garbage-record", "present-flag-without-value",
+        "bypass-all-left", "genuine-list-missing", "empty-vs-absent", "static-ignores-it"])
+def test_a_safe_mode_record_is_stale_only_with_its_bypass_list_back(tool, live, record,
+                                                                    expected):
+    assert tool.verdict(live, record, []) == expected
+
+
+def test_render_marks_a_stale_record(tool):
+    state = {"live": GENUINE_LIVE, "record": STALE_RECORD, "runonce": {}, "owner": None,
+             "guardians": [], "winhttp_ie_config": {"error": "x"}, "processes": [],
+             "verdict": STALE}
+    text = tool.render(state)
+    assert "(stale: the live settings already hold these genuine values)" in text
+    assert text.endswith("Verdict: " + STALE)
+    state["live"] = dict(GENUINE_LIVE, ProxyEnable=0)
+    assert "(stale:" not in tool.render(state)
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not IS_WINDOWS, reason="main() prints 'Windows only' elsewhere")
+def test_the_stale_verdict_survives_a_narrow_console_encoding():
+    # The em dash must never crash the tool on a cp437 console: main() is run
+    # in a subprocess on such a stdout, with collect() replaced by that state.
+    proc = subprocess.run(
+        [sys.executable, "-c",
+         "import importlib.util, sys; s = importlib.util.spec_from_file_location('t', sys.argv[1]);"
+         "m = importlib.util.module_from_spec(s); s.loader.exec_module(m);"
+         "m.collect = lambda: {'live': {'ProxyEnable': 0, 'ProxyServer': '', 'ProxyOverride': None,"
+         " 'AutoConfigURL': None}, 'record': None, 'runonce': {}, 'owner': None, 'guardians': [],"
+         " 'winhttp_ie_config': {'error': 'x'}, 'processes': [], 'verdict': m.VERDICT_STALE};"
+         "sys.exit(m.main([]))", _TOOL],
+        capture_output=True, timeout=60, env=dict(os.environ, PYTHONIOENCODING="cp437"))
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.rstrip().endswith(b"Verdict: CLEAN (stale record \\u2014 removed on next launch)")
 
 
 @pytest.mark.skipif(not IS_WINDOWS, reason="Win32 process queries")

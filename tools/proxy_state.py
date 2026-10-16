@@ -10,6 +10,11 @@ values and any SNIper processes, then a one-line verdict:
 
   CLEAN          no restore record and no SNIper-style proxy in the live
                  settings (whether or not SNIper is open)
+  CLEAN (stale record — removed on next launch)
+                 a complete record is left, but the live settings already
+                 hold its genuine values (the sign-in safety net or the user
+                 put them back) and no SNIper process runs; the next launch
+                 of SNIper just deletes the record
   SNIPER ACTIVE (guarded)
                  a record or a SNIper-style proxy, SNIper is running, and a
                  guardian watches the record's session
@@ -17,15 +22,18 @@ values and any SNIper processes, then a one-line verdict:
                  the same, but no guardian of that session is running
   STRANDED (harmless: fail-open PAC)
                  SNIper's safe-mode script URL is left over and no SNIper
-                 process runs; apps fall back to a direct connection, and the
-                 next launch of SNIper removes it
+                 process runs; apps fall back to a direct connection (past
+                 safe mode's manual proxy too, whose bypass list is "*"), and
+                 the next launch of SNIper removes it
   STRANDED       a record or a SNIper-style proxy, but no SNIper process
   UNKNOWN        a record or a SNIper-style proxy, and the process list could
                  not be read
 
 A SNIper-style proxy is what SNIper applies: in Compatibility mode
 ProxyEnable=1 with ProxyServer 127.0.0.1:<port>, in safe mode an
-AutoConfigURL of the form http://127.0.0.1:<port>/sniper-<16 hex>.pac.
+AutoConfigURL of the form http://127.0.0.1:<port>/sniper-<16 hex>.pac next to
+that same static proxy with ProxyOverride "*", which bypasses it for every
+app that reads the bypass list.
 Another tool on a loopback port looks like the first; the record section tells
 them apart. "SNIper is running" means the app itself: its guardian and the
 short-lived process that starts it don't count.
@@ -80,6 +88,7 @@ _SNIPER_PROXY = re.compile(r"^127\.0\.0\.1:\d+$")
 _SNIPER_PAC = re.compile(r"^http://127\.0\.0\.1:\d+/sniper-[0-9a-f]{16}\.pac$")
 
 VERDICT_HARMLESS = "STRANDED (harmless: fail-open PAC)"
+VERDICT_STALE = "CLEAN (stale record — removed on next launch)"
 VERDICT_GUARDED = "SNIPER ACTIVE (guarded)"
 VERDICT_UNGUARDED = "SNIPER ACTIVE (no guardian)"
 
@@ -308,17 +317,62 @@ def sniper_pac(live):
     return bool(_SNIPER_PAC.match(str(live.get("AutoConfigURL") or "")))
 
 
+def bypass_all(live):
+    """The manual proxy's bypass list is safe mode's "*": every host."""
+    return live.get("ProxyOverride") == "*"
+
+
 def record_mode(record):
     """What the restore record says SNIper applied, in words, or None."""
     if record is None:
         return None
     if record.get("AppliedMode") == "pac":
+        if record.get("AppliedManualProxy") == 1:
+            return "safe mode (auto-config script + manual proxy bypassing every host)"
         return "safe mode (auto-config script)"
     if record.get("AppliedMode") == "static":
         return "Compatibility mode (static proxy)"
     if "AppliedProxyServer" in record:
         return "static proxy (record from v1.1.7)"
     return "static proxy (legacy record, no footprint)"
+
+
+def _dword(value):
+    """A registry value as the DWORD number it holds, or None (as winproxy
+    reads a ProxyEnable)."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if 0 <= n <= 0xFFFFFFFF else None
+
+
+def stale_record(live, record):
+    """True if record is a complete restore record whose genuine values the
+    live settings already hold, exactly as SNIper's own "already back to
+    normal" check sees it: someone put them back (the sign-in safety net,
+    the user), and the next launch of SNIper only deletes the record. An
+    incomplete record is never acted on, so it is never stale either."""
+    if not record or record.get("Complete") != 1:
+        return False
+    live_enable = _dword(live.get("ProxyEnable") or 0)
+    if live_enable is None or live_enable != (_dword(record.get("ProxyEnable")) or 0):
+        return False
+    server = record.get("ProxyServer")
+    if (live.get("ProxyServer") or "") != (server if isinstance(server, str) else ""):
+        return False
+    if record.get("AppliedMode") == "pac" and "ProxyOverridePresent" in record:
+        # Safe mode's manual proxy recorded the genuine bypass list as well.
+        override = None
+        if record["ProxyOverridePresent"] and "ProxyOverride" in record:
+            override = record["ProxyOverride"]
+            override = override if isinstance(override, str) else ""
+        if live.get("ProxyOverride") != override:
+            return False
+    if record.get("AutoConfigURLPresent") and "AutoConfigURL" in record:
+        pac = record["AutoConfigURL"]
+        return live.get("AutoConfigURL") == (pac if isinstance(pac, str) else "")
+    return live.get("AutoConfigURL") is None
 
 
 def verdict(live, record, processes):
@@ -333,9 +387,12 @@ def verdict(live, record, processes):
         if guardians(processes, (record or {}).get("SessionId")):
             return VERDICT_GUARDED
         return VERDICT_UNGUARDED
-    if pac and not static:
+    if stale_record(live, record):
+        return VERDICT_STALE
+    if pac and (not static or bypass_all(live)):
         # A dead script URL is harmless: it can't be fetched, so apps go
-        # direct. Not so if SNIper's static proxy is enabled as well.
+        # direct, past safe mode's own manual proxy too, since its bypass
+        # list is "*". Not so if SNIper's static proxy is enabled without it.
         return VERDICT_HARMLESS
     return "STRANDED"
 
@@ -372,6 +429,8 @@ def render(state):
         line = "  %-15s %s" % (name, _show(state["live"][name]))
         if name == "AutoConfigURL" and sniper_pac(state["live"]):
             line += "  (SNIper safe-mode script)"
+        elif name == "ProxyOverride" and bypass_all(state["live"]):
+            line += "  (bypasses every host)"
         out.append(line)
 
     out += ["", "What Windows reports to apps (WinHTTP, current user)"]
@@ -402,6 +461,8 @@ def render(state):
                        % (owner["pid"], alive, owner["session_id"]))
         if state["record"].get("Complete") != 1:
             out.append("  (incomplete: never acted on)")
+        elif stale_record(state["live"], state["record"]):
+            out.append("  (stale: the live settings already hold these genuine values)")
 
     session = (state["record"] or {}).get("SessionId")
     if session:

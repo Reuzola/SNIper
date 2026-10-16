@@ -99,6 +99,45 @@ def test_fake_delete_value_and_failures():
     assert fake.open == 0
 
 
+def test_fake_enum_value_is_like_the_real_one():
+    fake = FakeWinreg()
+    fake.put(RESTORE_KEY, "Zeta", 1)
+    fake.put(RESTORE_KEY, "alpha", "x", REG_SZ)
+    k = fake.OpenKey(HKCU, RESTORE_KEY)
+    try:
+        # Creation order, the names' own spelling, and OSError past the end.
+        assert fake.EnumValue(k, 0) == ("Zeta", 1, REG_DWORD)
+        assert fake.EnumValue(k, 1) == ("alpha", "x", REG_SZ)
+        for index in (2, -1):
+            with pytest.raises(OSError):
+                fake.EnumValue(k, index)
+    finally:
+        fake.CloseKey(k)
+    k = fake.OpenKey(HKCU, RESTORE_KEY, 0, KEY_WRITE)
+    with pytest.raises(AssertionError, match="access"):
+        fake.EnumValue(k, 0)
+    fake.CloseKey(k)
+    fake.fail.add("EnumValue")
+    k = fake.OpenKey(HKCU, RESTORE_KEY)
+    with pytest.raises(PermissionError):
+        fake.EnumValue(k, 0)
+    fake.CloseKey(k)
+    assert ("EnumValue", RESTORE_KEY.lower()) in fake.calls
+    assert fake.open == 0
+
+
+@windows_only
+def test_fake_enum_value_matches_real_winreg_past_the_end():
+    # The real call raises OSError (ERROR_NO_MORE_ITEMS) past the last value,
+    # which winproxy's loop relies on; HKCU itself always has subkeys only.
+    k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Software")
+    try:
+        with pytest.raises(OSError):
+            winreg.EnumValue(k, 1_000_000)
+    finally:
+        winreg.CloseKey(k)
+
+
 def test_fake_live_and_record_helpers():
     fake = FakeWinreg()
     assert fake.record() is None
@@ -190,6 +229,7 @@ def test_registry_sandbox_fixture_redirects_everything(registry_sandbox):
     assert winproxy._IE == box.root + r"\Internet Settings"
     assert winproxy._SNIPER_KEY == box.root + r"\SNIper"
     assert winproxy._RESTORE_KEY == box.root + r"\SNIper\ProxyRestore"
+    assert winproxy._RUNONCE == box.runonce_key == box.root + r"\RunOnce"
     assert settings.SETTINGS_KEY == box.root + r"\SNIper\Settings"
     assert winproxy._proxy_gpo_locked() is False
     assert box.live() == (0, "", ABSENT)
@@ -197,10 +237,12 @@ def test_registry_sandbox_fixture_redirects_everything(registry_sandbox):
     assert winproxy.proxy_enable("127.0.0.1:1") is None
     assert box.live() == (1, "127.0.0.1:1", ABSENT)
     assert box.record()["Complete"] == 1
+    assert set(box.runonce()) == {"SNIperRestoreProxyEnable", "SNIperRestoreProxyServer"}
     assert winproxy.proxy_restore() == "restored"
     assert box.live() == (0, "", ABSENT)
     assert box.record() is None
     assert not box.exists(box.sniper_key)
+    assert box.runonce() == {}
 
 
 @windows_only
