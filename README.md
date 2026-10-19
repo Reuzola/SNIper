@@ -1,195 +1,119 @@
-# SNIper
+<div align="center">
 
-A lightweight, zero-dependency DPI bypass proxy written in pure Python, shipped
-as a portable Windows `.exe`.
+# 🎯 SNIper
 
-It runs entirely at the **application layer**: no admin privileges, no kernel
-drivers, no TAP adapters, no service installs. Just double-click the `.exe`
-from any folder and it works for the current user only.
+**A lightweight, zero-dependency DPI bypass proxy written in pure Python, shipped as a portable Windows `.exe`.**
 
-It is pre-configured and offered as a **plug-and-play** solution. All you have to do is
-press the start button. You can easily monitor what is happening through a live activity log.
+![Platform](https://img.shields.io/badge/platform-Windows%2010%2B-blue?style=flat-square)
+![Arch](https://img.shields.io/badge/arch-x64%20%7C%20ARM64-blue?style=flat-square)
+![Python](https://img.shields.io/badge/python-3.7%2B-blue?style=flat-square&logo=python&logoColor=white)
+![Portable](https://img.shields.io/badge/portable-no%20install-blue?style=flat-square)
 
-![License](https://img.shields.io/badge/license-MIT-blue)
-![Platform](https://img.shields.io/badge/platform-Windows%2010%2B-blue)
-![Arch](https://img.shields.io/badge/arch-x64%20%7C%20ARM64-blue)
-![Python](https://img.shields.io/badge/python-3.7%2B-blue)
-![Portable](https://img.shields.io/badge/portable-no%20install-blue)
+</div>
 
-| Stopped | Running |
+<br>
+
+SNIper runs entirely at the **application layer** — no admin privileges, no kernel drivers, no TAP adapters, no service installs. Just double-click the `.exe` from any folder and it works for the current user only.
+
+It comes **pre-configured** as a **plug-and-play** solution: all you have to do is press **Start**. A live activity log lets you follow everything that's happening.
+
+<div align="center">
+
+| ⏹️ Stopped | ▶️ Running |
 |:---:|:---:|
-| <img src="https://github.com/user-attachments/assets/feca0063-a013-40a1-bfd4-23f61913b67b" width="380"> | <img src="https://github.com/user-attachments/assets/5b8e9473-1e6e-4872-a1c4-62e98f7b1dfb" width="380"> |
+| <img src="https://github.com/user-attachments/assets/361004f3-7d8a-471d-a8f2-44b1a2de8bf1" width="380"> | <img src="https://github.com/user-attachments/assets/7244f5c5-7fce-42ef-9c99-bd090f1ec1e5" width="380"> |
 
----
+</div>
 
-## Origin
+## 🌱 Origin
 
-This project started from a personal need. I have an ARM64 Windows machine and
-could not find a working, pre-built DPI bypass tool for that architecture. Most
-existing solutions ship compiled binaries, none of them ran natively on ARM64,
-and most of them required admin rights or driver installs.
+This project started from a personal need. I have an **ARM64 Windows** machine and couldn't find a working, pre-built DPI bypass tool for that architecture. Most existing solutions ship compiled binaries, none of them ran natively on ARM64, and most of them required admin rights or driver installs.
 
-So I described the problem to Claude and asked it to write one from scratch in
-pure Python, which has no architecture dependency and runs entirely in user-space.
-After many rounds of feeding errors back and refining, this is the result, and it
-is still being developed. I do a lot of testing and read detailed logs to improve
-the stability and compatibility of the code.
+So I described the problem to **Claude** and asked it to write one from scratch in **pure Python**, which has no architecture dependency and runs entirely in user-space. After many rounds of feeding errors back and refining, this is the result, and it is still being developed. I do a lot of testing and read detailed logs to improve the stability and compatibility of the code.
 
-I am publishing it in case anyone else runs into the same gap.
+> 💬 *I'm publishing it in case anyone else runs into the same gap.*
 
----
+## 💡 How it works
 
-## How it works
+ISPs block websites by reading the **SNI** (Server Name Indication): the name of the site you're visiting, which your browser sends in **plain text** in the very first message of every HTTPS connection (the TLS *ClientHello*), before encryption kicks in. If that name is on a blocklist, the connection is dropped.
 
-ISPs block websites by inspecting the **SNI** (Server Name Indication) field inside
-the TLS ClientHello. When your browser opens an HTTPS connection, the very first packet
-it sends carries the target hostname in **plain text** — even though the rest of the connection is encrypted.
-The ISP's DPI reads that hostname, and if it matches a blocklist, drops the connection.
+SNIper gets around this in **two ways**:
 
-SNIper handles this in **two ways**.
+### 🧩 Splitting the handshake
 
-### ClientHello fragmentation
+SNIper sends that first message in **tiny pieces** (2 bytes each by default, adjustable in the app). The filter never sees the full site name in one piece, so it can't match it against the blocklist and lets the connection through. Only the handshake is split — the rest of the connection runs at **full speed**.
 
-Instead of sending the ClientHello as a single packet,
-SNIper **splits it into 2-byte** (can be changed via the GUI) TCP segments (with Nagle's algorithm disabled). That way, DPI cannot see the full hostname **in one piece**,
-so it can not match the blocklist and lets the connection through. **Only the handshake (ClientHello)** is fragmented — the rest of the connection runs at **full speed.**
+### 🔒 Secure DNS (DoH)
 
-### DNS-over-HTTPS (DoH)
+ISPs also poison DNS, handing out wrong addresses for blocked sites. SNIper skips your ISP's DNS and asks public resolvers (Cloudflare, Google, AdGuard) over an encrypted **DNS-over-HTTPS** connection. If those are blocked too, it automatically falls back to other public DNS routes, and uses your system DNS only as a last resort.
 
-ISPs also poison DNS. When you look up a blocked domain, their resolver returns a
-wrong address. SNIper sends DNS queries **over HTTPS** straight to public DNS
-resolvers (Cloudflare, Google, AdGuard), which **skips** the ISP's DNS. If those are
-blocked too, it falls back to plain DNS over TCP and UDP, and only uses the system
-resolver as a last resort.
+## ✨ Features
 
-Everything runs as a user-space process, no admin, no kernel driver, no TAP
-adapters, no service install, just a portable .exe.
+- ▶️ **Plug-and-play** — nothing to set up or configure. Press **Start** and you're done.
+- 💼 **Portable, no install** — a single `.exe` you can run from any folder, even a USB stick. No admin rights needed, and nothing gets installed on your PC.
+- 💻 **Native x64 and ARM64 builds** — unlike most DPI bypass tools, it runs natively on ARM64 Windows.
+- 🔓 **Opens blocked sites** — gets past the two most common ways ISPs block websites (reading the site's name and handing out fake addresses), which covers most ISP-level filtering.
+- 🌐 **Works with the apps you use** — SNIper sets up Windows for you, so Chrome, Spotify, Steam, Discord and most other apps go through it automatically.
+- 🛡️ **Your internet never breaks because of SNIper** — by default, apps fall back to a direct connection on their own as soon as SNIper is gone. A safety guard restores your settings the moment SNIper closes unexpectedly, and Windows sign-out, restart and shutdown are handled too.
+- 🔁 **Keeps working on tough networks** — if one secure DNS service is blocked, SNIper quietly moves on to the next, so sites keep loading even on heavily filtered networks.
 
----
+## 🚀 Usage
 
-## Features
+1. **Download** `SNIper_<arch>.exe` (`x64` or `ARM64`, matching your PC) from [Releases](https://github.com/Reuzola/SNIper/releases) and double-click it.
+2. **Press Start** to turn the proxy on. SNIper sets the Windows system proxy automatically, so Chrome, Spotify, Steam and most other apps route through it right away.
+3. **Press Stop** or close the window to turn it off and restore your previous proxy settings.
 
-- **User-space and portable** — no admin rights, no kernel driver, no service
-  install. Just a single `.exe` you can run from anywhere, even a USB stick.
-- **Plug-and-play** — zero configuration. Press **Start** and you are done.
-- **Native x64 and ARM64 builds** — unlike most DPI bypass tools, it runs natively on ARM64 Windows.
-- **Fragmentation + DNS-over-HTTPS (DoH) together** — bypasses both SNI-based blocking and DNS poisoning
-  in one tool, which covers most ISP-level filtering.
-- **Your internet never breaks because of SNIper** — by default, apps fall back
-  to a direct connection on their own as soon as SNIper is gone. A safety guard
-  restores your settings the moment SNIper closes unexpectedly, and Windows
-  sign-out, restart and shutdown are handled too.
-- **Smart DNS chain** — DoH → UDP → TCP → system DNS, so name resolution keeps working even on hostile networks.
+<sub>🪟 Requires Windows 10 (version 1607) or later. No Python needed: the `.exe` bundles its own runtime.</sub>
 
----
+> [!TIP]
+> - 🗂️ **System tray:** minimize SNIper to the tray and control it from there. Settings are locked while the proxy is running.
+> - 💾 **Remember settings:** tick it to keep your settings for the next launch. They're stored for your Windows user only, nothing is written next to the EXE, and unticking the box forgets them.
 
-## Usage
-
-Download `SNIper_<arch>.exe` and double-click it.
-Press **Start** to turn the proxy on; SNIper sets the Windows system proxy automatically, so
-Chrome, Spotify, Steam and most other apps route through it right away. Press **Stop** or close
-the window to turn it off and restore your previous proxy settings.
-
-You can minimize it to the system tray and control it from there. Settings are locked while the proxy is running.
-Tick **Remember settings** to keep them for the next launch: they are stored for your Windows user only, nothing is written next to the EXE, and unticking the box forgets them.
-
-### Settings
+### 🔧 Settings
 
 | Setting | Default | What it does |
-|---|---|---|
-| Port | 8881 | Local port the proxy listens on |
-| Fragment size | 2 | Bytes per TCP segment during the TLS handshake |
-| Disable DoH | off | Use system DNS instead of DNS-over-HTTPS |
-| Verbose | off | Show detailed debug messages in the log |
-| Compatibility mode | off | Use a fixed system proxy, for apps that don't go through SNIper in safe mode |
-| Remember settings | off | Keep your settings for the next launch |
+|---|:---:|---|
+| 🔌 **Port** | `8881` | Local port the proxy listens on |
+| ✂️ **Fragment size** | `2` | Bytes per TCP segment during the TLS handshake |
+| 🌐 **Disable DoH** | off | Use system DNS instead of DNS-over-HTTPS |
+| 📝 **Verbose** | off | Show detailed debug messages in the log |
+| 🧰 **Compatibility mode** | off | Use a fixed system proxy, for apps that don't go through SNIper in safe mode |
+| 💾 **Remember settings** | off | Keep your settings for the next launch |
 
----
+## 🚧 Limitations
 
-## Under the hood
+SNIper only gets around SNI-based blocking — it doesn't encrypt your traffic or hide your IP. It may not help in these cases:
+
+- 🦊 **Firefox** may use its own proxy settings. If blocked sites don't open there, switch it to *Use system proxy settings*.
+- 🛡️ **Antivirus HTTPS scanning** (ESET, Kaspersky, Bitdefender…) can undo SNIper's work. If sites stay blocked, turn it off.
+- 🔐 **VPNs** may route your traffic around SNIper entirely.
+- 🐢 **HTTP/3 (QUIC)** can't go through SNIper, but browsers fall back to a regular connection within seconds.
+- 🎮 **Discord** and similar apps read the proxy only at startup: restart them if they were open when you pressed **Start**. If the PC loses power while SNIper runs, they stay offline until you open SNIper again.
+- 🧰 **Compatibility mode:** after a power loss, your settings are restored at the next sign-in (a console window may flash briefly).
+
+> [!NOTE]
+> **Totally normal:** while SNIper runs, Windows proxy settings show `127.0.0.1` entries and Task Manager may list a second SNIper process (the safety guard). The `.exe` isn't code-signed, so SmartScreen may warn you on first launch.
+
+## 🔬 Under the hood
 
 A few details that were trickier than they look:
 
-- **Hand-driven TLS handshake.** Python's `urllib` sends the ClientHello in one
-  TCP segment, which defeats fragmentation. The DoH client drives the TLS
-  handshake manually through memory BIOs so its own ClientHello is fragmented
-  too — otherwise DoH itself gets blocked the same way.
-- **Fail-open auto-config script.** In the default safe mode, SNIper points
-  Windows at a small auto-config (PAC) script that it serves itself, which says
-  `PROXY 127.0.0.1:<port>; DIRECT`: use SNIper, or go direct if it doesn't
-  answer. Next to it SNIper sets a manual proxy whose bypass list is every host
-  (`ProxyOverride="*"`). Once SNIper is gone, the script can't be fetched and the
-  proxy refuses connections, so apps connect directly; Windows and Chrome fall
-  back from a failed script to the manual proxy, and its bypass list sends every
-  host direct as well. The manual proxy is there for apps that read nothing but
-  the fixed proxy, such as the Discord desktop app's updater. Each session's
-  script has its own random URL, so apps notice the change at once and SNIper
-  can tell exactly which setting is its own.
-- **Safety guard process.** Your original proxy settings are saved to the registry
-  before anything changes. When SNIper applies the proxy, it also starts a small
-  separate process that waits, using no CPU, for SNIper to end. If SNIper is
-  killed or crashes, the guard puts your settings back at once and shows a
-  notification. It only ever touches its own session's settings, and it leaves
-  quietly when SNIper stops normally. It is started through a short-lived helper,
-  so ending SNIper's process tree doesn't take it down.
-- **Session end.** A hidden window receives Windows' sign-out, restart and
-  shutdown messages and restores the proxy right there, before Windows may end
-  the process. SNIper also asks Windows to notify it among the first apps, so a
-  hung app can't force a "Shut down anyway" before SNIper has restored.
-- **Authoritative vs. spoofed DNS negatives.** A "host doesn't exist" answer is
-  trusted only over verified DoH; the same answer over plain UDP is treated as a
-  possible injection and ignored, so a poisoning ISP can't shut down a lookup.
+- **Hand-driven TLS for DoH.** `urllib` sends the ClientHello in one TCP segment, which would get DoH itself blocked, so the DoH client drives the handshake through memory BIOs and fragments its own ClientHello too.
+- **Fail-open PAC script.** Safe mode points Windows at a PAC script SNIper serves itself (`PROXY 127.0.0.1:<port>; DIRECT`), plus a manual proxy with `ProxyOverride="*"` for apps that read nothing else, like Discord's updater. Once SNIper is gone, the script can't be fetched, and Windows and Chrome fall back to the manual proxy, whose bypass list sends every host direct. The script gets a random URL per session, so SNIper always knows which setting is its own.
+- **Safety guard process.** The original settings are saved to the registry before anything changes. A separate idle process, launched via a short-lived helper so ending SNIper's process tree doesn't take it down, restores its own session's settings if SNIper is killed or crashes.
+- **Session end.** A hidden window catches sign-out, restart and shutdown messages and restores the proxy right there. SNIper asks to be notified among the first apps, so a hung app can't force "Shut down anyway" before that.
+- **Trusted vs. spoofed DNS negatives.** "Host doesn't exist" is trusted only over verified DoH; over plain UDP it's treated as a possible injection and ignored.
 
----
+### 📦 Building from source
 
-## Limitations
+Run `packaging\build_exe.bat` on an x64 or ARM64 machine to build `SNIper_<arch>.exe` for that architecture. To run without building: `python src/run_sniper.py` (Python 3.7+).
 
-SNIper bypasses SNI-based filtering only — it does not encrypt traffic or hide
-your IP. A few cases where it won't help:
+## 📜 Disclaimer
 
-- **Firefox** uses its own proxy and DNS settings, so SNIper has no effect until
-  you point Firefox at the system proxy.
-- **Antivirus HTTPS scanning** (ESET, Kaspersky, Bitdefender, etc.) reassembles
-  the fragmented ClientHello before it leaves your machine, which re-exposes the
-  SNI. Disable HTTPS/TLS scanning if blocked sites stay blocked.
-- **Active VPNs** route traffic through their own adapter and may bypass the
-  system proxy entirely.
-- **HTTP/3 (QUIC)** runs over UDP, which the TCP proxy can't carry. Browsers fall
-  back to TCP within a second or two, so most sites still load.
-- **Apps that read only the fixed proxy**, such as the Discord desktop app, read
-  it once when they start: restart one that was already open when you pressed
-  Start. They are the exception to safe mode's fail-open: if SNIper and its
-  safety guard are both gone (a power loss, both ended), they can't connect until
-  you open SNIper again, which puts your settings back.
-- **In Compatibility mode, after a power loss** (or if SNIper and its safety
-  guard are both ended), your proxy settings are restored at the next sign-in
-  by a one-time Windows startup entry. A console window may flash briefly when
-  it runs. SNIper removes the entry again on every clean exit.
-- **While SNIper runs**, the Windows proxy settings show "Use setup script" and
-  "Use a proxy server", both with a `127.0.0.1` address (the proxy server's
-  exceptions are `*`), and Task Manager may show a second SNIper background
-  process: the safety guard.
+> [!IMPORTANT]
+> Published for educational and personal use, to help access content that is legally available to you but blocked by ISP-level filtering. Use it in accordance with your local laws. SNIper does not encrypt traffic or provide anonymity — it only bypasses SNI-based filtering, and your existing TLS encryption stays intact end-to-end.
 
----
-
-## Building from source
-
-```packaging\build_exe.bat```
-
-Installs PyInstaller (6.9 or a later 6.x) if needed, builds a single-file
-`SNIper_<arch>.exe` at the project root, verifies its PE architecture, and prints
-its SHA-256. PyInstaller doesn't cross-compile, so x64 and ARM64 each need a
-native build.
-
-To run without building: `python src/run_sniper.py` (Python 3.7+). The EXE itself
-needs Windows 10 1607 or later (x64 or ARM64) and bundles its own runtime.
-
----
-
-## Disclaimer
-
-Published for educational and personal use, to help access content that is
-legally available to you but blocked by ISP-level filtering. Use it in accordance
-with your local laws. SNIper does not encrypt traffic or provide anonymity — it
-only bypasses SNI-based filtering, and your existing TLS encryption stays intact
-end-to-end.
+<div align="center">
+<br>
+<sub>Released under the <a href="LICENSE">MIT License</a>.</sub>
+</div>
