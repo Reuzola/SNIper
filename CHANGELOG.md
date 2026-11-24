@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.2.1 - 2026-11-24
+
+Fixes the Discord desktop app not opening in the default mode, as reported in [#2](https://github.com/Reuzola/SNIper/issues/2).
+
+- **Discord opens again.** A Discord update changed how the app finds the Windows proxy, so its updater went around SNIper and the app never got past the loading screen. It goes through SNIper again, with no setting to change. As before, restart Discord if it was already open when you pressed Start.
+- **More apps go through SNIper.** Apps that read the Windows proxy setting directly are now covered in the default mode, whichever way they read it. The same kind of change in another app's update no longer makes a difference.
+- **After a power loss, your settings come back at the next sign-in.** This now works in the default mode too, without opening SNIper first (a console window may flash briefly). In return, most apps no longer fall back to a direct connection on their own: if SNIper and its safety guard are both ended at the same moment, apps may have no internet until you sign in again or open SNIper.
+- **The safety guard comes back if it is closed.** If you end the second SNIper process in Task Manager, SNIper starts it again, so your settings are still restored if SNIper itself is ended next.
+- **Changing Windows' proxy exceptions while SNIper runs is safe now.** Your change is kept, and SNIper's own proxy is still turned off when you press Stop. Before, it stayed on and apps lost their internet.
+- **Local device names connect directly.** In the default mode, addresses ending in .local, such as a printer or a NAS on your home network, no longer go through SNIper, which could not find them.
+
+Compatibility mode works as before, and settings left behind by an earlier version are still restored on the first launch.
+
+---
+
 ## v1.2.0 - 2026-10-16
 
 Whatever happens to SNIper, your internet keeps working, without you doing anything.

@@ -54,7 +54,7 @@ ISPs also poison DNS, handing out wrong addresses for blocked sites. SNIper skip
 - 💻 **Native x64 and ARM64 builds** — unlike most DPI bypass tools, it runs natively on ARM64 Windows.
 - 🔓 **Opens blocked sites** — gets past the two most common ways ISPs block websites (reading the site's name and handing out fake addresses), which covers most ISP-level filtering.
 - 🌐 **Works with the apps you use** — SNIper sets up Windows for you, so Chrome, Spotify, Steam, Discord and most other apps go through it automatically.
-- 🛡️ **Your internet never breaks because of SNIper** — by default, apps fall back to a direct connection on their own as soon as SNIper is gone. A safety guard restores your settings the moment SNIper closes unexpectedly, and Windows sign-out, restart and shutdown are handled too.
+- 🛡️ **Your internet settings always come back** — pressing Stop or closing the window restores them immediately. If SNIper crashes or is killed, a safety guard restores them at once, and after a power loss they are restored at your next sign-in. Windows sign-out, restart and shutdown are handled too.
 - 🔁 **Keeps working on tough networks** — if one secure DNS service is blocked, SNIper quietly moves on to the next, so sites keep loading even on heavily filtered networks.
 
 ## 🚀 Usage
@@ -77,7 +77,7 @@ ISPs also poison DNS, handing out wrong addresses for blocked sites. SNIper skip
 | ✂️ **Fragment size** | `2` | Bytes per TCP segment during the TLS handshake |
 | 🌐 **Disable DoH** | off | Use system DNS instead of DNS-over-HTTPS |
 | 📝 **Verbose** | off | Show detailed debug messages in the log |
-| 🧰 **Compatibility mode** | off | Use a fixed system proxy, for apps that don't go through SNIper in safe mode |
+| 🧰 **Compatibility mode** | off | Use only a fixed system proxy, for apps that don't go through SNIper in safe mode |
 | 💾 **Remember settings** | off | Keep your settings for the next launch |
 
 ## 🚧 Limitations
@@ -88,19 +88,19 @@ SNIper only gets around SNI-based blocking — it doesn't encrypt your traffic o
 - 🛡️ **Antivirus HTTPS scanning** (ESET, Kaspersky, Bitdefender…) can undo SNIper's work. If sites stay blocked, turn it off.
 - 🔐 **VPNs** may route your traffic around SNIper entirely.
 - 🐢 **HTTP/3 (QUIC)** can't go through SNIper, but browsers fall back to a regular connection within seconds.
-- 🎮 **Discord** and similar apps read the proxy only at startup: restart them if they were open when you pressed **Start**. If the PC loses power while SNIper runs, they stay offline until you open SNIper again.
-- 🧰 **Compatibility mode:** after a power loss, your settings are restored at the next sign-in (a console window may flash briefly).
+- 🎮 **Discord** and similar apps read the proxy only at startup: restart them if they were open when you pressed **Start**.
+- 🔌 **Power loss:** if the PC loses power while SNIper runs, your settings are restored at your next sign-in (a console window may flash briefly). The same goes if SNIper and its safety guard are both ended at the same moment: until then, or until you open SNIper again, apps may have no internet.
 
 > [!NOTE]
-> **Totally normal:** while SNIper runs, Windows proxy settings show `127.0.0.1` entries and Task Manager may list a second SNIper process (the safety guard). The `.exe` isn't code-signed, so SmartScreen may warn you on first launch.
+> **Totally normal:** while SNIper runs, Windows proxy settings show `127.0.0.1` entries and Task Manager may list a second SNIper process (the safety guard; if you end it, SNIper starts it again). Security tools may mention one-time `RunOnce` entries (the safety net for a power loss). The `.exe` isn't code-signed, so SmartScreen may warn you on first launch.
 
 ## 🔬 Under the hood
 
 A few details that were trickier than they look:
 
 - **Hand-driven TLS for DoH.** `urllib` sends the ClientHello in one TCP segment, which would get DoH itself blocked, so the DoH client drives the handshake through memory BIOs and fragments its own ClientHello too.
-- **Fail-open PAC script.** Safe mode points Windows at a PAC script SNIper serves itself (`PROXY 127.0.0.1:<port>; DIRECT`), plus a manual proxy with `ProxyOverride="*"` for apps that read nothing else, like Discord's updater. Once SNIper is gone, the script can't be fetched, and Windows and Chrome fall back to the manual proxy, whose bypass list sends every host direct. The script gets a random URL per session, so SNIper always knows which setting is its own.
-- **Safety guard process.** The original settings are saved to the registry before anything changes. A separate idle process, launched via a short-lived helper so ending SNIper's process tree doesn't take it down, restores its own session's settings if SNIper is killed or crashes.
+- **Every way to find the proxy leads to SNIper.** Safe mode points Windows at a PAC script SNIper serves itself (`PROXY 127.0.0.1:<port>; DIRECT`), and at the same address as a manual proxy for apps that read nothing else, like Discord's updater. Some of those honor the manual proxy's bypass list and some ignore it, and an app update can change which, so the list only ever holds local addresses and your own entries. Both are rendered from the same rules, so they always agree. The script gets a random URL per session, so SNIper always knows which setting is its own.
+- **Safety guard process.** The original settings are saved to the registry before anything changes. A separate idle process, launched via a short-lived helper so ending SNIper's process tree doesn't take it down, restores its own session's settings if SNIper is killed or crashes; SNIper starts a new one if it is ended. If both are gone, one-time `RunOnce` entries put the settings back at the next sign-in with Windows' own `reg.exe`, even if SNIper was deleted.
 - **Session end.** A hidden window catches sign-out, restart and shutdown messages and restores the proxy right there. SNIper asks to be notified among the first apps, so a hung app can't force "Shut down anyway" before that.
 - **Trusted vs. spoofed DNS negatives.** "Host doesn't exist" is trusted only over verified DoH; over plain UDP it's treated as a possible injection and ignored.
 

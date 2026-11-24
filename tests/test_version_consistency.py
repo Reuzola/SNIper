@@ -29,7 +29,7 @@ def _four_part():
 
 def test_the_package_version_is_major_minor_patch():
     assert re.fullmatch(r"\d+\.\d+\.\d+", sniper.__version__)
-    assert sniper.__version__ == "1.2.0"
+    assert sniper.__version__ == "1.2.1"
 
 
 def test_the_exe_version_resource_agrees():
