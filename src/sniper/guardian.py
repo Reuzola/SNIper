@@ -23,6 +23,12 @@ change notifications for HKCU\\Software\\SNIper:
 The owner is named by its PID *and* creation time, so a PID that Windows
 hands to another process is never mistaken for SNIper.
 
+Watching the watcher. A guardian holds a named mutex, one per session, for as
+long as it lives. SNIper waits on it (wait_for_guardian, on a thread of its
+own) and starts a new guardian if the one it has ends while the session still
+runs, so ending the guardian first and SNIper second strands nothing. The
+mutex also keeps a second guardian of the same session from staying.
+
 Every child gets PYINSTALLER_RESET_ENVIRONMENT=1. Without it a frozen child
 reuses its parent's _MEI unpack directory, which PyInstaller deletes when the
 parent (SNIper) dies: the exact moment the guardian is needed.
@@ -80,6 +86,13 @@ _CREATE_NEW_PROCESS_GROUP  = 0x00000200
 _CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 _REAP_TIMEOUT = 120   # seconds a reaper thread waits for a launched child
 
+# The mutex a session's guardian holds for as long as it lives. Session-local
+# like SNIper's other ones: no "Global\\".
+_GUARD_MUTEX = "SNIper_guardian_%s"
+_CLAIM_TIMEOUT_MS = 2000     # how long a guardian waits for another to let go
+_GUARD_START_TIMEOUT = 30.0  # seconds SNIper gives a guardian to show up (a
+_GUARD_START_POLL = 0.1      # frozen one unpacks first), looking this often
+
 _SESSION_RX = re.compile(r"[0-9a-f]{16}")
 _NUMBER_RX = re.compile(r"[0-9]{1,20}")
 
@@ -89,6 +102,8 @@ _OWNER, _RECORD = "owner", "record"
 _POLL_MS = 2000
 _REG_NOTIFY_CHANGE_NAME     = 0x00000001
 _REG_NOTIFY_CHANGE_LAST_SET = 0x00000004
+_ERROR_ALREADY_EXISTS       = 183
+_MUTEX_MODIFY_STATE         = 0x0001
 
 if IS_WINDOWS:
     from ctypes import wintypes
@@ -101,6 +116,12 @@ if IS_WINDOWS:
     _kernel32.CreateEventW.restype = ctypes.c_void_p  # HANDLE
     _kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
     _kernel32.CloseHandle.restype = wintypes.BOOL
+    _kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    _kernel32.CreateMutexW.restype = ctypes.c_void_p  # HANDLE
+    _kernel32.OpenMutexW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    _kernel32.OpenMutexW.restype = ctypes.c_void_p  # HANDLE
+    _kernel32.ReleaseMutex.argtypes = [ctypes.c_void_p]
+    _kernel32.ReleaseMutex.restype = wintypes.BOOL
     # (HKEY hKey, BOOL bWatchSubtree, DWORD dwNotifyFilter, HANDLE hEvent,
     #  BOOL fAsynchronous) -> LSTATUS
     _advapi32.RegNotifyChangeKeyValue.argtypes = [
@@ -203,6 +224,44 @@ def spawn_guardian(session_id):
         return False
 
 
+def wait_for_guardian(session_id, wanted):
+    """SNIper's side: wait until the session's guardian is gone. True once it
+    ended, however it ended; False if none showed up in time; None if wanted()
+    turned false before one did, or the wait can't be done at all. Uses no CPU
+    once a guardian is there.
+
+    A guardian that is there holds its mutex; only then is there anything to
+    wait for. A mutex nobody holds is what a guardian that just ended leaves
+    until its process is fully gone. When a holder dies, Windows "abandons"
+    its mutex, which wakes the wait up like any release. Either way this
+    thread owns it then and lets go at once, for the next guardian. A guardian
+    leaves by itself when its session ends, so a Stop ends this wait too."""
+    if not IS_WINDOWS:
+        return None
+    name = _GUARD_MUTEX % session_id
+    deadline = time.monotonic() + _GUARD_START_TIMEOUT
+    while True:
+        mutex = _kernel32.OpenMutexW(procutil.SYNCHRONIZE | _MUTEX_MODIFY_STATE,
+                                     False, name)
+        if mutex:
+            try:
+                held = procutil.wait_any([mutex], 0) is None
+                if held:
+                    procutil.wait_any([mutex], procutil.INFINITE)
+                _kernel32.ReleaseMutex(mutex)
+                if held:
+                    return True
+            except OSError:
+                return None
+            finally:
+                procutil.close(mutex)
+        if not wanted():
+            return None
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_GUARD_START_POLL)
+
+
 def run_spawn_guard(args):
     """The intermediate: start the guardian with the same arguments and exit
     at once, so the guardian has no parent in SNIper's process tree."""
@@ -221,12 +280,43 @@ class _Win32Waiter:
     """The guardian's waits, on Win32: the owner's process handle, and a
     change notification on HKCU\\<winproxy._SNIPER_KEY> (the whole subtree,
     so the record's deletion, a rewrite, or its parent's removal all count).
-    run_guardian takes any object with these four methods, so the logic can
-    be tested without Win32."""
+    And the mutex that tells SNIper its guardian is there. run_guardian takes
+    any object with these six methods, so the logic can be tested without
+    Win32."""
 
     def __init__(self):
         self._key = None      # winreg handle, open while notifications are armed
         self._event = None    # auto-reset event the notification signals
+        self._mutex = None    # the session's guard mutex, while it is ours
+
+    def claim(self, session):
+        """Hold the session's guard mutex until release(); False if another
+        guardian has it. Without a mutex to hold (none can be created) the
+        session is still worth guarding, so that is True as well."""
+        try:
+            ctypes.set_last_error(0)
+            mutex = _kernel32.CreateMutexW(None, True, _GUARD_MUTEX % session)
+            if not mutex:
+                return True
+            if ctypes.get_last_error() == _ERROR_ALREADY_EXISTS:
+                # Not created here, so not owned yet. An abandoned one counts
+                # as free: its guardian is dead.
+                if procutil.wait_any([mutex], _CLAIM_TIMEOUT_MS) is None:
+                    procutil.close(mutex)
+                    return False
+            self._mutex = mutex
+        except Exception:
+            pass
+        return True
+
+    def release(self):
+        if self._mutex is not None:
+            try:
+                _kernel32.ReleaseMutex(self._mutex)
+            except Exception:
+                pass
+            procutil.close(self._mutex)
+            self._mutex = None
 
     def open_owner(self, pid, created):
         return procutil.open_for_wait(pid, created)
@@ -311,12 +401,22 @@ def run_guardian(args, waiter=None, read_session=None):
     owner = _parse_owner(args)
     if owner is None:
         return EXIT_BAD_ARGS
+    if waiter is None:
+        waiter = _Win32Waiter()
+    if read_session is None:
+        read_session = winproxy.current_session_id
+    if not waiter.claim(owner[2]):
+        return EXIT_NOTHING  # this session already has a guardian
+    try:
+        return _guard(owner, waiter, read_session)
+    finally:
+        waiter.release()
+
+
+def _guard(owner, waiter, read_session):
+    """run_guardian, once the session is this guardian's to watch."""
     pid, created, session = owner
     try:
-        if waiter is None:
-            waiter = _Win32Waiter()
-        if read_session is None:
-            read_session = winproxy.current_session_id
         if not _owner_died(pid, created, session, waiter, read_session):
             return EXIT_NOTHING
         result = winproxy.proxy_restore(session_id=session)

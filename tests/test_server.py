@@ -1,6 +1,7 @@
 """Tests for sniper.server.ProxyServer: the accept loop's error handling and
 fail-safe, the idempotent stop(), the session-end hooks, safe vs.
-Compatibility mode (the PAC script it serves) and connection backpressure.
+Compatibility mode (the PAC script it serves), connection backpressure, and
+the guardian: starting it, and replacing one that ended.
 
 winproxy is never reached: proxy_enable / proxy_restore are replaced by a
 recorder, so nothing here can touch any registry. Real sockets on 127.0.0.1
@@ -1177,6 +1178,261 @@ def test_a_guardian_failure_in_the_cancelled_path_never_raises(srv, wp, guardian
     assert NO_GUARD_LINE in lines and CANCELLED_LINE in lines
 
 
+# ── A guardian that ends before its session does ─────────────────────────────
+GUARD_AGAIN_LINE = ("INFO", "Safety guard was closed; started it again.")
+GUARD_GIVEN_UP_LINE = ("WARNING", "Safety guard could not be kept running; your proxy "
+                       "settings will still be restored when SNIper closes or starts again.")
+ENDED, NEVER_CAME, UNWANTED = True, False, None   # what wait_for_guardian answers
+
+
+class GuardWaits:
+    """Stands in for sniper.server.wait_for_guardian: answers from a script
+    (a callable is called for its answer), then stays until its session is
+    over, as the real one does with a guardian that keeps running. finished
+    counts the calls that returned."""
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+        self.sessions = []
+        self.finished = 0
+
+    def __call__(self, session_id, wanted):
+        self.sessions.append(session_id)
+        try:
+            if self.answers:
+                answer = self.answers.pop(0)
+                if isinstance(answer, BaseException):
+                    raise answer
+                return answer() if callable(answer) else answer
+            wait_until(lambda: not wanted(), timeout=20, interval=0.005)
+            return UNWANTED
+        finally:
+            self.finished += 1
+
+
+@pytest.fixture
+def waits(monkeypatch):
+    def install(*answers):
+        w = GuardWaits(*answers)
+        monkeypatch.setattr(server_mod, "wait_for_guardian", w)
+        return w
+    yield install
+
+
+def guard_threads():
+    return [t for t in threading.enumerate() if t.name == "SNIperGuardWatch"]
+
+
+@pytest.fixture(autouse=True)
+def no_guard_thread_left():
+    """Every guard-watching thread a test started ends with its session."""
+    yield
+    wait_until(lambda: not guard_threads(), message="a guard-watching thread is left")
+
+
+@pytest.mark.parametrize("compat", [False, True])
+def test_a_guardian_that_ended_is_replaced(srv, wp, guardian_spawns, waits, compat):
+    w = waits(ENDED)
+    srv.start(0, 2, False, compat=compat)
+    sid = srv.session_id
+    wait_until(lambda: len(w.sessions) == 2)   # ...and the new one is watched
+    assert guardian_spawns.calls == [sid, sid]
+    assert w.sessions == [sid, sid]
+    lines = drain(srv.log_q)
+    assert lines.count(GUARD_AGAIN_LINE) == 1
+    assert NO_GUARD_LINE not in lines
+    assert wp.restores == 0 and srv.running    # the session itself is untouched
+    srv.stop()
+    wait_until(lambda: w.finished == 2)
+    assert guardian_spawns.calls == [sid, sid]
+
+
+def test_a_guardian_that_never_came_is_started_once_more_quietly(srv, wp, guardian_spawns,
+                                                                waits):
+    w = waits(NEVER_CAME)
+    srv.start(0, 2, False)
+    wait_until(lambda: len(w.sessions) == 2)
+    assert guardian_spawns.calls == [srv.session_id] * 2
+    assert GUARD_AGAIN_LINE not in drain(srv.log_q)   # nothing was closed
+
+
+@pytest.mark.parametrize("answer", [ENDED, NEVER_CAME])
+def test_a_guardian_that_keeps_ending_is_never_replaced_in_a_loop(srv, wp, guardian_spawns,
+                                                                 waits, answer):
+    w = waits(*[answer] * 50)
+    srv.start(0, 2, False)
+    wait_until(lambda: not guard_threads())
+    assert len(guardian_spawns.calls) == 1 + server_mod._GUARD_MAX_RESTARTS == 6
+    assert len(w.sessions) == 6
+    lines = drain(srv.log_q)
+    assert lines.count(GUARD_GIVEN_UP_LINE) == 1
+    assert srv.running and wp.restores == 0    # SNIper goes on without one
+
+
+def test_guardians_that_lasted_are_replaced_for_as_long_as_it_takes(srv, wp, waits,
+                                                                   guardian_spawns,
+                                                                   monkeypatch):
+    # Days in the tray, a guardian ended every now and then: only those that
+    # end soon after one another count towards giving up.
+    monkeypatch.setattr(server_mod, "_GUARD_STEADY", 0.0)
+    w = waits(*[ENDED] * 30)
+    srv.start(0, 2, False)
+    wait_until(lambda: len(w.sessions) == 31)
+    assert guardian_spawns.calls == [srv.session_id] * 31
+    assert GUARD_GIVEN_UP_LINE not in drain(srv.log_q)
+
+
+def test_a_steady_guardian_forgives_the_quick_ends_before_it(srv, wp, waits, monkeypatch,
+                                                            guardian_spawns):
+    clock = [1000.0]
+    monkeypatch.setattr(server_mod, "time", types.SimpleNamespace(
+        monotonic=lambda: clock[0], sleep=time.sleep))
+
+    def lasted(seconds):
+        def answer():
+            clock[0] += seconds
+            return ENDED
+        return answer
+
+    quick, steady = lasted(1), lasted(server_mod._GUARD_STEADY)
+    w = waits(*[quick] * 5 + [steady] + [quick] * 4 + [steady])
+    srv.start(0, 2, False)
+    wait_until(lambda: len(w.sessions) == 12)
+    assert len(guardian_spawns.calls) == 12
+    assert GUARD_GIVEN_UP_LINE not in drain(srv.log_q)
+
+
+@pytest.mark.parametrize("over", ["stop", "session-ending", "fail-safe", "restart"])
+def test_the_end_of_a_session_starts_no_new_guardian(srv, wp, guardian_spawns, waits, over):
+    # Its guardian leaves because the record went, which is what ends the wait.
+    ended = threading.Event()
+    w = waits(lambda: ended.wait(20) and ENDED)
+    srv.start(0, 2, False)
+    first = srv.session_id
+    if over == "stop":
+        srv.stop()
+    elif over == "session-ending":
+        srv.session_ending()
+    elif over == "fail-safe":
+        srv._fail_safe(OSError("accept failed"), srv._sock)
+    else:
+        srv.stop()
+        srv.start(0, 2, False)
+    expected = [first] if over != "restart" else [first, srv.session_id]
+    ended.set()
+    wait_until(lambda: w.finished >= 1)
+    if over != "restart":
+        wait_until(lambda: not guard_threads())
+    else:
+        wait_until(lambda: len(guard_threads()) == 1)   # the new session's
+    assert guardian_spawns.calls == expected
+    lines = drain(srv.log_q)
+    assert GUARD_AGAIN_LINE not in lines and NO_GUARD_LINE not in lines
+
+
+def test_a_replacement_waits_for_a_stop_in_progress(srv, wp, guardian_spawns, waits,
+                                                   monkeypatch):
+    # The guardian's death is noticed while Stop is half-way: its restore has
+    # run, the session isn't marked as over yet. The lock settles it.
+    ended = threading.Event()
+    w = waits(lambda: ended.wait(20) and ENDED)
+    srv.start(0, 2, False)
+    sid = srv.session_id
+    real = wp.restore
+
+    def slow_restore(session_id=None):
+        ended.set()
+        wait_until(lambda: w.finished == 1)
+        time.sleep(0.1)          # the thread is at the lock now
+        return real(session_id)
+
+    monkeypatch.setattr(server_mod, "proxy_restore", slow_restore)
+    srv.stop()
+    wait_until(lambda: not guard_threads())
+    assert guardian_spawns.calls == [sid]
+
+
+def test_a_cancelled_sign_out_watches_the_new_guardian(srv, wp, guardian_spawns, waits):
+    ended = threading.Event()
+    w = waits(lambda: ended.wait(20) and ENDED)
+    srv.start(0, 2, False)
+    first = srv.session_id
+    srv.session_ending()
+    srv.session_end_cancelled()
+    second = srv.session_id
+    ended.set()   # the first session's guardian left, as it should
+    wait_until(lambda: w.finished == 1 and len(guard_threads()) == 1)
+    assert w.sessions == [first, second]
+    assert guardian_spawns.calls == [first, second]
+
+
+def test_no_replacement_once_the_record_is_not_this_sessions(srv, wp, guardian_spawns,
+                                                            waits):
+    # Someone restored behind SNIper's back: there is nothing left to guard,
+    # and nothing to warn about.
+    def restored_by_someone_else():
+        wp.current = None
+        return ENDED
+    waits(restored_by_someone_else)
+    srv.start(0, 2, False)
+    wait_until(lambda: not guard_threads())
+    assert guardian_spawns.calls == [srv.session_id]
+    lines = drain(srv.log_q)
+    assert GUARD_AGAIN_LINE not in lines and NO_GUARD_LINE not in lines
+
+
+def test_a_replacement_that_cannot_start_is_a_warning_and_the_end_of_it(srv, wp, waits,
+                                                                       guardian_spawns):
+    def exe_is_gone():
+        guardian_spawns.result = False
+        return ENDED
+    waits(exe_is_gone)
+    srv.start(0, 2, False)
+    wait_until(lambda: not guard_threads())
+    assert len(guardian_spawns.calls) == 2
+    lines = drain(srv.log_q)
+    assert lines.count(NO_GUARD_LINE) == 1 and GUARD_AGAIN_LINE not in lines
+    assert srv.running
+
+
+def test_a_wait_that_breaks_ends_the_watching_quietly(srv, wp, guardian_spawns, waits):
+    waits(RuntimeError("exploded"))
+    srv.start(0, 2, False)
+    wait_until(lambda: not guard_threads())
+    assert guardian_spawns.calls == [srv.session_id]
+    assert srv.running
+
+
+@pytest.mark.parametrize("why", ["no-record", "spawn-failed"])
+def test_nothing_is_watched_without_a_guardian(srv, wp, guardian_spawns, waits, why):
+    w = waits(ENDED)
+    if why == "no-record":
+        wp.writes_record = False
+    else:
+        guardian_spawns.result = False
+    srv.start(0, 2, False)
+    assert guard_threads() == [] and w.sessions == []
+
+
+def test_a_thread_that_cannot_start_never_fails_the_start(srv, wp, guardian_spawns,
+                                                         monkeypatch):
+    real = threading.Thread
+
+    class NoGuardThread(real):
+        def start(self):
+            if self.name == "SNIperGuardWatch":
+                raise RuntimeError("can't start new thread")
+            super().start()
+
+    fake_threading = types.SimpleNamespace(**{
+        name: getattr(threading, name) for name in dir(threading)
+        if not name.startswith("__")})
+    fake_threading.Thread = NoGuardThread
+    monkeypatch.setattr(server_mod, "threading", fake_threading)
+    srv.start(0, 2, False)
+    assert srv.running and guardian_spawns.calls == [srv.session_id]
+
+
 def test_recover_reports_already(srv, wp):
     wp.restore_result = "already"
     srv.recover()
@@ -1195,7 +1451,7 @@ def test_stop_treats_already_like_restored(srv, wp, session):
 
 def test_new_lines_read_well_in_the_friendly_log():
     from sniper.logformat import friendly_format
-    for line in (NO_GUARD_LINE, ALREADY_LINE):
+    for line in (NO_GUARD_LINE, ALREADY_LINE, GUARD_AGAIN_LINE, GUARD_GIVEN_UP_LINE):
         assert friendly_format(*line) == line
 
 

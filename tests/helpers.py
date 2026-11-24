@@ -410,6 +410,26 @@ def guard_processes(session_id, mode="--guard"):
     return sorted(pid for pid, cmd in processes_with(session_id) if rx.search(cmd))
 
 
+def suspend(pid):
+    """Stop every thread of the process, so nothing in it can react any more
+    to what the test does next. (It can still be terminated.)"""
+    _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _kernel32.OpenProcess.restype = ctypes.c_void_p
+    _kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    ntdll = ctypes.WinDLL("ntdll")
+    ntdll.NtSuspendProcess.argtypes = [ctypes.c_void_p]
+    ntdll.NtSuspendProcess.restype = ctypes.c_long
+    handle = _kernel32.OpenProcess(0x0800, False, pid)  # PROCESS_SUSPEND_RESUME
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        status = ntdll.NtSuspendProcess(handle)
+        if status:
+            raise OSError("NtSuspendProcess failed: %#x" % (status & 0xFFFFFFFF))
+    finally:
+        _kernel32.CloseHandle(handle)
+
+
 def taskkill(pid, tree=False):
     """taskkill /F (/T) /PID pid: always by PID, never by image name."""
     args = ["taskkill", "/F"] + (["/T"] if tree else []) + ["/PID", str(pid)]

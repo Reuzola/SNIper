@@ -7,6 +7,8 @@
 - The guardian's decision logic, with an injected waiter and record reader:
   when it restores, when it leaves quietly, how outcomes map to exit codes,
   when it notifies, and what happens when something breaks.
+- The guard mutex: one guardian per session, and how SNIper notices that it
+  is gone.
 - The self-test owner's refusal, dispatch, and the entry points, including
   that the guard path never imports tkinter or the app.
 
@@ -214,14 +216,23 @@ class FakeWaiter:
     """Plays back a script of wake-ups: "owner", "record", None (a polling
     timeout), or an exception to raise from wait()."""
 
-    def __init__(self, script=(), owner_alive=True, arms=()):
+    def __init__(self, script=(), owner_alive=True, arms=(), free=True):
         self.script = list(script)
         self.owner_alive = owner_alive
         self.arm_results = list(arms)
+        self.free = free     # False: another guardian has the session
+        self.claims = []     # claim(session) and release(), in order
         self.opened = None
         self.arms = 0
         self.waits = []      # the armed flag of each wait
         self.closed = []
+
+    def claim(self, session):
+        self.claims.append(session)
+        return self.free
+
+    def release(self):
+        self.claims.append("released")
 
     def open_owner(self, pid, created):
         self.opened = (pid, created)
@@ -284,6 +295,14 @@ def test_owner_dead_at_start_restores_at_once(restores, notices):
     assert waiter.opened == (PID, CTIME)
     assert restores.calls == [SID]  # its own session only
     assert waiter.arms == 0 and waiter.waits == []
+    assert waiter.claims == [SID, "released"]
+
+
+def test_a_second_guardian_of_a_session_leaves_at_once(restores, notices):
+    waiter = FakeWaiter(free=False)
+    assert guardian.run_guardian(ARGS, waiter=waiter, read_session=_unused) == 0
+    assert waiter.claims == [SID]          # never held, so nothing to release
+    assert waiter.opened is None and restores.calls == [] and notices == []
 
 
 def test_owner_dies_while_watched(restores, notices):
@@ -292,6 +311,7 @@ def test_owner_dies_while_watched(restores, notices):
     assert restores.calls == [SID]
     assert waiter.waits == [True]          # waited on owner + notification
     assert waiter.closed == ["owner-handle"]
+    assert waiter.claims == [SID, "released"]
 
 
 def test_record_gone_leaves_quietly(restores, notices):
@@ -367,6 +387,18 @@ def test_an_exception_still_attempts_a_final_restore(restores, notices, failure)
     assert restores.calls == [SID]
     assert notices == []
     assert waiter.closed == ["owner-handle"]
+    assert waiter.claims == [SID, "released"]
+
+
+def test_the_session_stays_claimed_until_the_restore_is_done(restores, notices,
+                                                            monkeypatch):
+    waiter = FakeWaiter(owner_alive=False)
+    real = winproxy.proxy_restore
+    held = []
+    monkeypatch.setattr(winproxy, "proxy_restore", lambda session_id=None: (
+        held.append(list(waiter.claims)), real(session_id))[1])
+    assert guardian.run_guardian(ARGS, waiter=waiter, read_session=_unused) == 10
+    assert held == [[SID]]
 
 
 def test_a_restore_that_raises_is_exit_3(restores, notices):
@@ -627,11 +659,222 @@ def test_win32_waiter_cannot_arm_without_the_key(registry_sandbox):
         waiter.close(None)
 
 
+# ── The guard mutex ──────────────────────────────────────────────────────────
+# A guardian in a process of its own, as far as the mutex goes: "claim" says
+# what claim() answered and holds on until a line arrives on stdin, or until
+# it is killed; "open" only holds a handle to the mutex, without owning it.
+_CLAIMER = r"""
+import sys
+sys.path.insert(0, sys.argv[1])
+import sniper.guardian as g
+if sys.argv[3] == "open":
+    h = g._kernel32.CreateMutexW(None, False, g._GUARD_MUTEX % sys.argv[2])
+    print(bool(h), flush=True)
+    sys.stdin.readline()
+else:
+    w = g._Win32Waiter()
+    print(w.claim(sys.argv[2]), flush=True)
+    sys.stdin.readline()
+    w.release()
+"""
+
+
+@pytest.fixture
+def claimer():
+    procs = []
+
+    def start(session, mode="claim"):
+        p = subprocess.Popen([sys.executable, "-c", _CLAIMER, _SRC, session, mode],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             universal_newlines=True)
+        procs.append(p)
+        p.answer = p.stdout.readline().strip()
+        return p
+
+    yield start
+    for p in procs:
+        if p.poll() is None:
+            p.kill()
+        p.wait(10)
+        p.stdin.close()
+        p.stdout.close()
+
+
+@pytest.fixture
+def session():
+    """A session id no other test or run uses: the mutexes are real."""
+    import secrets
+    return secrets.token_hex(8)
+
+
+@pytest.fixture
+def quick(monkeypatch):
+    """Short waits, for what isn't going to happen."""
+    monkeypatch.setattr(guardian, "_CLAIM_TIMEOUT_MS", 150)
+    monkeypatch.setattr(guardian, "_GUARD_START_TIMEOUT", 0.3)
+    monkeypatch.setattr(guardian, "_GUARD_START_POLL", 0.02)
+
+
+needs_mutexes = pytest.mark.skipif(not IS_WINDOWS, reason="named mutexes are Win32")
+
+
+def in_thread(fn, *args):
+    """Run fn in a thread; .result once it is done."""
+    t = threading.Thread(target=lambda: setattr(t, "result", fn(*args)), daemon=True)
+    t.start()
+    return t
+
+
+@needs_mutexes
+def test_only_one_guardian_claims_a_session(claimer, session, quick):
+    first = claimer(session)
+    assert first.answer == "True"
+    waiter = guardian._Win32Waiter()
+    assert waiter.claim(session) is False
+    waiter.release()                        # nothing held: a no-op
+    first.stdin.write("go\n")
+    first.stdin.flush()
+    assert first.wait(10) == 0
+    assert waiter.claim(session) is True    # let go: free again
+    waiter.release()
+    other = guardian._Win32Waiter()
+    assert other.claim("0" * 16 if session != "0" * 16 else "1" * 16) is True
+    other.release()                         # another session is another mutex
+
+
+@needs_mutexes
+def test_a_released_session_is_free_at_once(session, quick):
+    # Not only because the process that held it exits: a mutex belongs to a
+    # thread, so another one of this very process can tell.
+    waiter = guardian._Win32Waiter()
+    assert waiter.claim(session) is True
+    t = in_thread(guardian._Win32Waiter().claim, session)
+    t.join(10)
+    assert t.result is False
+    waiter.release()
+    t = in_thread(guardian._Win32Waiter().claim, session)
+    t.join(10)
+    assert t.result is True
+    assert guardian.wait_for_guardian(session, lambda: True) is False
+
+
+@needs_mutexes
+@pytest.mark.parametrize("keeper", [False, True], ids=["gone", "lingering"])
+def test_a_killed_guardians_session_can_be_claimed(claimer, session, quick, keeper):
+    # With a keeper the mutex outlives its owner, abandoned: free all the same.
+    first = claimer(session)
+    kept = claimer(session, "open") if keeper else None
+    assert kept is None or kept.answer == "True"
+    first.kill()
+    first.wait(10)
+    waiter = guardian._Win32Waiter()
+    assert waiter.claim(session) is True
+    waiter.release()
+
+
+@needs_mutexes
+def test_a_session_is_guarded_even_if_no_mutex_can_be_had(session, monkeypatch):
+    monkeypatch.setattr(guardian, "_kernel32", types.SimpleNamespace(
+        CreateMutexW=lambda *args: None))
+    waiter = guardian._Win32Waiter()
+    assert waiter.claim(session) is True
+    waiter.release()
+
+    def boom(*args):
+        raise OSError("kernel32 exploded")
+    monkeypatch.setattr(guardian, "_kernel32", types.SimpleNamespace(CreateMutexW=boom))
+    assert waiter.claim(session) is True
+    waiter.release()
+
+
+@needs_mutexes
+@pytest.mark.parametrize("how", ["killed", "left"])
+def test_sniper_notices_that_its_guardian_is_gone(claimer, session, how):
+    guard = claimer(session)
+    t = in_thread(guardian.wait_for_guardian, session, lambda: True)
+    t.join(0.5)
+    assert t.is_alive()                     # there, and held: nothing to notice
+    if how == "killed":
+        guard.kill()
+    else:
+        guard.stdin.write("go\n")
+        guard.stdin.flush()
+    t.join(10)
+    assert t.result is True
+    # It let go of the mutex it got that way: the next guardian can have it.
+    waiter = guardian._Win32Waiter()
+    assert waiter.claim(session) is True
+    waiter.release()
+
+
+@needs_mutexes
+def test_sniper_waits_for_a_guardian_that_is_slow_to_show_up(claimer, session, monkeypatch):
+    monkeypatch.setattr(guardian, "_GUARD_START_POLL", 0.02)
+    t = in_thread(guardian.wait_for_guardian, session, lambda: True)
+    t.join(0.3)
+    assert t.is_alive()
+    guard = claimer(session)
+    t.join(0.5)
+    assert t.is_alive()
+    guard.kill()
+    t.join(10)
+    assert t.result is True
+
+
+@needs_mutexes
+def test_a_guardian_that_never_shows_up(session, quick):
+    assert guardian.wait_for_guardian(session, lambda: True) is False
+
+
+@needs_mutexes
+def test_a_mutex_nobody_holds_is_no_guardian(claimer, session, quick):
+    # What a guardian that just died leaves until its process is fully gone:
+    # taken for a guardian, it would "end" at once, over and over.
+    keeper = claimer(session, "open")
+    assert keeper.answer == "True"
+    assert guardian.wait_for_guardian(session, lambda: True) is False
+    waiter = guardian._Win32Waiter()
+    assert waiter.claim(session) is True    # and looking took nothing away
+    waiter.release()
+
+
+@needs_mutexes
+def test_sniper_stops_waiting_for_a_guardian_nobody_wants(session, monkeypatch):
+    monkeypatch.setattr(guardian, "_GUARD_START_POLL", 0.02)
+    wanted = [True]
+    t = in_thread(guardian.wait_for_guardian, session, lambda: wanted[0])
+    t.join(0.2)
+    assert t.is_alive()
+    wanted[0] = False
+    t.join(5)
+    assert t.result is None
+
+
+def test_there_is_nothing_to_wait_for_off_windows(monkeypatch):
+    monkeypatch.setattr(guardian, "IS_WINDOWS", False)
+    assert guardian.wait_for_guardian(SID, _unused) is None
+
+
+@needs_mutexes
+def test_a_wait_that_fails_is_nothing_to_act_on(claimer, session, monkeypatch):
+    guard = claimer(session)
+
+    def broken(handles, timeout_ms):
+        raise OSError("WAIT_FAILED")
+    monkeypatch.setattr(procutil, "wait_any", broken)
+    assert guardian.wait_for_guardian(session, lambda: True) is None
+    assert guard.poll() is None
+
+
 @pytest.mark.skipif(not IS_WINDOWS, reason="Win32 bindings")
 def test_guardian_win32_calls_are_fully_bound():
     for fn in (guardian._kernel32.CreateEventW, guardian._kernel32.CloseHandle,
+               guardian._kernel32.CreateMutexW, guardian._kernel32.OpenMutexW,
+               guardian._kernel32.ReleaseMutex,
                guardian._advapi32.RegNotifyChangeKeyValue):
         assert fn.argtypes is not None and fn.restype is not None
     assert guardian._advapi32.RegNotifyChangeKeyValue.argtypes[0] is ctypes.c_void_p
-    assert guardian._kernel32.CreateEventW.restype is ctypes.c_void_p
+    for fn in (guardian._kernel32.CreateEventW, guardian._kernel32.CreateMutexW,
+               guardian._kernel32.OpenMutexW):
+        assert fn.restype is ctypes.c_void_p
     assert guardian._kernel32 is not ctypes.windll.kernel32

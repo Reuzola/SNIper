@@ -15,7 +15,8 @@ port, restores, tells the UI); and Windows sign-out / restart / shutdown is
 handled by session_ending(), which the session watcher calls synchronously
 before Windows terminates the process. For what no code in this process can
 catch (a Task Manager kill, a crash), every apply also starts a guardian, a
-separate process that restores the moment this one dies (sniper.guardian).
+separate process that restores the moment this one dies (sniper.guardian), and
+a thread here starts a new one if it ends before the session does.
 """
 from __future__ import annotations
 
@@ -28,7 +29,7 @@ import time
 
 from sniper.compat import IS_WINDOWS
 from sniper.config import MAX_CONNECTIONS
-from sniper.guardian import spawn_guardian
+from sniper.guardian import spawn_guardian, wait_for_guardian
 from sniper.pac import build_pac, new_pac_path
 from sniper.proxy import ServeConfig, handle_client
 from sniper.winproxy import (
@@ -75,10 +76,20 @@ _LIMIT_WARNING_INTERVAL = 30.0
 # guarantees the session watcher's window procedure can never hang on it.
 _SESSION_LOCK_TIMEOUT = 5.0
 
+# A guardian that ends while its session runs is replaced, but never in a loop:
+# after this many replacements in a row that each lasted less than
+# _GUARD_STEADY seconds (something keeps ending them), SNIper goes on without.
+_GUARD_MAX_RESTARTS = 5
+_GUARD_STEADY = 60.0
+
 _MSG_STOPPED = "Proxy stopped. Windows proxy restored."
 _MSG_KEPT = "Proxy server stopped; your manual proxy change was left in place."
 _MSG_NO_GUARD = ("Safety guard could not be started; your proxy settings will "
                  "still be restored when SNIper closes or starts again.")
+_MSG_GUARD_AGAIN = "Safety guard was closed; started it again."
+_MSG_GUARD_GIVEN_UP = ("Safety guard could not be kept running; your proxy "
+                       "settings will still be restored when SNIper closes or "
+                       "starts again.")
 
 
 def _err_code(exc):
@@ -254,22 +265,63 @@ class ProxyServer:
             old_a = proxy_enable(self.addr, pac_url=self.pac_url,
                                  session_id=self.session_id, log_q=self.log_q)
             self._applied = True
-            self._start_guardian()
+            if self._start_guardian():
+                try:
+                    threading.Thread(target=self._keep_guarded, name="SNIperGuardWatch",
+                                     args=(self.session_id,), daemon=True).start()
+                except RuntimeError:
+                    pass  # no thread to spare: this guardian isn't replaced
             return old_a
 
     def _start_guardian(self):
         """Start the safety guard for this session, but only if the proxy
         really was applied: the record names this session (not policy-locked,
-        no failed write). Never raises: the guard is the second line of
-        defense and must never stop a Start or a re-apply."""
+        no failed write). True if it was started. Never raises: the guard is
+        the second line of defense and must never stop a Start or a
+        re-apply."""
         try:
             if current_session_id() != self.session_id:
-                return
+                return False
             started = spawn_guardian(self.session_id)
         except Exception:
             started = False
         if not started:
             self.log_q.put(("WARNING", _MSG_NO_GUARD))
+        return started
+
+    def _guards(self, session_id):
+        """True while session_id is the session being guarded: applied, and
+        not stopped, suspended or replaced by a newer one since."""
+        return self._applied and self.session_id == session_id
+
+    def _keep_guarded(self, session_id):
+        """Thread: replace the session's guardian whenever it ends before the
+        session does, say because it was ended in Task Manager. Killing
+        SNIper after its guardian would otherwise leave nobody to restore.
+
+        Stop and the other ends of a session clear the record, which makes
+        the guardian leave; by the time this thread gets _sys_lock they have
+        marked the session as over, so nothing is started for it then."""
+        quick_ends = 0
+        while True:
+            waiting_since = time.monotonic()
+            try:
+                ended = wait_for_guardian(session_id, lambda: self._guards(session_id))
+            except Exception:
+                return
+            with self._sys_lock:
+                if ended is None or not self._guards(session_id):
+                    return
+                if time.monotonic() - waiting_since >= _GUARD_STEADY:
+                    quick_ends = 0
+                quick_ends += 1
+                if quick_ends > _GUARD_MAX_RESTARTS:
+                    self.log_q.put(("WARNING", _MSG_GUARD_GIVEN_UP))
+                    return
+                if not self._start_guardian():
+                    return
+                if ended:
+                    self.log_q.put(("INFO", _MSG_GUARD_AGAIN))
 
     def stop(self):
         """End the session, if there is one, and always restore the system

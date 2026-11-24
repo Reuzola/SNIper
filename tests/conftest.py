@@ -11,7 +11,7 @@ is guarding against.
 - real_proxy_guard: snapshots the real proxy state when the session starts and
   fails the run if anything differs at the end. It only ever reads.
 - guardian_spawns (autouse): in-process tests never start a real guardian
-  process unless marked real_guardian.
+  process, nor wait for one, unless marked real_guardian.
 """
 from __future__ import annotations
 
@@ -129,12 +129,15 @@ class GuardianSpawns:
 def guardian_spawns(request, monkeypatch):
     """A ProxyServer started in a test process never starts a real guardian
     process: spawn_guardian is a GuardianSpawns recorder, unless the test is
-    marked real_guardian (then the fixture's value is None)."""
+    marked real_guardian (then the fixture's value is None). With no guardian
+    to watch either, wait_for_guardian answers "nothing to wait for" at once,
+    which ends the thread that would replace one."""
     if request.node.get_closest_marker("real_guardian") is not None:
         yield None
         return
     spawns = GuardianSpawns()
     monkeypatch.setattr(server, "spawn_guardian", spawns)
+    monkeypatch.setattr(server, "wait_for_guardian", lambda session_id, wanted: None)
     yield spawns
 
 

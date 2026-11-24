@@ -30,12 +30,14 @@ pytestmark = [pytest.mark.skipif(not IS_WINDOWS, reason="real Windows processes"
               pytest.mark.real_guardian]
 
 if IS_WINDOWS:
-    from helpers import guard_processes, taskkill
+    from helpers import guard_processes, suspend, taskkill
 
 _SRC = os.path.dirname(os.path.dirname(os.path.abspath(winproxy.__file__)))
 GENUINE = (0, "", ABSENT)
 # The same with ProxyOverride, which safe mode writes too.
 GENUINE_ALL = GENUINE + (ABSENT,)
+# The sign-in net per mode.
+NET = {"compat": {"SNIperRestoreProxyEnable", "SNIperRestoreProxyServer"}, "safe": set()}
 RESTORE_TIMEOUT = 15
 # The graceful case stops on its own after this many seconds. Long enough for
 # the (about 1 s) process query to find the guardian first, so its exit code
@@ -88,6 +90,17 @@ class Run:
         assert handle, "the guardian %d was gone before it could be opened" % pid
         self.handles.append(handle)
         return pid, handle
+
+    def replacement(self, session_id, old_pid):
+        """Find and open the guardian that came after old_pid."""
+        found = wait_until(
+            lambda: [p for p in guard_processes(session_id) if p != old_pid], timeout=30,
+            message="no new guardian appeared for %s" % session_id)
+        assert len(found) == 1, found
+        handle = procutil.open_for_wait(found[0], procutil.process_identity(found[0])[1])
+        assert handle, "the guardian %d was gone before it could be opened" % found[0]
+        self.handles.append(handle)
+        return found[0], handle
 
     def exit_code(self, handle, timeout=RESTORE_TIMEOUT):
         assert procutil.wait_any([handle], int(timeout * 1000)) == 0, \
@@ -361,21 +374,86 @@ def test_the_guardian_survives_a_tree_kill(run, registry_sandbox):
 
 
 # ── 8. Guardian killed first ─────────────────────────────────────────────────
-def test_with_the_guardian_killed_first_launch_recovery_restores(run, registry_sandbox):
-    # The layering: without a guardian nothing restores at the kill, and the
-    # next launch's recovery does.
+@pytest.mark.parametrize("mode", ["safe", "compat"])
+def test_a_killed_guardian_is_replaced_and_the_new_one_restores(run, registry_sandbox, mode):
+    # What "End task" on both entries in Task Manager does, guard first.
     box = registry_sandbox
-    owner, info = run.start_owner("compat")
-    guard_pid, handle = run.guardian(info["SessionId"])
+    owner, info = run.start_owner(mode)
+    sid = info["SessionId"]
+    first_pid, first = run.guardian(sid)
+    footprint, record = box.live_all(), box.record()
+    killed = time.perf_counter()
+    assert taskkill(first_pid).returncode == 0
+    assert run.exit_code(first) == 1   # taskkill /F's exit code
+    second_pid, second = run.replacement(sid, first_pid)
+    print("%s: replaced within %.2f s" % (mode, time.perf_counter() - killed))
+    run.assert_watching(second, footprint[:3])
+    assert (box.live_all(), box.record()) == (footprint, record)   # nothing else changed
+    # And again, as often as it takes.
+    assert taskkill(second_pid).returncode == 0
+    _, third = run.replacement(sid, second_pid)
+    run.assert_watching(third, footprint[:3])
+    owner.kill()
+    assert run.exit_code(third) == 10
+    assert box.live_all() == GENUINE_ALL
+    assert box.record() is None
+    assert not box.runonce()
+
+
+def test_stop_after_a_replacement_leaves_no_guardian_behind(run, registry_sandbox,
+                                                           live_owner):
+    box = registry_sandbox
+    live_owner.start(0, 2, False)
+    sid = live_owner.session_id
+    first_pid, _ = run.guardian(sid)
+    assert taskkill(first_pid).returncode == 0
+    _, second = run.replacement(sid, first_pid)
+    run.assert_watching(second, box.live())
+    live_owner.stop()
+    assert run.exit_code(second, timeout=10) == 0
+    time.sleep(1)                      # long enough to show up, were it started
+    assert not guard_processes(sid)
+    assert box.live_all() == GENUINE_ALL
+
+
+def test_a_second_guardian_of_a_session_steps_aside(run, registry_sandbox):
+    box = registry_sandbox
+    owner, info = run.start_owner("safe")
+    _, handle = run.guardian(info["SessionId"])
+    record = box.record()
+    started = time.monotonic()
+    second = subprocess.run(
+        [sys.executable, "-m", "sniper", "--guard", str(record["OwnerPid"]),
+         str(record["OwnerCreateTime"]), info["SessionId"]], env=run.env, timeout=60,
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert second.returncode == 0, second.stderr
+    assert time.monotonic() - started < 20
+    run.assert_watching(handle, box.live())
+    owner.kill()
+    assert run.exit_code(handle) == 10
+    assert box.live_all() == GENUINE_ALL
+
+
+# ── 9. Both killed at once ───────────────────────────────────────────────────
+@pytest.mark.parametrize("mode", ["safe", "compat"])
+def test_with_both_killed_the_net_stays_and_launch_recovery_restores(run, registry_sandbox,
+                                                                    mode):
+    # As a power loss leaves it. The owner is stopped first, so it can't start
+    # a new guardian in between.
+    box = registry_sandbox
+    owner, info = run.start_owner(mode)
+    guard_pid, handle = run.guardian(info["SessionId"], wait_for_intermediate=True)
+    suspend(owner.pid)
     assert taskkill(guard_pid).returncode == 0
-    assert run.exit_code(handle) == 1  # taskkill /F's exit code
-    footprint, record = box.live(), box.record()
+    assert run.exit_code(handle) == 1
+    footprint, record = box.live_all(), box.record()
     owner.kill()
     owner.wait(30)
-    assert box.live() == footprint     # stranded: nobody is left to restore
+    assert box.live_all() == footprint  # stranded: nobody is left to restore...
     assert box.record() == record
-    # ...except the sign-in net (test_runonce_windows.py runs it for real).
-    assert set(box.runonce()) == {"SNIperRestoreProxyEnable", "SNIperRestoreProxyServer"}
+    # ...except the sign-in net (test_runonce_windows.py runs it for real)
+    # and the next launch.
+    assert set(box.runonce() or ()) == NET[mode]
     assert winproxy.recover_orphaned_proxy() == "restored"
     assert box.live_all() == GENUINE_ALL
     assert box.record() is None
