@@ -1,18 +1,19 @@
 """The guardian: a small separate process that restores the system proxy the
 moment SNIper dies, and says so.
 
-Safe mode already makes a dead SNIper harmless for most apps, and the next
-launch cleans up in any case. The guardian removes even the harmless
-leftover at once, fixes long-running apps that cached the PAC script, and is
-the main protection for Compatibility mode. Nothing can catch a Task Manager
-kill from inside the process being killed, so it has to be another process.
+A dead SNIper leaves the Windows proxy pointing at a port nobody answers, in
+either mode, and only a restore brings apps back online (an app that already
+loaded safe mode's script connects directly meanwhile, but not one that has
+yet to load it). The guardian is that restore. Nothing can catch a Task
+Manager kill from inside the process being killed, so it has to be another
+process.
 
 How it gets there. When SNIper applies the system proxy it starts an
 *intermediate* process (--spawn-guard), which starts the guardian (--guard)
 and exits at once. The guardian's parent is then gone, so "End process tree"
 or taskkill /T on SNIper does not reach it. A kill in the first second or
-two, while the intermediate still lives, can take both down; safe mode and
-launch recovery still cover that.
+two, while the intermediate still lives, can take both down; the sign-in
+safety net and launch recovery still cover that.
 
 What it does. It waits, using no CPU, on SNIper's process handle and on
 change notifications for HKCU\\Software\\SNIper:

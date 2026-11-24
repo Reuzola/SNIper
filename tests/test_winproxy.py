@@ -520,7 +520,7 @@ def test_mode_switch_refuses_after_the_old_record_backs_off(fake_reg, first, the
     else:
         # Safe: our one-off script URL went, as it always does; the manual
         # proxy, whose flag the user changed, stays as found.
-        assert fake_reg.live_all() == ("x", ADDR, ABSENT, "*")
+        assert fake_reg.live_all() == ("x", ADDR, ABSENT, winproxy._bypass_list(None))
         assert _writes(fake_reg, IE, mark) == [("DeleteValue", IE, "AutoConfigURL")]
     assert winproxy.proxy_restore() is None
 

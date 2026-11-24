@@ -1,15 +1,17 @@
 """Tests for the RunOnce safety net in sniper.winproxy, on the fake registry.
 
-In Compatibility mode, after the record is committed and the static proxy is
-live, one RunOnce value per genuine value holds a complete reg.exe command
-that writes it back, so an unclean exit that also took the guardian down is
-undone at the next sign-in even if SNIper never runs again. Safe mode never
-writes them. They go whenever the record is cleared, on every safe-mode
-apply and on every launch recovery. test_runonce_windows.py runs the commands
-for real against the registry sandbox.
+In either mode, after the record is committed and SNIper's proxy is live, one
+RunOnce value per genuine value holds a complete reg.exe command that puts it
+back (or deletes SNIper's, if there was none), so an unclean exit that also
+took the guardian down is undone at the next sign-in even if SNIper never runs
+again. They are replaced on every apply, and go whenever the record is cleared
+and on every launch recovery. test_runonce_windows.py runs the commands for
+real against the registry sandbox; that the net is there before safe mode's
+proxy takes effect, wherever the power is lost, is test_winproxy_pac.py's.
 """
 from __future__ import annotations
 
+import itertools
 import queue
 import re
 
@@ -28,8 +30,11 @@ IE = IE_KEY.lower()
 REC = RESTORE_KEY.lower()
 RUNONCE = RUNONCE_KEY.lower()
 WINDIR = r"C:\Windows"
-HEAD = (r'"C:\Windows\System32\reg.exe" add '
-        r'"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings" /v ')
+REG = r'"C:\Windows\System32\reg.exe" '
+WHERE = r'"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings" /v '
+HEAD = REG + "add " + WHERE
+# Every combination of genuine values, for what holds in both modes.
+MODES = pytest.mark.parametrize("pac_url", [None, URL], ids=["static", "safe"])
 OTHER = ("OneDriveSetup", r"C:\x\OneDriveSetup.exe /thfirstsetup")  # not ours
 
 
@@ -39,6 +44,10 @@ def enable_cmd(n):
 
 def sz_cmd(name, data):
     return HEAD + '%s /t REG_SZ /d "%s" /f' % (name, data)
+
+
+def delete_cmd(name):
+    return REG + "delete " + WHERE + name + " /f"
 
 
 @pytest.fixture(autouse=True)
@@ -59,6 +68,10 @@ def net(fake):
             if name.lower().startswith("sniperrestore")}
 
 
+def expected_net(commands):
+    return {"SNIperRestore" + name: command for name, command in commands.items()}
+
+
 def put_runonce(fake, *pairs):
     for name, data in pairs:
         fake.put(RUNONCE_KEY, name, data, REG_SZ)
@@ -70,19 +83,27 @@ def stale_net(fake):
                 ("SNIperRestoreFromTheFuture", "anything"), OTHER)
 
 
-_CMD_RX = re.compile(r'^"(?P<exe>[^"]+)" add "HKCU\\(?P<key>[^"]+)" /v (?P<name>\w+) '
-                     r'/t (?P<kind>REG_DWORD|REG_SZ) /d (?:"(?P<sz>[^"]*)"|(?P<dw>\d+)) /f$')
+_CMD_RX = re.compile(
+    r'^"(?P<exe>[^"]+)" (?:add|(?P<delete>delete)) "HKCU\\(?P<key>[^"]+)" /v (?P<name>\w+)'
+    r'(?(delete)|(?: /t REG_DWORD /d (?P<dw>\d+)| /t REG_SZ /d "(?P<sz>[^"]*)")) /f$')
 
 
-def run_net(fake):
+def run_net(fake, names=None):
     """Do what the commands say, on the fake: what reg.exe would do at sign-in.
-    Fails the test on any command that isn't exactly the expected shape."""
-    for name, command in net(fake).items():
+    Windows deletes a value before it runs it, so the net is gone afterwards.
+    names limits it to those commands, in that order. Fails the test on any
+    command that isn't exactly the expected shape."""
+    commands = net(fake)
+    for name in names or list(commands):
+        command = commands[name]
         m = _CMD_RX.match(command)
         assert m, command
-        assert m["exe"] == WINDIR + r"\System32\reg.exe"
+        assert m["exe"].lower().endswith(r"\system32\reg.exe"), command
         assert name == "SNIperRestore" + m["name"]
-        if m["kind"] == "REG_DWORD":
+        fake.keys[RUNONCE].pop(name.lower())
+        if m["delete"]:
+            fake.keys[m["key"].lower()].pop(m["name"].lower(), None)
+        elif m["dw"] is not None:
             fake.put(m["key"], m["name"], int(m["dw"]), REG_DWORD)
         else:
             fake.put(m["key"], m["name"], m["sz"], REG_SZ)
@@ -134,23 +155,113 @@ def test_running_the_net_after_a_crash_restores_the_genuine_values(fake_reg, gen
     assert net(fake_reg) == {} and fake_reg.record() is None
 
 
-def test_safe_mode_writes_no_net_and_removes_a_stale_one(fake_reg):
+@pytest.mark.parametrize("genuine, expected", [
+    # Nothing genuine: SNIper's script and bypass list are deleted.
+    ((0, "", ABSENT, ABSENT),
+     {"ProxyEnable": enable_cmd(0), "ProxyServer": sz_cmd("ProxyServer", ""),
+      "AutoConfigURL": delete_cmd("AutoConfigURL"),
+      "ProxyOverride": delete_cmd("ProxyOverride")}),
+    ((1, "corp:8080", ABSENT, "*.corp;<local>"),
+     {"ProxyEnable": enable_cmd(1), "ProxyServer": sz_cmd("ProxyServer", "corp:8080"),
+      "AutoConfigURL": delete_cmd("AutoConfigURL"),
+      "ProxyOverride": sz_cmd("ProxyOverride", "*.corp;<local>")}),
+    ((0, "", CORP_PAC, "*"),
+     {"ProxyEnable": enable_cmd(0), "ProxyServer": sz_cmd("ProxyServer", ""),
+      "AutoConfigURL": sz_cmd("AutoConfigURL", CORP_PAC),
+      "ProxyOverride": sz_cmd("ProxyOverride", "*")}),
+    # Empty is not absent: safe mode wrote over both, so both come back empty.
+    ((0, "", "", ""),
+     {"ProxyEnable": enable_cmd(0), "ProxyServer": sz_cmd("ProxyServer", ""),
+      "AutoConfigURL": sz_cmd("AutoConfigURL", ""),
+      "ProxyOverride": sz_cmd("ProxyOverride", "")}),
+], ids=["nothing", "manual-proxy", "pac-and-star", "empty"])
+def test_safe_mode_has_a_command_for_each_value_it_writes_over(fake_reg, genuine, expected):
     stale_net(fake_reg)
+    fake_reg.set_live(*genuine[:3], override=genuine[3])
     winproxy.proxy_enable(ADDR, pac_url=URL)
-    # The script next to the manual proxy that bypasses every host: fail-open
-    # for all but the apps that read only the manual proxy.
-    assert fake_reg.live_all() == (1, ADDR, URL, "*")
-    assert net(fake_reg) == {}
-    assert fake_reg.runonce() == {OTHER[0]: (OTHER[1], REG_SZ)}  # others stay
-    assert not [op for op in fake_reg.ops if op[0] == "SetValueEx" and op[1] == RUNONCE]
+    assert net(fake_reg) == expected_net(expected)
+    assert all(len(c) <= 260 for c in net(fake_reg).values())
+    assert all(kind == REG_SZ for _, kind in fake_reg.runonce().values())
+    assert fake_reg.runonce()[OTHER[0]] == (OTHER[1], REG_SZ)  # others stay
 
 
-def test_a_reapply_rewrites_the_net_from_the_record_not_the_live_footprint(fake_reg):
-    fake_reg.set_live(0, "", CORP_PAC)
-    winproxy.proxy_enable(ADDR)
+SAFE_GENUINE = [(0, "", ABSENT, ABSENT), (1, "corp:8080", ABSENT, "*.corp;<local>"),
+                (0, "", CORP_PAC, "*"), (0, "127.0.0.1:8881", "", ""),
+                (1, "proxy with spaces:1", "http://corp/a b.pac", "a b;<local>")]
+
+
+@pytest.mark.parametrize("genuine", SAFE_GENUINE)
+def test_running_the_safe_mode_net_restores_it_all_in_any_order(fake_reg, genuine):
+    for order in itertools.permutations(
+            ["SNIperRestore" + n for n in ("ProxyEnable", "ProxyServer", "AutoConfigURL",
+                                           "ProxyOverride")]):
+        fake_reg.set_live(*genuine[:3], override=genuine[3])
+        winproxy.proxy_enable(ADDR, pac_url=URL)
+        assert fake_reg.live_all()[:3] == (1, ADDR, URL)
+        run_net(fake_reg, order)                   # sign-in after the crash
+        assert fake_reg.live_all() == genuine, order
+        assert net(fake_reg) == {}                 # each one fired, and is gone
+        # The next launch finds the record already settled and clears up.
+        assert winproxy.recover_orphaned_proxy() == "already"
+        assert fake_reg.record() is None
+
+
+def test_signing_in_after_only_some_commands_ran_gets_there_in_the_end(fake_reg):
+    # A second power loss in the middle of the sign-in: what ran is gone from
+    # RunOnce, the rest runs at the one after.
+    genuine = (1, "corp:8080", CORP_PAC, "<local>")
+    fake_reg.set_live(*genuine[:3], override=genuine[3])
+    winproxy.proxy_enable(ADDR, pac_url=URL)
+    run_net(fake_reg, ["SNIperRestoreProxyOverride", "SNIperRestoreProxyEnable"])
+    assert set(net(fake_reg)) == {"SNIperRestoreProxyServer", "SNIperRestoreAutoConfigURL"}
+    assert fake_reg.live_all() == (1, ADDR, URL, "<local>")
+    run_net(fake_reg)
+    assert fake_reg.live_all() == genuine
+    assert winproxy.recover_orphaned_proxy() == "already"
+
+
+@pytest.mark.parametrize("genuine, left_out, reason", [
+    ((1, "corp:8080", ABSENT, 'a"b'), "ProxyOverride", "it contains a quote"),
+    ((1, "corp:8080", ABSENT, "a\\"), "ProxyOverride", "it ends with a backslash"),
+    ((1, "corp:8080", ABSENT, "*.corp;" * 30), "ProxyOverride",
+     "its command would be longer than 260 characters"),
+    ((1, "corp:8080", "http://corp/" + "p" * 200, ABSENT), "AutoConfigURL",
+     "its command would be longer than 260 characters"),
+], ids=["quote", "backslash", "long-list", "long-pac"])
+def test_a_safe_mode_value_a_command_cannot_carry_is_left_out(fake_reg, genuine, left_out,
+                                                             reason):
+    fake_reg.set_live(*genuine[:3], override=genuine[3])
+    log = queue.Queue()
+    winproxy.proxy_enable(ADDR, pac_url=URL, log_q=log)
+    assert set(net(fake_reg)) == {"SNIperRestore" + n for n in (
+        "ProxyEnable", "ProxyServer", "AutoConfigURL", "ProxyOverride")} - {
+        "SNIperRestore" + left_out}
+    assert list(log.queue) == [("DEBUG", "Sign-in safety net: %s left out, because %s."
+                                % (left_out, reason))]
+    # The sign-in still takes SNIper's proxy away; the launch finishes it.
+    run_net(fake_reg)
+    assert fake_reg.live()[:2] == genuine[:2]
+    assert winproxy.recover_orphaned_proxy() == "restored"
+    assert fake_reg.live_all() == genuine
+
+
+def test_a_stale_net_of_the_other_mode_never_survives(fake_reg):
+    fake_reg.set_live(0, "", ABSENT)
+    winproxy.proxy_enable(ADDR, pac_url=URL)
+    assert len(net(fake_reg)) == 4
+    winproxy.proxy_enable(ADDR2)
+    # Static mode never touched the script or the list: no command may.
+    assert net(fake_reg) == expected_net({"ProxyEnable": enable_cmd(0),
+                                          "ProxyServer": sz_cmd("ProxyServer", "")})
+
+
+@MODES
+def test_a_reapply_rewrites_the_net_from_the_record_not_the_live_footprint(fake_reg, pac_url):
+    fake_reg.set_live(0, "", CORP_PAC, override="<local>")
+    winproxy.proxy_enable(ADDR, pac_url=pac_url)
     first = net(fake_reg)
-    assert fake_reg.live() == (1, ADDR, "")    # the footprint, never genuine
-    winproxy.proxy_enable(ADDR2)               # the idempotent path
+    assert fake_reg.live()[:2] == (1, ADDR)    # the footprint, never genuine
+    winproxy.proxy_enable(ADDR2, pac_url=pac_url)   # the idempotent path
     assert net(fake_reg) == first
 
 
@@ -257,7 +368,7 @@ def _kept(fake):
 
 
 def _already(fake):
-    fake.set_live(1, "corp:8080", ABSENT)
+    fake.set_live(1, "corp:8080", ABSENT, override=ABSENT)
     return winproxy.proxy_restore()
 
 
@@ -269,15 +380,16 @@ def _by_launch_recovery(fake):
     return winproxy.recover_orphaned_proxy()
 
 
+@MODES
 @pytest.mark.parametrize("clear, outcome", [
     (_restored, "restored"), (_kept, "kept"), (_already, "already"),
     (_by_the_guardian, "restored"), (_by_launch_recovery, "restored"),
 ], ids=["restored", "kept", "already", "guardian", "launch-recovery"])
-def test_the_net_goes_whenever_the_record_is_cleared(fake_reg, clear, outcome):
+def test_the_net_goes_whenever_the_record_is_cleared(fake_reg, clear, outcome, pac_url):
     fake_reg.set_live(1, "corp:8080", ABSENT)
     put_runonce(fake_reg, OTHER)
-    winproxy.proxy_enable(ADDR, session_id=SID)
-    assert len(net(fake_reg)) == 2
+    winproxy.proxy_enable(ADDR, pac_url=pac_url, session_id=SID)
+    assert len(net(fake_reg)) == (2 if pac_url is None else 4)
     mark = len(fake_reg.ops)
     assert clear(fake_reg) == outcome
     assert net(fake_reg) == {}
@@ -311,18 +423,22 @@ def test_launch_recovery_with_no_runonce_key_at_all(fake_reg):
 @pytest.mark.parametrize("op", [lambda: winproxy.proxy_restore(),
                                 lambda: winproxy.recover_orphaned_proxy()],
                          ids=["restore", "recover"])
-def test_a_record_that_cannot_be_restored_keeps_its_net(fake_reg, op):
-    winproxy.proxy_enable(ADDR)
+@MODES
+def test_a_record_that_cannot_be_restored_keeps_its_net(fake_reg, op, pac_url):
+    winproxy.proxy_enable(ADDR, pac_url=pac_url)
     before = net(fake_reg)
+    assert before
     fake_reg.fail.add(("OpenKey", IE))     # the live state can't be read
     assert op() is None
     assert fake_reg.record() is not None
     assert net(fake_reg) == before
 
 
-def test_another_sessions_record_keeps_its_net(fake_reg):
-    winproxy.proxy_enable(ADDR, session_id=SID)
+@MODES
+def test_another_sessions_record_keeps_its_net(fake_reg, pac_url):
+    winproxy.proxy_enable(ADDR, pac_url=pac_url, session_id=SID)
     before = net(fake_reg)
+    assert before
     assert winproxy.proxy_restore(session_id="fedcba9876543210") == "not-ours"
     assert net(fake_reg) == before
 
@@ -332,19 +448,23 @@ def test_a_mode_switch(fake_reg, old, new):
     fake_reg.set_live(1, "corp:8080", ABSENT)
     winproxy.proxy_enable(ADDR, pac_url=old)
     winproxy.proxy_enable(ADDR2, pac_url=new)
-    if new is None:
-        assert net(fake_reg) == {"SNIperRestoreProxyEnable": enable_cmd(1),
-                                 "SNIperRestoreProxyServer": sz_cmd("ProxyServer", "corp:8080")}
-    else:
-        assert net(fake_reg) == {}
+    expected = {"ProxyEnable": enable_cmd(1),
+                "ProxyServer": sz_cmd("ProxyServer", "corp:8080")}
+    if new is not None:
+        expected.update(AutoConfigURL=delete_cmd("AutoConfigURL"),
+                        ProxyOverride=delete_cmd("ProxyOverride"))
+    assert net(fake_reg) == expected_net(expected)
 
 
 # ── The kill switch ──────────────────────────────────────────────────────────
-def test_the_kill_switch_writes_nothing_but_still_removes_stale_values(fake_reg, monkeypatch):
+@MODES
+def test_the_kill_switch_writes_nothing_but_still_removes_stale_values(fake_reg, monkeypatch,
+                                                                      pac_url):
     monkeypatch.setattr(winproxy, "RUNONCE_SAFETY_NET", False)
     stale_net(fake_reg)
-    winproxy.proxy_enable(ADDR)
-    assert fake_reg.live() == (1, ADDR, ABSENT)     # Compatibility mode still works
+    winproxy.proxy_enable(ADDR, pac_url=pac_url)
+    assert fake_reg.live() == (1, ADDR, pac_url)     # SNIper still works
+    assert fake_reg.live_all()[3] != "*"             # ...in full, safe mode too
     assert net(fake_reg) == {}
     assert not [op for op in fake_reg.ops if op[0] == "SetValueEx" and op[1] == RUNONCE]
     stale_net(fake_reg)
@@ -388,8 +508,10 @@ def test_removing_a_stale_net_runs_under_the_state_lock(fake_reg, op):
     assert runonce_calls and all(start <= i < end for i in runonce_calls)
 
 
+@MODES
 @pytest.mark.parametrize("failing", ["CreateKey", "first-write", "second-write"])
-def test_a_net_that_cannot_be_written_never_fails_the_apply(fake_reg, monkeypatch, failing):
+def test_a_net_that_cannot_be_written_never_fails_the_apply(fake_reg, monkeypatch, failing,
+                                                           pac_url):
     fake_reg.set_live(0, "", CORP_PAC)
     if failing == "CreateKey":
         fake_reg.fail.add(("CreateKey", RUNONCE))
@@ -405,8 +527,10 @@ def test_a_net_that_cannot_be_written_never_fails_the_apply(fake_reg, monkeypatc
             return real_set(hkey, name, reserved, kind, data)
         monkeypatch.setattr(fake_reg, "SetValueEx", set_value)
     log = queue.Queue()
-    assert winproxy.proxy_enable(ADDR, log_q=log) == CORP_PAC   # the apply worked
-    assert fake_reg.live() == (1, ADDR, "")
+    # The apply worked, in full: apps are worth more than the last net.
+    assert winproxy.proxy_enable(ADDR, pac_url=pac_url, log_q=log) == CORP_PAC
+    assert fake_reg.live() == (1, ADDR, pac_url or "")
+    assert fake_reg.live_all()[3] != "*"
     assert fake_reg.record()["Complete"] == 1
     assert fake_reg.refresh_calls                               # and took effect
     assert net(fake_reg) == {}                                  # no half net left

@@ -4,7 +4,8 @@
   against the registry sandbox.
 - A simulated hard kill (no restore runs) followed by launch recovery.
 - Windows' own PAC engine (WinHTTP) evaluating the script SNIper serves, and
-  failing to download it once SNIper is gone: the precondition for fail-open.
+  failing to download it once SNIper is gone: what sends an app to the manual
+  proxy next to it until something restores the settings.
 
 Nothing here touches the real proxy settings: winproxy is pointed at the
 registry sandbox, and the WinHTTP queries name the script URL explicitly
@@ -34,6 +35,7 @@ if IS_WINDOWS:
                          winhttp_proxy_for_url)
 
 CORP = (1, "corp:8080", "http://corp/p.pac")
+RULES = winproxy._bypass_list(None)   # the list over no genuine one
 
 
 @pytest.fixture
@@ -56,16 +58,20 @@ def test_safe_mode_end_to_end(server, registry_sandbox, genuine):
     box.set_live(*genuine)
     server.start(0, 2, False)
     url = server.pac_url
-    # The script, and the manual proxy that bypasses every host.
-    assert box.live_all() == (1, server.addr, url, "*")
+    # The script, the manual proxy that only local hosts bypass, and the net
+    # for the next sign-in.
+    assert box.live_all() == (1, server.addr, url, RULES)
     record = box.record()
     assert (record["AppliedMode"], record["AppliedAutoConfigURL"], record["Complete"]) \
         == ("pac", url, 1)
+    assert record["AppliedProxyOverride"] == RULES
+    assert len(box.runonce()) == 4
     # The URL in the registry is the one being served.
     assert fetch(box.live()[2]) == build_pac(server.port).encode("ascii")
     server.stop()
     assert box.live_all() == genuine + (ABSENT,)
     assert box.record() is None
+    assert not box.runonce()
     assert not box.exists(box.sniper_key)
 
 
@@ -88,7 +94,7 @@ def test_switching_modes_between_sessions(server, registry_sandbox):
     server.start(0, 2, False, compat=True)
     server.stop()
     server.start(0, 2, False)
-    assert box.live_all() == (1, server.addr, server.pac_url, "*")
+    assert box.live_all() == (1, server.addr, server.pac_url, RULES)
     server.stop()
     assert box.live_all() == CORP + (ABSENT,)
 
@@ -165,8 +171,8 @@ def test_windows_pac_engine_evaluates_the_served_script(server, registry_sandbox
     assert wrong == {}
 
     # SNIper gone: a client that (re)fetches the script cannot download it,
-    # which for a non-mandatory PAC means DIRECT. A path never asked for
-    # before, so no cached copy of the script can answer instead.
+    # and is left to the manual proxy. A path never asked for before, so no
+    # cached copy of the script can answer instead.
     server.stop()
     gone = "http://127.0.0.1:%d/sniper-%s.pac" % (port, secrets.token_hex(8))
     result = ask_windows("https://example.com/", gone)

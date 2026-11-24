@@ -1,10 +1,14 @@
-"""Tests for sniper.pac, the safe-mode PAC script.
+"""Tests for sniper.pac: the safe-mode PAC script, and the rules it shares with
+the manual proxy's bypass list.
 
 The script text is pinned exactly, and then evaluated by a real JavaScript
 engine against the routing table from the plan: node when it is on PATH, and
 on Windows also the in-box JScript engine (cscript.exe), so the table runs on
 a stock Windows machine too. Windows' own WinHTTP PAC engine evaluates it in
 test_server_pac_windows.py.
+
+The bypass list is checked against the same table, by the parsers that decide
+for real apps: test_bypass_list.py.
 """
 from __future__ import annotations
 
@@ -17,24 +21,30 @@ import subprocess
 import pytest
 
 from sniper.compat import IS_WINDOWS
-from sniper.pac import PAC_CONTENT_TYPE, build_pac, new_pac_path
+from sniper.pac import PAC_CONTENT_TYPE, build_pac, bypass_rules, new_pac_path
 
-# The script exactly as the plan specifies it, port 8881.
+# The script exactly as it must come out of the rule tables, port 8881.
 EXPECTED_8881 = r"""function FindProxyForURL(url, host) {
   host = host.toLowerCase();
   if ((host.indexOf(".") < 0 && host.indexOf(":") < 0) ||
+      host == "::1" || host == "[::1]" ||
       host == "localhost" || dnsDomainIs(host, ".localhost") ||
-      host == "127.0.0.1" || host == "::1" || host == "[::1]" ||
-      /^(10|127)\.\d+\.\d+\.\d+$/.test(host) ||
-      /^192\.168\.\d+\.\d+$/.test(host) ||
-      /^169\.254\.\d+\.\d+$/.test(host) ||
-      /^172\.(1[6-9]|2\d|3[01])\.\d+\.\d+$/.test(host) ||
       host == "msftconnecttest.com" || dnsDomainIs(host, ".msftconnecttest.com") ||
-      host == "msftncsi.com" || dnsDomainIs(host, ".msftncsi.com"))
+      host == "msftncsi.com" || dnsDomainIs(host, ".msftncsi.com") ||
+      dnsDomainIs(host, ".local") ||
+      (/^\d+\.\d+\.\d+\.\d+$/.test(host) &&
+       /^(127|10|192\.168|169\.254|172\.16|172\.17|172\.18|172\.19|172\.20|172\.21|172\.22|172\.23|172\.24|172\.25|172\.26|172\.27|172\.28|172\.29|172\.30|172\.31)\./.test(host)))
     return "DIRECT";
   return "PROXY 127.0.0.1:8881; DIRECT";
 }
 """
+# And the same rules as a bypass list.
+EXPECTED_RULES = (
+    "localhost", "*.localhost", "msftconnecttest.com", "*.msftconnecttest.com",
+    "msftncsi.com", "*.msftncsi.com", "*.local", "127.*", "10.*", "192.168.*",
+    "169.254.*", "172.16.*", "172.17.*", "172.18.*", "172.19.*", "172.20.*",
+    "172.21.*", "172.22.*", "172.23.*", "172.24.*", "172.25.*", "172.26.*",
+    "172.27.*", "172.28.*", "172.29.*", "172.30.*", "172.31.*", "<local>")
 
 # The plan's table: these go through SNIper...
 PROXIED = ["discord.com", "www.example.com", "8.8.8.8", "2606:4700::1111",
@@ -47,9 +57,11 @@ DIRECT = ["WWW.MSFTCONNECTTEST.COM", "ipv6.msftconnecttest.com",
 # Boundaries of the same rules, beyond the plan's table.
 EXTRA_PROXIED = ["172.15.255.255", "192.169.0.1", "169.255.0.1", "11.0.0.1",
                  "10.0.0.5.nip.io", "x.localhost.com", "msftncsi.com.example.net",
-                 "fe80::1", "LOCALHOST.example.com"]
+                 "fe80::1", "LOCALHOST.example.com", "172.160.0.1", "100.0.0.1",
+                 "printer.local.example.com", "mylocal.example.com", "thelocal.com"]
 EXTRA_DIRECT = ["[::1]", "LOCALHOST", "Intranet", "172.31.255.255",
-                "127.1.2.3", "a.b.localhost", "www.msftncsi.com"]
+                "127.1.2.3", "a.b.localhost", "www.msftncsi.com", "printer.local",
+                "DC01.Corp.LOCAL", "10.255.255.255", "172.20.10.1"]
 
 _FORBIDDEN = ("dnsResolve", "isInNet", "myIpAddress", "isResolvable",
               "dnsDomainLevels", "isPlainHostName")
@@ -88,8 +100,23 @@ def test_direct_fallback_is_the_last_return():
 
 
 def test_regex_backslashes_survive():
-    # A format()/% template would have mangled these.
-    assert r"/^(10|127)\.\d+\.\d+\.\d+$/" in build_pac(8881)
+    assert r"/^\d+\.\d+\.\d+\.\d+$/" in build_pac(8881)
+    assert r"|192\.168|" in build_pac(8881)
+
+
+# ── The same rules as a bypass list ──────────────────────────────────────────
+def test_the_bypass_rules_are_exactly_these():
+    assert bypass_rules() == EXPECTED_RULES
+
+
+def test_no_rule_is_one_that_some_parser_reads_differently():
+    for rule in bypass_rules():
+        rule.encode("ascii")
+        assert not re.search(r"[;,\s]", rule), rule          # the separators
+        assert rule.strip("*."), rule                         # never "every host"
+        assert ":" not in rule and "[" not in rule, rule      # see bypass_rules()
+        assert "/" not in rule and "?" not in rule, rule      # CIDR, other globs
+    assert len(set(r.lower() for r in bypass_rules())) == len(bypass_rules())
 
 
 def test_new_pac_path_is_random_and_well_formed():

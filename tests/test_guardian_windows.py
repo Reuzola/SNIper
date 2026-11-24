@@ -36,8 +36,10 @@ _SRC = os.path.dirname(os.path.dirname(os.path.abspath(winproxy.__file__)))
 GENUINE = (0, "", ABSENT)
 # The same with ProxyOverride, which safe mode writes too.
 GENUINE_ALL = GENUINE + (ABSENT,)
-# The sign-in net per mode.
-NET = {"compat": {"SNIperRestoreProxyEnable", "SNIperRestoreProxyServer"}, "safe": set()}
+# The bypass list safe mode applies over that, and the sign-in net per mode.
+RULES = winproxy._bypass_list(None)
+NET = {"compat": {"SNIperRestoreProxyEnable", "SNIperRestoreProxyServer"}}
+NET["safe"] = NET["compat"] | {"SNIperRestoreAutoConfigURL", "SNIperRestoreProxyOverride"}
 RESTORE_TIMEOUT = 15
 # The graceful case stops on its own after this many seconds. Long enough for
 # the (about 1 s) process query to find the guardian first, so its exit code
@@ -151,16 +153,15 @@ def test_hard_kill_restores_within_seconds(run, registry_sandbox, mode):
     owner, info = run.start_owner(mode)
     if mode == "safe":
         e, s, a, o = box.live_all()
-        assert (e, s, o) == (1, "127.0.0.1:%d" % info["Port"], "*")
+        assert (e, s, o) == (1, "127.0.0.1:%d" % info["Port"], RULES)
         assert a.startswith(pac_url(info["Port"]))
-        assert not box.runonce()  # safe mode never writes the sign-in net
     else:
         assert box.live() == (1, "127.0.0.1:%d" % info["Port"], ABSENT)
-        # The owner's winproxy wrote the sign-in net into the sandbox (the
-        # environment redirects RunOnce too), aimed at the sandbox's key.
-        net = box.runonce()
-        assert set(net) == {"SNIperRestoreProxyEnable", "SNIperRestoreProxyServer"}
-        assert all(('"HKCU\\%s"' % box.ie) in command for command in net.values())
+    # The owner's winproxy wrote the sign-in net into the sandbox (the
+    # environment redirects RunOnce too), aimed at the sandbox's key.
+    net = box.runonce()
+    assert set(net) == NET[mode]
+    assert all(('"HKCU\\%s"' % box.ie) in command for command in net.values())
     assert box.record()["SessionId"] == info["SessionId"]
     _, handle = run.guardian(info["SessionId"])
     run.assert_watching(handle, box.live())
@@ -251,7 +252,7 @@ def test_owner_already_dead_when_the_guardian_starts(run, registry_sandbox, monk
     winproxy.proxy_enable("127.0.0.1:1", pac_url=url, session_id=sid)
     monkeypatch.undo()  # only the record was meant to name the dead child
     assert box.record()["OwnerPid"] == identity[0]
-    assert box.live_all() == (1, "127.0.0.1:1", url, "*")
+    assert box.live_all() == (1, "127.0.0.1:1", url, RULES)
     run.sessions.add(sid)
     guard = subprocess.run([sys.executable, "-m", "sniper", "--guard", str(identity[0]),
                             str(identity[1]), sid], env=run.env, timeout=60,
@@ -359,8 +360,8 @@ def test_cancelled_sign_out_hands_over_to_a_new_guardian(run, registry_sandbox,
 def test_the_guardian_survives_a_tree_kill(run, registry_sandbox):
     # The intermediate has exited, so the guardian has no parent in the
     # owner's tree: taskkill /T can't reach it. (A tree kill while the
-    # intermediate still lives can take the guardian down; launch recovery
-    # and safe mode cover that first second or two.)
+    # intermediate still lives can take the guardian down; the sign-in net
+    # and launch recovery cover that first second or two.)
     box = registry_sandbox
     owner, info = run.start_owner("compat")
     guard_pid, handle = run.guardian(info["SessionId"], wait_for_intermediate=True)
@@ -453,7 +454,7 @@ def test_with_both_killed_the_net_stays_and_launch_recovery_restores(run, regist
     assert box.record() == record
     # ...except the sign-in net (test_runonce_windows.py runs it for real)
     # and the next launch.
-    assert set(box.runonce() or ()) == NET[mode]
+    assert set(box.runonce()) == NET[mode]
     assert winproxy.recover_orphaned_proxy() == "restored"
     assert box.live_all() == GENUINE_ALL
     assert box.record() is None

@@ -302,10 +302,13 @@ def test_compat_tooltip():
     import sniper.ui as ui
     text = ui.TOOLTIPS["compat_mode"]
     assert text.startswith(
-        "Use a fixed system proxy instead of SNIper's safe auto-config script.\n\n")
+        "Use only a fixed system proxy, without SNIper's auto-config script.\n\n")
     assert "Default: off (safe mode)." in text
-    assert "your\ninternet never breaks." in text
-    assert text.endswith("lose internet until SNIper restores the settings.")
+    # What brings the settings back holds in both modes, and is all it promises.
+    assert text.endswith("In both modes your settings are restored at once if SNIper "
+                         "crashes or is\nkilled, and at your next sign-in if the PC "
+                         "loses power.")
+    assert "never breaks" not in text
 
 
 @pytest.mark.parametrize("compat", [False, True])

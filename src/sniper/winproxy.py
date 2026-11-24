@@ -3,21 +3,35 @@
 SNIper points the per-user system proxy at itself in one of two modes:
 
 - Safe mode ("pac", the default): AutoConfigURL names a PAC script SNIper
-  serves itself (see sniper.pac), and next to it a manual proxy that bypasses
-  every host: ProxyEnable=1, ProxyServer=127.0.0.1:port, ProxyOverride="*".
-  A dead SNIper is then harmless with no code having to run: the script can't
-  be fetched, or the proxy it names refuses, and clients go DIRECT. WinINet
-  and Chromium fall back from a failed auto-config script to the manual
-  proxy, and its bypass list sends every host DIRECT; without that list the
-  fallback would be the dead SNIper.
-  The manual proxy is there for apps that read only ProxyEnable/ProxyServer
-  and ignore both the script and the bypass list. The Discord desktop app's
-  updater (Rust reqwest 0.11) is one: it reads them once when Discord starts,
-  and can't reach updates.discord.com without them, so Discord never opens.
-  Only such apps lose their connection if SNIper dies (until the guardian
-  restores); everything that follows the script or the bypass list fails open.
+  serves itself (see sniper.pac), and next to it a manual proxy for apps that
+  don't follow the script: ProxyEnable=1, ProxyServer=127.0.0.1:port and a
+  ProxyOverride bypass list that holds only the user's own entries and local
+  hosts, the ones the script answers DIRECT for. Every way an app can discover
+  the Windows proxy then leads to SNIper: the script, the manual proxy with
+  its bypass list ignored, and the manual proxy with it honored. The Discord
+  desktop app's updater (Rust reqwest) reads only the manual proxy, once when
+  Discord starts, and can't reach updates.discord.com without SNIper, so
+  Discord never opens; Python's urllib and requests read only it as well.
+  Up to v1.2.0 the bypass list was "*", every host, which worked because
+  reqwest 0.11 ignored the list. reqwest 0.12 honors it, so when a Discord
+  update moved to that, its updater walked straight past SNIper. A list that
+  no parser reads as "everything" doesn't depend on which of the three an app
+  does, or will do after its next update.
+  The price is paid when SNIper is gone and nothing has restored the settings
+  yet. A client that can't fetch the script falls back to the manual proxy,
+  and where "*" then sent it DIRECT it now finds the dead SNIper's port. The
+  nets below are what brings it back.
 - Compatibility mode ("static"): ProxyEnable=1 and ProxyServer=127.0.0.1:port,
   for apps that ignore PAC scripts. This is exactly the v1.1.7 behavior.
+
+Several nets undo a footprint whose SNIper is gone, each for what the ones
+before it can't see. The guardian (sniper.guardian), a separate process,
+restores the moment SNIper is killed or crashes. The session-end handler
+(sniper.sessionwatch) restores before Windows signs out or shuts down. If
+SNIper and its guardian both died (a power loss, both killed, the EXE gone),
+a one-time RunOnce entry puts the genuine values back at the next sign-in
+with Windows' own reg.exe, in either mode (see _write_runonce); and the next
+launch of SNIper recovers the record before anything else.
 
 The genuine pre-SNIper proxy configuration (the *restore baseline*) is written
 to a durable per-user registry key BEFORE SNIper overwrites the live Internet
@@ -38,16 +52,20 @@ the live proxy has diverged — the user changed it during the
 session or between a crash and the next launch — SNIper treats the user as
 having taken control: it leaves the live proxy untouched and simply drops the
 durable record. SNIper only ever undoes its own change, never a manual one —
-and never by guessing from the loopback address. In safe mode the script URL
-and the manual proxy are judged apart: SNIper's one-off script URL is always
-removed while it is still there, and the manual proxy is put back unless the
-user changed any of its values.
+and never by guessing from the loopback address. In safe mode the script URL,
+the manual proxy and its bypass list are judged apart: SNIper's one-off script
+URL is always removed while it is still there, the manual proxy is put back
+unless the user changed its flag or its server, and the bypass list unless the
+user changed any of the three. A user who only edited the list keeps it, and
+still gets their connection back.
 
 The record names the mode it was written for (AppliedMode). A record without
 it was written by v1.1.7 and is static; one without AppliedProxyServer
 predates footprints. Both are recovered exactly as before. A safe-mode record
 without AppliedManualProxy comes from a v1.2.0 build before the manual proxy
-was added, whose footprint was the script URL and ProxyEnable=0.
+was added, whose footprint was the script URL and ProxyEnable=0; one with it
+but without AppliedProxyOverride comes from v1.2.0 itself, whose bypass list
+was always "*".
 
 Every record also names its owner: the process that applied it (OwnerPid and
 OwnerCreateTime, which together name one process even after Windows reuses
@@ -59,13 +77,6 @@ SNIper's own Stop pass no session and restore whatever record there is.
 
 More than one process can now act on the record (SNIper, its guardian), so
 every read-decide-write sequence runs under a session-local named mutex.
-
-Compatibility mode has one more net, for when SNIper and its guardian both
-die or the EXE is gone: a one-time RunOnce entry that puts the genuine values
-back at the next sign-in with Windows' own reg.exe (see _write_runonce). Safe
-mode never writes it: its footprint already fails open for everything that
-follows the script or the bypass list, and the few apps that read only the
-manual proxy stay offline until the next launch recovers the record.
 
 All operations stay HKCU-only (no admin), standard-library only, and guarded so
 the module still imports on a non-Windows host where winreg is None.
@@ -81,6 +92,7 @@ from collections import namedtuple
 
 from sniper import procutil
 from sniper.compat import IS_WINDOWS, winreg
+from sniper.pac import bypass_rules
 
 _IE        = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 _IE_POLICY = r"Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings"
@@ -98,17 +110,19 @@ _RESTORE_KEY = r"Software\SNIper\ProxyRestore"
 # its guardian). Session-local like the single-instance mutex: no "Global\".
 _STATE_MUTEX_NAME = "SNIper_proxy_state"
 
-# ── Compatibility-mode safety net: RunOnce ────────────────────────────────────
-# After a static (Compatibility-mode) apply, one RunOnce value per genuine
-# value holds a complete reg.exe command that writes it back. If SNIper and
-# its guardian both die (power loss, both killed, the EXE deleted), Windows
-# runs them at the next sign-in and the static proxy is gone without SNIper
-# ever running again. Windows deletes a RunOnce value before it runs it, so
-# nothing is left once it has fired. It is a blind restore of the genuine
-# values: it can't check a footprint, so it is removed whenever the record is
-# cleared, on every safe-mode apply and on every launch recovery, and it only
-# ever fires after an unclean exit in Compatibility mode. reg.exe is a console
-# program, so a console window may flash briefly at that sign-in.
+# ── The sign-in safety net: RunOnce ───────────────────────────────────────────
+# With every apply, one RunOnce value per genuine value holds a complete
+# reg.exe command that puts it back, or deletes it if there was none. If
+# SNIper and its guardian both die (power loss, both killed, the EXE deleted),
+# Windows runs them at the next sign-in and SNIper's proxy is gone without
+# SNIper ever running again. Windows deletes a RunOnce value before it runs
+# it, so nothing is left once it has fired, and runs them in no fixed order,
+# so each one puts back one value on its own. It is a blind restore of the
+# genuine values: it can't check a footprint, so it is replaced on every
+# apply and removed whenever the record is cleared and on every launch
+# recovery, and it only ever fires after an unclean exit. (Restarting Explorer
+# doesn't run it; signing in does.) reg.exe is a console program, so a console
+# window may flash briefly at that sign-in.
 # RUNONCE_SAFETY_NET is the kill switch: when False nothing is ever written,
 # while stale values are still removed wherever they would be.
 RUNONCE_SAFETY_NET = True
@@ -152,8 +166,9 @@ if _SANDBOXED:
 MODE_STATIC = "static"
 MODE_PAC    = "pac"
 
-# The bypass list of safe mode's manual proxy: every host. WinINet, WinHTTP,
-# Chromium and Python all read "*" as matching any host name.
+# The bypass list that means every host to every parser that honors one. It
+# holds the manual proxy's place while safe mode is being applied (see
+# _apply_live_pac), and it is what v1.2.0 left there for good.
 _BYPASS_ALL = "*"
 
 # A complete restore record, as _read_baseline returns it:
@@ -172,12 +187,15 @@ _BYPASS_ALL = "*"
 #                         proxy ever wrote it)
 #   applied_manual        True if SNIper applied safe mode's manual proxy
 #                         (ProxyEnable=1, ProxyServer=applied_server,
-#                         ProxyOverride="*") next to its script URL
+#                         ProxyOverride=applied_override) next to its script URL
+#   applied_override      the bypass list it applied with it ("*" in a v1.2.0
+#                         record); None without applied_manual
 Baseline = namedtuple("Baseline", "enable server pac_present pac applied_server "
                                   "applied_mode applied_pac_url owner_pid "
                                   "owner_create_time session_id "
-                                  "override_present override applied_manual",
-                      defaults=(None, None, False))
+                                  "override_present override applied_manual "
+                                  "applied_override",
+                      defaults=(None, None, False, None))
 
 
 class UnrecordableProxyValue(ValueError):
@@ -362,22 +380,57 @@ def _apply_live(addr, clear_pac):
         winreg.CloseKey(k)
 
 
+def _bypass_list(genuine, log_q=None):
+    """The bypass list safe mode applies: the entries of the genuine one (None
+    or "" for none), then SNIper's own local rules (sniper.pac), each once
+    whatever its case.
+
+    An entry of nothing but wildcards and dots ("*", "*.*") is left out: it
+    means every host, so it would send exactly the apps this list is for
+    straight past SNIper. It stays in the record with the rest of the genuine
+    list, and comes back with it."""
+    entries, seen = [], set()
+    # Windows separates entries with semicolons or whitespace.
+    own = [entry for entry in re.split(r"[;\s]+", genuine or "") if entry]
+    for entry in own + list(bypass_rules()):
+        if not entry.strip("*."):
+            _debug(log_q, "Your Windows proxy exceptions include \"%s\" (every "
+                          "site); SNIper leaves it out while it runs." % entry)
+        elif entry.lower() not in seen:
+            seen.add(entry.lower())
+            entries.append(entry)
+    return ";".join(entries)
+
+
 def _apply_live_pac(pac_url, addr):
-    """Point the live HKCU proxy at SNIper in safe mode: its PAC script, and
-    the manual proxy that bypasses every host. Like _apply_live, only ever
-    runs AFTER the durable baseline is committed.
+    """Point the live HKCU proxy at SNIper in safe mode: its PAC script and
+    the manual proxy, still with a bypass list of every host. Like
+    _apply_live, only ever runs AFTER the durable baseline is committed.
 
     The bypass list goes in first and the enable flag last, so no moment
     ever has a manual proxy enabled that doesn't bypass every host: wherever
-    an interruption stops it, a dead SNIper still fails open. Each value
-    written is either the genuine one or exactly SNIper's, both in the
-    record, so the restore recognizes and fully undoes any such state."""
+    an interruption stops it, a dead SNIper still fails open. Only once the
+    sign-in safety net is in place does _apply_live_bypass let the manual
+    proxy take effect. Each value written is either the genuine one or
+    exactly SNIper's, all known to the restore, so it recognizes and fully
+    undoes any such state."""
     k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _IE, 0, winreg.KEY_WRITE)
     try:
         winreg.SetValueEx(k, "ProxyOverride", 0, winreg.REG_SZ, _BYPASS_ALL)
         winreg.SetValueEx(k, "ProxyServer", 0, winreg.REG_SZ, addr)
         winreg.SetValueEx(k, "AutoConfigURL", 0, winreg.REG_SZ, pac_url)
         winreg.SetValueEx(k, "ProxyEnable", 0, winreg.REG_DWORD, 1)
+    finally:
+        winreg.CloseKey(k)
+
+
+def _apply_live_bypass(bypass):
+    """The last live write of a safe-mode apply: the local-only bypass list in
+    place of "*". From here on the manual proxy is in effect for every app
+    that reads it, and a dead SNIper needs one of the nets."""
+    k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _IE, 0, winreg.KEY_WRITE)
+    try:
+        winreg.SetValueEx(k, "ProxyOverride", 0, winreg.REG_SZ, bypass)
     finally:
         winreg.CloseKey(k)
 
@@ -541,7 +594,10 @@ def _read_baseline():
     bypass list. SNIper only ever records them as REG_SZ, and a restore
     writes them back as REG_SZ, which takes nothing but a string.
     AutoConfigURL keeps its present flag, so the static footprint check still
-    expects the PAC that SNIper emptied."""
+    expects the PAC that SNIper emptied.
+
+    An AppliedProxyOverride that is missing, as v1.2.0 left it, or that isn't
+    a string reads as "*", the bypass list v1.2.0 always applied."""
     if not IS_WINDOWS:
         return None
     try:
@@ -608,6 +664,14 @@ def _read_baseline():
                     override = ""
         applied_manual = (mode == MODE_PAC
                           and _query_int(k, "AppliedManualProxy") == 1)
+        applied_override = None
+        if applied_manual:
+            try:
+                applied_override = winreg.QueryValueEx(k, "AppliedProxyOverride")[0]
+            except OSError:
+                pass  # a v1.2.0 record
+            if not isinstance(applied_override, str):
+                applied_override = _BYPASS_ALL
         owner_pid = _query_int(k, "OwnerPid")
         owner_create_time = _query_int(k, "OwnerCreateTime")
         try:
@@ -618,7 +682,8 @@ def _read_baseline():
             session_id = None
         return Baseline(enable, server or "", bool(present), pac, applied,
                         mode, applied_pac_url, owner_pid, owner_create_time,
-                        session_id, override_present, override, applied_manual)
+                        session_id, override_present, override, applied_manual,
+                        applied_override)
     finally:
         winreg.CloseKey(k)
 
@@ -633,15 +698,18 @@ def _query_int(k, name):
 
 
 def _write_baseline(enable, server, pac, applied_server, applied_mode,
-                    applied_pac_url, owner, session_id, override=None):
+                    applied_pac_url, owner, session_id, override=None,
+                    applied_override=None):
     """Persist the genuine baseline plus the footprint SNIper is applying and
     who applies it (owner is (pid, creation time)). The Complete marker is
     written LAST so an interruption mid-write leaves an incomplete record
     that _read_baseline ignores; pac is None when no PAC existed.
 
     AppliedAutoConfigURL, the genuine ProxyOverride (override, None when
-    there was none) and the AppliedManualProxy marker are written in PAC mode
-    only; a static record drops any left from a PAC record it replaces."""
+    there was none), the AppliedManualProxy marker and AppliedProxyOverride
+    (applied_override, the bypass list going live with it) are written in PAC
+    mode only; a static record drops any left from a PAC record it
+    replaces."""
     k = winreg.CreateKey(winreg.HKEY_CURRENT_USER, _RESTORE_KEY)
     try:
         # Drop any stale marker first so a crash mid-rewrite is not acted on.
@@ -675,9 +743,12 @@ def _write_baseline(enable, server, pac, applied_server, applied_mode,
                 except OSError:
                     pass
             winreg.SetValueEx(k, "AppliedManualProxy", 0, winreg.REG_DWORD, 1)
+            winreg.SetValueEx(k, "AppliedProxyOverride", 0, winreg.REG_SZ,
+                              applied_override)
         else:
             for name in ("AppliedAutoConfigURL", "ProxyOverridePresent",
-                         "ProxyOverride", "AppliedManualProxy"):
+                         "ProxyOverride", "AppliedManualProxy",
+                         "AppliedProxyOverride"):
                 try:
                     winreg.DeleteValue(k, name)
                 except OSError:
@@ -719,7 +790,7 @@ def _clear_baseline():
         pass
 
 
-# ── Compatibility-mode safety net (RunOnce) ───────────────────────────────────
+# ── The sign-in safety net (RunOnce) ──────────────────────────────────────────
 def _debug(log_q, text):
     """Put a DEBUG line on log_q, if the caller gave one."""
     if log_q is not None:
@@ -749,30 +820,49 @@ def _unwritable(text):
     return None
 
 
-def _runonce_commands(enable, server, pac):
-    """The RunOnce values that write the genuine values back to the live
-    Internet Settings, as ([(value name, command)], [(name, why skipped)]).
+def _genuine_values(mode, enable, server, pac, override):
+    """What the sign-in net puts back after a footprint of this mode, as
+    (value name, genuine value) in the order it is written; None means the
+    value is deleted.
 
-    pac is the genuine AutoConfigURL that static mode emptied, or None when
-    there was none to empty (an absent or empty one is never touched, so it
-    needs no command). A value that a command can't carry exactly, or whose
-    command would not fit in _RUNONCE_MAX_CHARS, is skipped rather than
-    written wrong; the others are still written. _IE is the live key (the
-    sandbox's own in tests), so a test can run the commands for real."""
-    head = '"%s" add "HKCU\\%s" /v ' % (_reg_exe(), _IE)
-    values = [("ProxyEnable", "REG_DWORD", "%d" % int(enable)),
-              ("ProxyServer", "REG_SZ", server or "")]
-    if pac:
-        values.append(("AutoConfigURL", "REG_SZ", pac))
+    Static mode only writes over a script it has to empty, so an absent or
+    empty one needs no command, and it never touches the bypass list. Safe
+    mode writes over all four values. ProxyEnable comes first and the bypass
+    list last: a net cut short by a power loss then always holds the flag,
+    and never takes the "*" of a half-applied safe mode away while SNIper's
+    server is still enabled."""
+    values = [("ProxyEnable", int(enable)), ("ProxyServer", server or "")]
+    if mode == MODE_PAC:
+        values += [("AutoConfigURL", pac), ("ProxyOverride", override)]
+    elif pac:
+        values.append(("AutoConfigURL", pac))
+    return values
+
+
+def _runonce_commands(values):
+    """The RunOnce values that put these genuine values (see _genuine_values)
+    back into the live Internet Settings, as ([(value name, command)],
+    [(name, why skipped)]).
+
+    A value that a command can't carry exactly, or whose command would not
+    fit in _RUNONCE_MAX_CHARS, is skipped rather than written wrong; the
+    others are still written. _IE is the live key (the sandbox's own in
+    tests), so a test can run the commands for real."""
+    exe, where = '"%s"' % _reg_exe(), '"HKCU\\%s" /v ' % _IE
     commands, skipped = [], []
-    for name, kind, data in values:
-        if kind == "REG_SZ":
+    for name, data in values:
+        if data is None:
+            # Nothing to put back, only SNIper's own value to take away. When
+            # it is gone already, reg.exe just says so and exits.
+            command = "%s delete %s%s /f" % (exe, where, name)
+        elif isinstance(data, int):
+            command = "%s add %s%s /t REG_DWORD /d %d /f" % (exe, where, name, data)
+        else:
             reason = _unwritable(data)
             if reason:
                 skipped.append((name, reason))
                 continue
-            data = '"%s"' % data
-        command = "%s%s /t %s /d %s /f" % (head, name, kind, data)
+            command = '%s add %s%s /t REG_SZ /d "%s" /f' % (exe, where, name, data)
         if len(command) > _RUNONCE_MAX_CHARS:
             skipped.append((name, "its command would be longer than %d characters"
                             % _RUNONCE_MAX_CHARS))
@@ -808,19 +898,20 @@ def _clear_runonce():
         winreg.CloseKey(k)
 
 
-def _write_runonce(enable, server, pac, log_q=None):
+def _write_runonce(values, log_q=None):
     """Replace the RunOnce safety net with commands that put these genuine
-    values back (see _RUNONCE). Only ever runs after the record is committed
-    and the static proxy is live, under the state lock.
+    values back (see _RUNONCE and _genuine_values). Only ever runs after the
+    record is committed and the footprint it undoes is live, under the state
+    lock.
 
     Best-effort and never raises: the net is a last resort, so failing to
     write it must not fail the apply. A write that fails half-way removes
     what it wrote, so the net is never a partial one by accident."""
-    commands, skipped = _runonce_commands(enable, server, pac)
+    commands, skipped = _runonce_commands(values)
     for name, reason in skipped:
         _debug(log_q, "Sign-in safety net: %s left out, because %s."
                % (name, reason))
-    _clear_runonce()  # a stale AutoConfigURL command must not survive
+    _clear_runonce()  # a stale command must not survive
     try:
         k = winreg.CreateKey(winreg.HKEY_CURRENT_USER, _RUNONCE)
         try:
@@ -873,25 +964,28 @@ def _restore_static(base):
     return "already" if _is_genuine(live, base) else "kept"
 
 
-# What a safe-mode footprint did not write, in _pac_values.
-_NOT_APPLIED = object()
+def _applied_overrides(base):
+    """Every bypass list a record's safe-mode manual proxy may have left
+    live: the one it applied, and the "*" that held its place meanwhile (see
+    _apply_live_pac), which is also all that v1.2.0 ever applied."""
+    return (base.applied_override, _BYPASS_ALL)
 
 
 def _pac_values(base, live, live_override):
     """The manual proxy values a safe-mode record accounts for, as (value
     name, live, genuine, applied) in the order a restore writes them back.
-    applied is _NOT_APPLIED for a value the footprint left alone: before the
-    manual proxy was added (applied_manual False) safe mode wrote only
-    ProxyEnable=0. ProxyOverride is left out when the record doesn't hold its
-    genuine value.
+    applied holds every value the footprint may have left there, none for a
+    value it left alone: before the manual proxy was added (applied_manual
+    False) safe mode wrote only ProxyEnable=0. ProxyOverride is left out when
+    the record doesn't hold its genuine value.
 
-    ProxyEnable goes first, so a restore cut short never leaves the manual
-    proxy enabled without the bypass list (see _apply_live_pac)."""
+    ProxyEnable goes first, so the dead proxy is off before anything else
+    changes, wherever a restore is cut short."""
     live_e, live_s, _live_a = live
     if base.applied_manual:
-        applied = (1, base.applied_server, _BYPASS_ALL)
+        applied = ((1,), (base.applied_server,), _applied_overrides(base))
     else:
-        applied = (0, _NOT_APPLIED, _NOT_APPLIED)
+        applied = ((0,), (), ())
     values = [("ProxyEnable", _flag(live_e), base.enable, applied[0]),
               ("ProxyServer", live_s, base.server or "", applied[1])]
     if base.override_present is not None:
@@ -903,27 +997,29 @@ def _pac_values(base, live, live_override):
 
 def _whose(live, genuine, applied):
     """Who a live value belongs to: "genuine" if it is the genuine one,
-    "sniper" if it is the one SNIper applied, else "user", for someone who
+    "sniper" if it is one SNIper applied, else "user", for someone who
     changed it after SNIper did. A value that is both is genuine: there is
     nothing to write back."""
     if live == genuine:
         return "genuine"
-    if applied is not _NOT_APPLIED and live == applied:
-        return "sniper"
-    return "user"
+    return "sniper" if live in applied else "user"
 
 
 def _restore_pac(base):
-    """Safe mode. The script URL and the manual proxy are restored apart,
-    each only while it is still SNIper's.
+    """Safe mode. The script URL, the manual proxy and its bypass list are
+    restored apart, each only while it is still SNIper's.
 
     Our script URL holds this session's random value, so while it is still
     there it is provably ours and always goes, replaced by the genuine PAC
     (or by nothing). The manual proxy goes back to its genuine values only if
-    none of them was changed by someone else: a manual proxy the user set up
-    meanwhile stays exactly as found. "kept" when anything the user changed
-    was left in place, "restored" when SNIper wrote the genuine values back,
-    "already" when nothing of SNIper's was left."""
+    neither its flag nor its server was changed by someone else: a manual
+    proxy the user set up meanwhile stays exactly as found, its bypass list
+    included. A bypass list that only itself was changed is the user's and
+    stays, but the proxy next to it is still SNIper's own and goes: left
+    enabled, it would keep every app on a port nobody answers any more.
+    "kept" when anything the user changed was left in place, "restored" when
+    SNIper wrote the genuine values back, "already" when nothing of SNIper's
+    was left."""
     try:
         live = _read_live()
         live_override = (_read_override() if base.override_present is not None
@@ -934,11 +1030,11 @@ def _restore_pac(base):
     manual = _pac_values(base, live, live_override)
     manual_whose = [_whose(lv, gv, av) for _, lv, gv, av in manual]
     script_whose = _whose(live[2], base.pac if base.pac_present else None,
-                          base.applied_pac_url or _NOT_APPLIED)
+                          (base.applied_pac_url,) if base.applied_pac_url else ())
 
     restore_manual = [(name, gv) for (name, _, gv, _), whose
                       in zip(manual, manual_whose) if whose == "sniper"]
-    if "user" in manual_whose:
+    if "user" in manual_whose[:2]:  # the flag or the server
         restore_manual = []
     restore_script = script_whose == "sniper"
     if restore_manual or restore_script:
@@ -958,12 +1054,13 @@ def _restore_pac(base):
 def _put_back_override(base):
     """Before a record whose restore could not act is taken over for the
     other mode: if it is a safe-mode record and the live bypass list is still
-    SNIper's "*", put the genuine list back. The static record that replaces
-    it doesn't hold the list, and "*" would send every host past the static
-    proxy. Nothing else is touched; OSError propagates."""
+    SNIper's, put the genuine list back. The static record that replaces it
+    doesn't hold the list, so nothing would put it back later, and a "*"
+    would send every host past the static proxy. Nothing else is touched;
+    OSError propagates."""
     if not base.applied_manual or base.override_present is None:
         return
-    if _read_override() == _BYPASS_ALL:
+    if _read_override() in _applied_overrides(base):
         _write_live_pac_genuine(
             [("ProxyOverride", base.override if base.override_present else None)],
             None)
@@ -975,8 +1072,8 @@ def proxy_enable(addr, pac_url=None, session_id=None, log_q=None):
 
     With pac_url None this is Compatibility mode: the static proxy addr. With
     a pac_url it is safe mode: AutoConfigURL=pac_url, plus the manual proxy
-    addr with a bypass list of every host (ProxyEnable=1, ProxyServer=addr,
-    ProxyOverride="*"); see the module doc.
+    addr with a bypass list of local hosts (ProxyEnable=1, ProxyServer=addr,
+    ProxyOverride=the genuine entries and SNIper's own); see the module doc.
 
     Records the genuine pre-SNIper configuration, plus the footprint being
     applied and its owner (the current process and session_id, a new one if
@@ -992,17 +1089,18 @@ def proxy_enable(addr, pac_url=None, session_id=None, log_q=None):
     values are still the only genuine ones, so they are kept and the record is
     taken over for this mode. A safe-mode record taken over for Compatibility
     mode first gets its genuine bypass list put back, which the static
-    footprint doesn't cover and whose "*" would send every host past it.
+    footprint doesn't cover (see _put_back_override).
 
     Capture refuses a live value the record can't hold exactly (see
     _check_recordable): it raises UnrecordableProxyValue before anything is
     written, so the proxy is left as found and no record is created. On a
     mode switch the old record has been restored or released by then.
 
-    In Compatibility mode the RunOnce safety net goes in last, after the
-    record and the live values; safe mode removes any stale one instead.
-    log_q, if given, gets a DEBUG line for each genuine value the net can't
-    carry.
+    The RunOnce safety net goes in after the record and the live values, so
+    that what it restores is durable and what it undoes is live. In safe mode
+    one live write follows it: the bypass list that puts the manual proxy into
+    effect, so that is never live without the net. log_q, if given, gets a
+    DEBUG line for each genuine value the net can't carry.
 
     Returns the genuine PAC URL (or None) so the caller can note that a PAC was
     temporarily disabled.
@@ -1017,6 +1115,7 @@ def proxy_enable(addr, pac_url=None, session_id=None, log_q=None):
     if session_id is None:
         session_id = secrets.token_hex(8)
     owner = procutil.process_identity()
+    bypass = genuine_o = None  # safe mode's bypass list and the genuine one
     with _state_lock():
         try:
             existing = _read_baseline()
@@ -1032,10 +1131,13 @@ def proxy_enable(addr, pac_url=None, session_id=None, log_q=None):
                 # footprint before we get here, so capturing the live state is
                 # correct.)
                 cur_e, cur_s, cur_a = _read_live()
-                cur_o = _read_override() if mode == MODE_PAC else None
-                _check_recordable(cur_e, cur_s, cur_a, cur_o)
+                genuine_o = _read_override() if mode == MODE_PAC else None
+                _check_recordable(cur_e, cur_s, cur_a, genuine_o)
+                if mode == MODE_PAC:
+                    bypass = _bypass_list(genuine_o, log_q)
                 _write_baseline(cur_e, cur_s, cur_a, addr, mode, pac_url,
-                                owner, session_id, override=cur_o)
+                                owner, session_id, override=genuine_o,
+                                applied_override=bypass)
                 genuine_enable, genuine_server, genuine_pac = cur_e, cur_s, cur_a
             else:
                 # A complete baseline already exists; it is the genuine config. Keep
@@ -1044,30 +1146,39 @@ def proxy_enable(addr, pac_url=None, session_id=None, log_q=None):
                 genuine_enable, genuine_server = existing.enable, existing.server
                 genuine_pac = existing.pac if existing.pac_present else None
                 genuine_o = existing.override if existing.override_present else None
-                if mode == MODE_PAC and existing.override_present is None:
-                    # The record doesn't hold the bypass list, so no footprint
-                    # it describes ever wrote it: the live one is genuine.
-                    genuine_o = _read_override()
-                    _check_recordable(existing.enable, existing.server,
-                                      genuine_pac, genuine_o)
+                if mode == MODE_PAC:
+                    if existing.override_present is None:
+                        # The record doesn't hold the bypass list, so no
+                        # footprint it describes ever wrote it: the live one
+                        # is genuine.
+                        genuine_o = _read_override()
+                        _check_recordable(existing.enable, existing.server,
+                                          genuine_pac, genuine_o)
+                    bypass = _bypass_list(genuine_o, log_q)
                 if (existing.applied_server != addr or existing.applied_mode != mode
                         or existing.applied_pac_url != pac_url
-                        or (mode == MODE_PAC and not existing.applied_manual)
+                        or existing.applied_override != bypass
                         or (existing.owner_pid, existing.owner_create_time) != owner
                         or existing.session_id != session_id):
                     _write_baseline(existing.enable, existing.server, genuine_pac,
                                     addr, mode, pac_url, owner, session_id,
-                                    override=genuine_o)
+                                    override=genuine_o, applied_override=bypass)
             if mode == MODE_PAC:
                 _apply_live_pac(pac_url, addr)
             else:
                 _apply_live(addr, clear_pac=bool(genuine_pac))
-            # The sign-in safety net comes last: what it restores is already
-            # durable, and what it undoes is already live.
-            if mode == MODE_STATIC and RUNONCE_SAFETY_NET:
-                _write_runonce(genuine_enable, genuine_server, genuine_pac, log_q)
+            # The sign-in safety net comes after the record and the footprint:
+            # what it restores is already durable, and what it undoes is
+            # already live. Until safe mode's bypass list replaces the "*"
+            # below, that footprint fails open on its own, so the manual proxy
+            # never takes effect without the net.
+            if RUNONCE_SAFETY_NET:
+                _write_runonce(_genuine_values(mode, genuine_enable, genuine_server,
+                                               genuine_pac, genuine_o), log_q)
             else:
                 _clear_runonce()
+            if mode == MODE_PAC:
+                _apply_live_bypass(bypass)
             _refresh()
             return genuine_pac
         except OSError:
@@ -1089,10 +1200,12 @@ def proxy_restore(session_id=None, _launch=False):
     stale baseline. Either way the durable record is dropped, and the RunOnce
     safety net with it.
 
-    In safe mode the footprint is the script URL and the manual proxy, judged
-    apart. While the URL is still there it is always replaced by the genuine
-    PAC (or removed); the manual proxy goes back unless the user changed any
-    of its values meanwhile, in which case it stays and the result is "kept".
+    In safe mode the footprint is the script URL, the manual proxy and its
+    bypass list, judged apart. While the URL is still there it is always
+    replaced by the genuine PAC (or removed); the manual proxy goes back
+    unless the user changed its flag or server meanwhile, and the bypass list
+    unless the user changed any of the three. What the user changed stays and
+    the result is "kept".
 
     With a session_id (the guardian's), only that session's record is acted
     on: a record of another session, or an older one without a SessionId, is

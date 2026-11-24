@@ -153,13 +153,13 @@ TOOLTIPS = {
         "Enable when troubleshooting a specific issue — output becomes very detailed."
     ),
     "compat_mode": (
-        "Use a fixed system proxy instead of SNIper's safe auto-config script.\n\n"
-        "Default: off (safe mode). In safe mode, if SNIper closes unexpectedly,\n"
-        "crashes, or the PC loses power, apps simply connect directly, so your\n"
-        "internet never breaks.\n"
+        "Use only a fixed system proxy, without SNIper's auto-config script.\n\n"
+        "Default: off (safe mode). Safe mode covers almost every app, and leaves\n"
+        "local addresses out of SNIper.\n"
         "Turn this on only if an app you need doesn't go through SNIper in safe\n"
-        "mode. Such apps are then covered, but after an unexpected exit they can\n"
-        "lose internet until SNIper restores the settings."
+        "mode.\n"
+        "In both modes your settings are restored at once if SNIper crashes or is\n"
+        "killed, and at your next sign-in if the PC loses power."
     ),
     "remember": (
         "Keep these settings for the next time you open SNIper.\n\n"

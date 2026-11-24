@@ -31,6 +31,7 @@ import time
 import pytest
 
 import sniper.procutil as procutil
+import sniper.winproxy as winproxy
 from helpers import ABSENT, wait_until
 from sniper.compat import IS_WINDOWS
 
@@ -46,8 +47,9 @@ pytestmark = [
 if IS_WINDOWS:
     from helpers import taskkill
 
-GENUINE = (0, "", ABSENT)
+GENUINE = (0, "", ABSENT, ABSENT)
 NET = {"SNIperRestoreProxyEnable", "SNIperRestoreProxyServer"}
+SAFE_NET = NET | {"SNIperRestoreAutoConfigURL", "SNIperRestoreProxyOverride"}
 RESTORE_TIMEOUT = 15
 GRACEFUL_STOP_AFTER = 6   # as in test_guardian_windows.py: time to find the guard
 _CREATE_NO_WINDOW = 0x08000000
@@ -239,17 +241,17 @@ def expected_live(mode, info):
 def check_applied(box, mode, info):
     if mode == "compat":
         assert box.live() == expected_live(mode, info)
-        net = box.runonce()
-        assert set(net) == NET
-        assert all(('"HKCU\\%s"' % box.ie) in c for c in net.values())
     else:
-        e, s, a = box.live()
-        assert (e, s) == (0, "") and a.startswith("http://127.0.0.1:%d/sniper-" % info["Port"])
-        assert not box.runonce()
+        e, s, a, o = box.live_all()
+        assert (e, s, o) == (1, "127.0.0.1:%d" % info["Port"], winproxy._bypass_list(None))
+        assert a.startswith("http://127.0.0.1:%d/sniper-" % info["Port"])
+    net = box.runonce()
+    assert set(net) == (NET if mode == "compat" else SAFE_NET)
+    assert all(('"HKCU\\%s"' % box.ie) in c for c in net.values())
 
 
 def check_restored(box):
-    assert box.live() == GENUINE
+    assert box.live_all() == GENUINE
     assert box.record() is None
     assert not box.runonce()
 
@@ -333,6 +335,35 @@ def test_a_user_change_is_kept_and_the_net_still_goes(mei, frun, registry_sandbo
     assert box.live() == user
     assert box.record() is None
     assert not box.runonce()   # a blind restore must not undo the user's change
+
+
+# ── The guardian is killed (the other entry in Task Manager) ─────────────────
+@pytest.mark.parametrize("which", ["child", "both"])
+def test_a_killed_guardian_is_replaced_and_the_new_one_restores(mei, frun, registry_sandbox,
+                                                               which):
+    box = registry_sandbox
+    owner, info = frun.start_owner("safe")
+    check_applied(box, "safe", info)
+    guard, handles = frun.guardian(info["SessionId"], wait_for_intermediate=True)
+    if which == "both":   # a terminated launcher can't delete its _MEI directory
+        mei.expected.add(mei_dir_of(guard[1]))
+        assert taskkill(guard[0]).returncode == 0
+    killed = time.perf_counter()
+    assert taskkill(guard[1]).returncode == 0
+    frun.exit_codes(handles)
+
+    def replaced():
+        found = pair("--guard", info["SessionId"])
+        return found if found and not set(found) & set(guard) else None
+
+    wait_until(replaced, timeout=30, message="the guardian was not replaced")
+    print("replaced within %.1f s" % (time.perf_counter() - killed))
+    new_guard, new_handles = frun.guardian(info["SessionId"], wait_for_intermediate=True)
+    frun.assert_watching(new_handles, box.live())
+    assert taskkill(info["OwnerPid"]).returncode == 0
+    assert frun.exit_codes(new_handles) == [10, 10]
+    check_restored(box)
+    owner.wait(30)
 
 
 # ── 3. Tree kill of the launcher ─────────────────────────────────────────────

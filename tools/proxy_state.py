@@ -21,19 +21,23 @@ values and any SNIper processes, then a one-line verdict:
   SNIPER ACTIVE (no guardian)
                  the same, but no guardian of that session is running
   STRANDED (harmless: fail-open PAC)
-                 SNIper's safe-mode script URL is left over and no SNIper
-                 process runs; apps fall back to a direct connection (past
-                 safe mode's manual proxy too, whose bypass list is "*"), and
-                 the next launch of SNIper removes it
-  STRANDED       a record or a SNIper-style proxy, but no SNIper process
+                 a safe-mode footprint whose manual proxy isn't in effect is
+                 left over and no SNIper process runs: one of v1.2.0, whose
+                 bypass list was "*" for good, or one that never got further
+                 than that. Apps fall back to a direct connection, and the
+                 next launch of SNIper removes it
+  STRANDED       a record or a SNIper-style proxy, but no SNIper process. Apps
+                 may have no connection until something restores the settings:
+                 the RunOnce values listed, at the next sign-in, or the next
+                 launch of SNIper
   UNKNOWN        a record or a SNIper-style proxy, and the process list could
                  not be read
 
 A SNIper-style proxy is what SNIper applies: in Compatibility mode
 ProxyEnable=1 with ProxyServer 127.0.0.1:<port>, in safe mode an
 AutoConfigURL of the form http://127.0.0.1:<port>/sniper-<16 hex>.pac next to
-that same static proxy with ProxyOverride "*", which bypasses it for every
-app that reads the bypass list.
+that same static proxy with a ProxyOverride list of local hosts (in v1.2.0
+"*", which bypasses the proxy for every app that reads the bypass list).
 Another tool on a loopback port looks like the first; the record section tells
 them apart. "SNIper is running" means the app itself: its guardian and the
 short-lived process that starts it don't count.
@@ -318,8 +322,16 @@ def sniper_pac(live):
 
 
 def bypass_all(live):
-    """The manual proxy's bypass list is safe mode's "*": every host."""
+    """The manual proxy's bypass list is "*", every host: v1.2.0's safe mode,
+    or a newer one whose apply was cut short before its own list went in."""
     return live.get("ProxyOverride") == "*"
+
+
+def bypass_local(live, record):
+    """The manual proxy's bypass list is the one the record says safe mode
+    applied: the user's own entries and local hosts."""
+    applied = (record or {}).get("AppliedProxyOverride")
+    return isinstance(applied, str) and live.get("ProxyOverride") == applied
 
 
 def record_mode(record):
@@ -328,6 +340,9 @@ def record_mode(record):
         return None
     if record.get("AppliedMode") == "pac":
         if record.get("AppliedManualProxy") == 1:
+            if isinstance(record.get("AppliedProxyOverride"), str):
+                return "safe mode (auto-config script + manual proxy)"
+            # A v1.2.0 record doesn't name its bypass list: it was always "*".
             return "safe mode (auto-config script + manual proxy bypassing every host)"
         return "safe mode (auto-config script)"
     if record.get("AppliedMode") == "static":
@@ -351,8 +366,10 @@ def stale_record(live, record):
     """True if record is a complete restore record whose genuine values the
     live settings already hold, exactly as SNIper's own "already back to
     normal" check sees it: someone put them back (the sign-in safety net,
-    the user), and the next launch of SNIper only deletes the record. An
-    incomplete record is never acted on, so it is never stale either."""
+    in either mode, or the user), and the next launch of SNIper only deletes
+    the record. An incomplete record is never acted on, so it is never stale
+    either. Nor is one whose bypass list SNIper still has to put back, because
+    the sign-in net could not carry it."""
     if not record or record.get("Complete") != 1:
         return False
     live_enable = _dword(live.get("ProxyEnable") or 0)
@@ -390,9 +407,10 @@ def verdict(live, record, processes):
     if stale_record(live, record):
         return VERDICT_STALE
     if pac and (not static or bypass_all(live)):
-        # A dead script URL is harmless: it can't be fetched, so apps go
-        # direct, past safe mode's own manual proxy too, since its bypass
-        # list is "*". Not so if SNIper's static proxy is enabled without it.
+        # A dead script URL on its own is harmless: it can't be fetched, so
+        # apps go direct, past a manual proxy of SNIper's too while its bypass
+        # list is "*". Not so once that proxy is in effect: it is what an app
+        # that can't fetch the script falls back to.
         return VERDICT_HARMLESS
     return "STRANDED"
 
@@ -431,6 +449,8 @@ def render(state):
             line += "  (SNIper safe-mode script)"
         elif name == "ProxyOverride" and bypass_all(state["live"]):
             line += "  (bypasses every host)"
+        elif name == "ProxyOverride" and bypass_local(state["live"], state["record"]):
+            line += "  (SNIper safe-mode list)"
         out.append(line)
 
     out += ["", "What Windows reports to apps (WinHTTP, current user)"]

@@ -97,10 +97,15 @@ RECORD = {"ProxyEnable": 0, "ProxyServer": "", "AutoConfigURLPresent": 0,
 PAC_URL = "http://127.0.0.1:8881/sniper-0123456789abcdef.pac"
 PAC_LIVE = dict(CLEAN_LIVE, ProxyServer="", AutoConfigURL=PAC_URL)
 PAC_RECORD = dict(RECORD, AppliedMode="pac", AppliedAutoConfigURL=PAC_URL)
-# Safe mode as it is now: the script next to a manual proxy bypassing every host.
-SAFE_LIVE = dict(PAC_LIVE, ProxyEnable=1, ProxyServer="127.0.0.1:8881",
+# Safe mode as v1.2.0 had it: the script next to a manual proxy bypassing every
+# host, for good...
+V120_LIVE = dict(PAC_LIVE, ProxyEnable=1, ProxyServer="127.0.0.1:8881",
                  ProxyOverride="*")
-SAFE_RECORD = dict(PAC_RECORD, ProxyOverridePresent=0, AppliedManualProxy=1)
+V120_RECORD = dict(PAC_RECORD, ProxyOverridePresent=0, AppliedManualProxy=1)
+# ...and as it is now: with a bypass list of local hosts, which the record names.
+LIST = "localhost;10.*;<local>"
+SAFE_LIVE = dict(V120_LIVE, ProxyOverride=LIST)
+SAFE_RECORD = dict(V120_RECORD, AppliedProxyOverride=LIST)
 SNIPER_PROC = {"pid": 1, "name": "SNIper_x64.exe", "command_line": "x", "is_sniper": True}
 OTHER_PROC = {"pid": 2, "name": "Code.exe", "command_line": r"C:\SNIper", "is_sniper": False}
 
@@ -130,13 +135,25 @@ OTHER_PROC = {"pid": 2, "name": "Code.exe", "command_line": r"C:\SNIper", "is_sn
      "STRANDED"),
     (dict(PAC_LIVE, ProxyEnable=1, ProxyServer="127.0.0.1:8881",
           ProxyOverride="<local>"), PAC_RECORD, [], "STRANDED"),
-    # ...unless it bypasses every host, as safe mode's own manual proxy does.
-    (SAFE_LIVE, SAFE_RECORD, [OTHER_PROC], HARMLESS),
-    (SAFE_LIVE, None, [], HARMLESS),
+    # ...unless it bypasses every host, as v1.2.0's safe mode left it, and a
+    # newer one that was cut short before its own list went in.
+    (V120_LIVE, V120_RECORD, [OTHER_PROC], HARMLESS),
+    (V120_LIVE, SAFE_RECORD, [OTHER_PROC], HARMLESS),
+    (V120_LIVE, None, [], HARMLESS),
+    (V120_LIVE, V120_RECORD, [SNIPER_PROC], UNGUARDED),
+    # Safe mode as it is now puts its manual proxy into effect: plain stranded,
+    # with or without a record.
+    (SAFE_LIVE, SAFE_RECORD, [OTHER_PROC], "STRANDED"),
+    (SAFE_LIVE, None, [], "STRANDED"),
     (SAFE_LIVE, SAFE_RECORD, [SNIPER_PROC], UNGUARDED),
+    (SAFE_LIVE, SAFE_RECORD, None, "UNKNOWN"),
+    (dict(SAFE_LIVE, ProxyOverride=None), SAFE_RECORD, [], "STRANDED"),
+    # Half restored, the proxy already off: what is left of it is harmless.
+    (dict(SAFE_LIVE, ProxyEnable=0), SAFE_RECORD, [], HARMLESS),
     # The bypass list alone is no footprint at all.
     (dict(CLEAN_LIVE, ProxyOverride="*"), None, [], "CLEAN"),
     # Without the script, SNIper's static proxy is what apps use: stranded.
+    (dict(V120_LIVE, AutoConfigURL=None), None, [], "STRANDED"),
     (dict(SAFE_LIVE, AutoConfigURL=None), None, [], "STRANDED"),
     # Setup scripts that are not SNIper's.
     (dict(CLEAN_LIVE, AutoConfigURL="http://127.0.0.1:8881/proxy.pac"), None, [], "CLEAN"),
@@ -173,7 +190,10 @@ def test_is_sniper_process(tool, name, cmd, expected):
 @pytest.mark.parametrize("record, expected", [
     (None, None),
     (PAC_RECORD, "safe mode (auto-config script)"),
-    (SAFE_RECORD, "safe mode (auto-config script + manual proxy bypassing every host)"),
+    (V120_RECORD, "safe mode (auto-config script + manual proxy bypassing every host)"),
+    (SAFE_RECORD, "safe mode (auto-config script + manual proxy)"),
+    (dict(SAFE_RECORD, AppliedProxyOverride=7),          # reads as v1.2.0's, as in winproxy
+     "safe mode (auto-config script + manual proxy bypassing every host)"),
     (dict(RECORD, AppliedMode="static"), "Compatibility mode (static proxy)"),
     (RECORD, "static proxy (record from v1.1.7)"),
     ({"ProxyEnable": 1, "ProxyServer": "corp:8080", "Complete": 1},
@@ -233,9 +253,25 @@ def test_render_marks_the_safe_mode_script_and_the_record_mode(tool):
     assert "SNIper safe-mode script" not in tool.render(state)
 
 
-def test_render_marks_the_bypass_all_list(tool):
+def test_render_marks_the_safe_mode_list(tool):
     state = {
         "live": SAFE_LIVE, "record": SAFE_RECORD, "runonce": {},
+        "winhttp_ie_config": {"auto_detect": False, "auto_config_url": PAC_URL,
+                              "proxy": "127.0.0.1:8881", "proxy_bypass": LIST},
+        "processes": [], "verdict": "STRANDED",
+    }
+    text = tool.render(state)
+    assert 'ProxyOverride   "%s"  (SNIper safe-mode list)' % LIST in text
+    assert "  Mode: safe mode (auto-config script + manual proxy)\n" in text
+    # A list someone changed, or one no record vouches for, gets no such label.
+    for other in (dict(state, live=dict(SAFE_LIVE, ProxyOverride="<local>")),
+                  dict(state, record=V120_RECORD), dict(state, record=None)):
+        assert "(SNIper safe-mode list)" not in tool.render(other)
+
+
+def test_render_marks_the_bypass_all_list(tool):
+    state = {
+        "live": V120_LIVE, "record": V120_RECORD, "runonce": {},
         "winhttp_ie_config": {"auto_detect": False, "auto_config_url": PAC_URL,
                               "proxy": "127.0.0.1:8881", "proxy_bypass": "*"},
         "processes": [], "verdict": HARMLESS,
@@ -244,7 +280,7 @@ def test_render_marks_the_bypass_all_list(tool):
     assert 'ProxyOverride   "*"  (bypasses every host)' in text
     assert ("  Mode: safe mode (auto-config script + manual proxy bypassing "
             "every host)") in text
-    state["live"] = dict(SAFE_LIVE, ProxyOverride="<local>")
+    state["live"] = dict(V120_LIVE, ProxyOverride="<local>")
     assert "bypasses every host)" not in tool.render(state).split("Mode:")[0]
 
 
@@ -278,8 +314,11 @@ SELFTEST = {"pid": 81, "name": "python.exe", "is_sniper": True,
     (PAC_LIVE, OWNED_RECORD, [GUARD], HARMLESS),                  # mid-restore
     (SNIPER_LIVE, dict(RECORD, SessionId=SID), [GUARD, SPAWNER], "STRANDED"),
     (PAC_LIVE, OWNED_RECORD, [SELFTEST], HARMLESS),               # a test's stand-in
+    (SAFE_LIVE, dict(SAFE_RECORD, SessionId=SID), [APP_SRC, GUARD], GUARDED),
+    (SAFE_LIVE, dict(SAFE_RECORD, SessionId=SID), [GUARD], "STRANDED"),   # mid-restore
 ], ids=["guarded", "guarded-exe", "guarded-compat", "no-guardian", "other-session",
-        "spawner-only", "no-record", "guardian-alone", "helpers-alone", "selftest"])
+        "spawner-only", "no-record", "guardian-alone", "helpers-alone", "selftest",
+        "guarded-safe", "guardian-alone-safe"])
 def test_verdict_with_guardians(tool, live, record, processes, expected):
     assert tool.verdict(live, record, processes) == expected
 
@@ -391,26 +430,30 @@ def test_a_record_the_live_settings_already_match_is_stale(tool, live, record,
 
 # A safe-mode record with the manual proxy also holds the genuine bypass list,
 # which winproxy's "already" check compares too.
-BACK_LIVE = dict(CLEAN_LIVE, ProxyServer="")   # SAFE_RECORD's genuine values
+BACK_LIVE = dict(CLEAN_LIVE, ProxyServer="")   # both records' genuine values
 
 
 @pytest.mark.parametrize("live, record, expected", [
+    (BACK_LIVE, V120_RECORD, STALE),
     (BACK_LIVE, SAFE_RECORD, STALE),
     (dict(BACK_LIVE, ProxyOverride="<local>"),
      dict(SAFE_RECORD, ProxyOverridePresent=1, ProxyOverride="<local>"), STALE),
     (dict(BACK_LIVE, ProxyOverride=""),
      dict(SAFE_RECORD, ProxyOverridePresent=1, ProxyOverride=7), STALE),   # garbage = ""
     (BACK_LIVE, dict(SAFE_RECORD, ProxyOverridePresent=1), STALE),     # present, no value
-    # Not stale: SNIper's "*" is still there, or the genuine list isn't back.
-    (dict(BACK_LIVE, ProxyOverride="*"), SAFE_RECORD, "STRANDED"),
+    # Not stale: SNIper's list is still there (the sign-in net could not carry
+    # the genuine one), or its "*" is, or the genuine list isn't back.
+    (dict(BACK_LIVE, ProxyOverride=LIST), SAFE_RECORD, "STRANDED"),
+    (dict(BACK_LIVE, ProxyOverride="*"), V120_RECORD, "STRANDED"),
     (BACK_LIVE, dict(SAFE_RECORD, ProxyOverridePresent=1, ProxyOverride="<local>"),
      "STRANDED"),
     (dict(BACK_LIVE, ProxyOverride=""), SAFE_RECORD, "STRANDED"),      # empty is not absent
     # Only safe mode writes the list, so only a safe-mode record is judged by it.
     (dict(GENUINE_LIVE, ProxyOverride="*"), dict(STALE_RECORD, ProxyOverridePresent=0),
      STALE),
-], ids=["absent", "recorded", "garbage-record", "present-flag-without-value",
-        "bypass-all-left", "genuine-list-missing", "empty-vs-absent", "static-ignores-it"])
+], ids=["absent-v120", "absent", "recorded", "garbage-record", "present-flag-without-value",
+        "list-left", "bypass-all-left", "genuine-list-missing", "empty-vs-absent",
+        "static-ignores-it"])
 def test_a_safe_mode_record_is_stale_only_with_its_bypass_list_back(tool, live, record,
                                                                     expected):
     assert tool.verdict(live, record, []) == expected

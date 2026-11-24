@@ -2,10 +2,11 @@
 
 It proves that Windows honors the legacy values safe mode writes: with a
 safe-mode server running against the real keys, WinHTTP must report SNIper's
-script as the user's setup script, next to SNIper's manual proxy with a bypass
-list of every host, and its PAC engine must route example.com through SNIper.
-Stop must then leave the real values exactly as they were, and Windows' own
-view of them too.
+script as the user's setup script, next to SNIper's manual proxy with its
+bypass list, and its PAC engine must route example.com through SNIper. Python,
+which reads only the manual proxy and honors the list, as the Discord app's
+updater does, must send sites to SNIper and local hosts past it. Stop must then
+leave the real values exactly as they were, and Windows' own view of them too.
 
 Skipped unless SNIPER_ALLOW_REAL_PROXY_TESTS=1, and never run without the
 user's consent. The real values are snapshotted first; a finally block writes
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import urllib.request
 
 import pytest
 
@@ -97,7 +99,27 @@ def _sniper_running():
     return False
 
 
-def test_windows_honors_the_safe_mode_setup_script():
+def _runonce():
+    """SNIper's values in the real RunOnce."""
+    try:
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUNONCE)
+    except FileNotFoundError:
+        return {}
+    try:
+        values, i = {}, 0
+        while True:
+            try:
+                name, data, _ = winreg.EnumValue(k, i)
+            except OSError:
+                return values
+            if name.startswith("SNIperRestore"):
+                values[name] = data
+            i += 1
+    finally:
+        winreg.CloseKey(k)
+
+
+def test_windows_honors_the_safe_mode_proxy():
     from helpers import winhttp_ie_config, winhttp_proxy_for_url
 
     # Nothing may stand between this test and the real keys, and nothing of
@@ -116,6 +138,9 @@ def test_windows_honors_the_safe_mode_setup_script():
     before = _live()
     windows_before = winhttp_ie_config()
     sniper_key_existed = _exists(_SNIPER)
+    assert _runonce() == {}
+    genuine_list = before["ProxyOverride"] and before["ProxyOverride"][0]
+    applied_list = winproxy._bypass_list(genuine_list)
     print("before:", before, windows_before)
     server = ProxyServer()
     try:
@@ -127,12 +152,20 @@ def test_windows_honors_the_safe_mode_setup_script():
         assert during["AutoConfigURL"] == (url, winreg.REG_SZ)
         assert during["ProxyEnable"] == (1, winreg.REG_DWORD)
         assert during["ProxyServer"] == (server.addr, winreg.REG_SZ)
-        assert during["ProxyOverride"] == ("*", winreg.REG_SZ)
-        # Windows took it: SNIper's script is the setup script, and the manual
-        # proxy it falls back to bypasses every host.
+        assert during["ProxyOverride"] == (applied_list, winreg.REG_SZ)
+        # Windows took it: SNIper's script is the setup script, and next to it
+        # is the manual proxy that only local hosts bypass.
         assert windows_during["auto_config_url"] == url
         assert windows_during["proxy"] == server.addr
-        assert windows_during["proxy_bypass"] == "*"
+        assert windows_during["proxy_bypass"] == applied_list
+        # An app that reads only the manual proxy goes through SNIper, the
+        # bypass list notwithstanding.
+        assert urllib.request.getproxies_registry()["https"].endswith(server.addr)
+        assert not urllib.request.proxy_bypass_registry("updates.discord.com")
+        assert urllib.request.proxy_bypass_registry("localhost")
+        assert urllib.request.proxy_bypass_registry("192.168.1.1")
+        # The net for a power loss is in place, for all four values.
+        assert len(_runonce()) == 4
         # And its PAC engine sends traffic through SNIper.
         result = winhttp_proxy_for_url("https://example.com/",
                                        windows_during["auto_config_url"])
@@ -145,6 +178,7 @@ def test_windows_honors_the_safe_mode_setup_script():
         print("after:", after, windows_after)
         assert after == before
         assert windows_after == windows_before
+        assert _runonce() == {}
         assert not _exists(_RESTORE)
         assert _exists(_SNIPER) == sniper_key_existed
     finally:
